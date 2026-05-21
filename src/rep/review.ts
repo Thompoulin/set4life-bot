@@ -560,6 +560,30 @@ async function reviewOneCarrier(
     // to fix imaginary PDF-render problems.
     const url = String(diag?.url || "")
     const errorsBlob = (diag?.errors || []).join(" ").toLowerCase()
+    const bodyExcerpt = String(diag?.bodyExcerpt || "")
+    // Withdrawn-appointment detection: when SureLC's review page
+    // renders for an appointment-request that the agency has discarded
+    // (via /surecrm/appointments-requests DELETE), the page shows
+    // "Agency has withdrawn this request for review. Please contact
+    // your agency for details" instead of the contract PDF. Verified
+    // Maria Lugo 2026-05-21: her mailbox had stale SureLC emails from
+    // prior-day discarded appointments; the bot followed those links
+    // (the URLs in the emails still auth-resolve to the appointment
+    // record, the page just renders the withdrawn-banner), waited
+    // 90s+30s for the PDF viewer, then bailed with the generic "PDF
+    // viewer did not load" — which sent admins chasing imaginary
+    // rendering bugs. Surface this as its own reason so the
+    // server-side orchestrator can skip-and-move-on instead of
+    // patching state / retrying.
+    const isWithdrawn =
+      /agency has withdrawn this request/i.test(bodyExcerpt) ||
+      /contact your agency for details/i.test(bodyExcerpt)
+    if (isWithdrawn) {
+      return {
+        ok: false,
+        reason: `appointment_withdrawn: the appointment-request was discarded by the agency before signing. The follow-up email the bot followed points at the withdrawn record; SureLC will issue a fresh email for the new appointment-request created by the most recent Phase A run. URL: ${url}`,
+      }
+    }
     const isWizardBlock =
       url.includes("/wizard/welcome") ||
       url.includes("/wizard/profile") ||
@@ -1274,6 +1298,30 @@ async function waitForPdfViewer(page: Page, maxRetries = 2): Promise<boolean> {
   // dialog blocking, network error, prior-carrier handoff stuck.
   // The diagnostic block below captures the actual page state when
   // we bail so the next iteration of this function knows what to fix.
+  //
+  // Fast-path: if the page already renders the "Agency has withdrawn
+  // this request" banner (Maria Lugo pattern 2026-05-21 — stale
+  // SureLC follow-up email pointed at a withdrawn appointment), bail
+  // immediately. No PDF will ever load on a withdrawn appointment,
+  // so the 4-min budget is pure waste — 20 carriers stacking up
+  // to 80 min of dead retry per Phase B run. Short-circuiting here
+  // saves the budget AND populates _lastPdfDiag with the body text
+  // so the caller's classifier picks the right specific reason.
+  try {
+    const earlyDiag = await page.evaluate(() => ({
+      url: location.href,
+      bodyExcerpt: (document.body.innerText || "").replace(/\s+/g, " ").slice(0, 300),
+    }))
+    if (
+      /agency has withdrawn this request/i.test(earlyDiag.bodyExcerpt) ||
+      /contact your agency for details/i.test(earlyDiag.bodyExcerpt)
+    ) {
+      ;(page as any)._lastPdfDiag = { ...earlyDiag, withdrawn: true }
+      return false
+    }
+  } catch {
+    /* page not ready — fall through to the slow path below */
+  }
   for (let i = 0; i < maxRetries; i++) {
     try {
       await page
