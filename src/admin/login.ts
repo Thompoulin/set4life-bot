@@ -44,19 +44,39 @@ export async function loginAdmin(
   // (owner-reported failure 2026-05-05: bot reported "Logged in" then
   // immediately failed at "Add Producer button not found" because it
   // was actually still on the OAuth login form).
+  //
+  // We don't break the wait loop on "any visible input" anymore — the
+  // 2026-05-22 failure mode was that `input:visible` matched a transient
+  // input (cookie banner / SPA bootstrap form) before the actual OAuth
+  // form rendered, then firstVisible ran against an unsettled DOM and
+  // returned null. Instead wait specifically for the OAuth form's
+  // username field to be in the DOM, and only THEN proceed.
   const start = Date.now()
   while (Date.now() - start < 25_000) {
     if (isLoggedInBgaUrl(page.url())) return { ok: true } // already logged in
-    if (await page.$("input:visible")) break
+    const formReady = await page.$(
+      'input[data-cy="email-input"], input[type="email"], input[name="username"]',
+    )
+    if (formReady) break
     await page.waitForTimeout(500)
   }
+  // Extra beat for Material to finish wiring up the input. Without it
+  // isVisible() can race the form's slide-in animation and return false
+  // for an input that's already in the DOM.
+  await page.waitForTimeout(1_500)
 
   const emailField = await firstVisible(page, [
+    'input[data-cy="email-input"]',
+    'input[formcontrolname="username"]',
     'input[type="email"]',
     'input[name*="email" i]',
     'input[name*="username" i]',
     'input[id*="email" i]',
     'input[id*="username" i]',
+    'input[autocomplete="username"]',
+    'input[autocomplete="email"]',
+    'input[aria-label*="email" i]',
+    'input[placeholder*="email" i]',
   ])
   if (!emailField) {
     logger.warn({ url: page.url() }, "admin login: email input not found")
@@ -65,9 +85,12 @@ export async function loginAdmin(
   await emailField.fill(creds.email)
 
   const pwField = await firstVisible(page, [
+    'input[data-cy="password-input"]',
+    'input[formcontrolname="password"]',
     'input[type="password"]',
     'input[name*="password" i]',
     'input[id*="password" i]',
+    'input[autocomplete="current-password"]',
   ])
   if (!pwField) {
     logger.warn("admin login: password input not found")
