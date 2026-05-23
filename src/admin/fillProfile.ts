@@ -2147,9 +2147,10 @@ async function fillSignature(
     }
     // forceReupload=true: the existing signature is stale/broken
     // (Fastlane flagged "N issues" with the producer despite the
-    // signature tab being green). Click REMOVE, accept the confirm
-    // dialog, wait for the upload-method screen to render, then fall
-    // through into the normal upload path below.
+    // signature tab being green). Click REMOVE, confirm in the
+    // Material modal that SureLC pops, wait for the upload-method
+    // screen to render, then fall through into the normal upload
+    // path below.
     logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature")
     const removeBtn =
       (await page.$('button:has-text("REMOVE")')) ||
@@ -2160,24 +2161,76 @@ async function fillSignature(
         reason: "forceReupload=true but REMOVE button not found",
       }
     }
-    // SureLC's REMOVE on signature triggers a Material confirm
-    // dialog ("Are you sure?"). Accept it so the actual delete fires.
-    page.once("dialog", (d) => d.accept().catch(() => {}))
     await removeBtn.click().catch(() => undefined)
-    // Wait for the SPA to swap back to the choose-method screen
-    // (UPLOAD IT NOW + DRAW IT NOW + TYPE IT NOW). Without this the
-    // immediate file-input lookup below races a stale DOM and
-    // returns "file input not found".
+
+    // SureLC pops a Material confirm dialog (<mat-dialog-container>
+    // with YES / NO or CONFIRM / CANCEL buttons), NOT a browser-
+    // native window.confirm — so page.on("dialog", ...) does NOT
+    // fire. Wait for the dialog, then click the affirm button.
     try {
       await page.waitForSelector(
-        'button:has-text("UPLOAD IT NOW"), button:has-text("Upload it now"), button:has-text("Upload")',
+        'mat-dialog-container, [role="dialog"]',
+        { timeout: 8_000 },
+      )
+      const affirm =
+        (await page.$('mat-dialog-container button:has-text("YES")')) ||
+        (await page.$('mat-dialog-container button:has-text("Yes")')) ||
+        (await page.$('mat-dialog-container button:has-text("CONFIRM")')) ||
+        (await page.$('mat-dialog-container button:has-text("Confirm")')) ||
+        (await page.$('mat-dialog-container button:has-text("OK")')) ||
+        (await page.$('mat-dialog-container button:has-text("Ok")')) ||
+        (await page.$('mat-dialog-container button:has-text("REMOVE")')) ||
+        (await page.$('mat-dialog-container button:has-text("Remove")')) ||
+        (await page.$('mat-dialog-container button:has-text("DELETE")')) ||
+        (await page.$('[role="dialog"] button.mat-primary')) ||
+        (await page.$('[role="dialog"] button.mat-mdc-button-base'))
+      if (!affirm) {
+        // No recognizable affirm button — log what the dialog says so
+        // we can tune the selector list. Snapshot for forensic
+        // evidence.
+        const dialogText = await page
+          .$$eval("mat-dialog-container, [role='dialog']", (els) =>
+            els.map((e) => (e.textContent || "").trim()).join(" | "),
+          )
+          .catch(() => "")
+        await snapshot(ctx, "tab-signature-01b-confirm-modal-text")
+        return {
+          ok: false,
+          reason: `REMOVE confirm modal opened but affirm button not found. Modal text: ${dialogText.slice(0, 200)}`,
+        }
+      }
+      await affirm.click().catch(() => undefined)
+      logger.info("[Signature] REMOVE confirm modal — affirm clicked")
+    } catch {
+      // Modal didn't appear within 8s — maybe SureLC removed the
+      // signature without a confirm prompt (older SPA version). Just
+      // continue and let the next waitForSelector validate.
+      logger.info("[Signature] no confirm modal detected — assuming REMOVE took effect without prompt")
+    }
+
+    // Wait for the SPA to swap back to the choose-method screen.
+    // Accept any of UPLOAD / DRAW / TYPE — post-cutover the page may
+    // default to a different method than UPLOAD IT NOW.
+    try {
+      await page.waitForSelector(
+        [
+          'button:has-text("UPLOAD IT NOW")',
+          'button:has-text("Upload it now")',
+          'button:has-text("Upload")',
+          'button:has-text("DRAW IT NOW")',
+          'button:has-text("TYPE IT NOW")',
+          'input[type="file"]',
+        ].join(", "),
         { timeout: 20_000 },
       )
     } catch {
       await snapshot(ctx, "tab-signature-01b-remove-stuck")
+      const after = await page
+        .$$eval("body", (els) => (els[0]?.innerText || ""))
+        .catch(() => "")
       return {
         ok: false,
-        reason: "REMOVE clicked but upload screen never rendered (20s timeout)",
+        reason: `REMOVE clicked but choose-method screen never rendered. Page snippet: ${after.slice(0, 200).replace(/\s+/g, " ")}`,
       }
     }
     await snapshot(ctx, "tab-signature-01c-after-remove")
