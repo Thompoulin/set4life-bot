@@ -439,31 +439,33 @@ export async function runActivation(
               )
               if (dedup) {
                 logger.info({ producerId, dedup }, "[Fastlane] pre-dedup result")
-                // Skip Fastlane when re-running for an already-processed
-                // producer. Two signals:
-                //   - uniqueCarriers >= 8: realistic ceiling for most
-                //     reps. SureLC has 10 carriers configured but ~2
-                //     consistently reject reps (Americo + Foresters for
-                //     state/eligibility reasons). The previous hard-
-                //     coded "9" threshold meant Fastlane re-ran every
-                //     daily cron for the typical 8-active rep, each
-                //     run creating new Producer-stage requests for the
-                //     2 rejecting carriers → those went to Discarded →
-                //     Beam accumulated 100+ Discarded over weeks.
-                //   - deleted > 0 with any active: dedup just removed
-                //     duplicates we created in a prior run. Don't go
-                //     create more — we already have active requests.
-                const hasMaxCarriers = dedup.uniqueCarriers >= 8
-                const wasReRunCleanup =
-                  dedup.deleted > 0 && dedup.uniqueCarriers >= 1
-                if (hasMaxCarriers || wasReRunCleanup) {
+                // Skip Fastlane if the producer has ANY active
+                // appointment-requests. Fastlane is a "submit one
+                // producer for many carriers" wizard — it doesn't
+                // take a missing-carriers list, it just creates a
+                // fresh Producer-stage row for every configured
+                // carrier. Firing on top of existing active rows
+                // produces the BGA duplicates that Ana then has to
+                // discard by hand (2026-05-23 incident; previously
+                // Tonette 2026-05-18→05-20 and Zachary 2026-05-09).
+                //
+                // The earlier `>= 8 OR (deleted > 0 with active)`
+                // threshold was a workaround for the 8-active-rep
+                // common case; reps stuck at 1–7 active still
+                // triggered Fastlane each retry and accumulated
+                // dupes. Now: if the dedup pass found any alive
+                // request, contracting is considered already-
+                // submitted — admin handles further additions
+                // manually via the BGA portal. The brand-new case
+                // (zero alive) still fires Fastlane normally.
+                if (dedup.uniqueCarriers >= 1) {
                   adminPhase.contracting = {
                     submitted: ["already-submitted-skipped-fastlane"],
                     failed: [],
                   }
                   await finishContracting({
                     ok: true,
-                    msg: `Skipped Fastlane — already have ${dedup.uniqueCarriers} active appointment-requests (deleted ${dedup.deleted} dup(s))`,
+                    msg: `Skipped Fastlane — already have ${dedup.uniqueCarriers} active appointment-request(s) (deleted ${dedup.deleted} dup(s))`,
                   })
                   preDedupSkipsFastlane = true
                 }
