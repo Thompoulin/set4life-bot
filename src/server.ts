@@ -137,6 +137,12 @@ const profileSchema = z.object({
       // agents.signatureAuthPdfUrl. fillSignature.ts prefers this
       // over the bare image and crops the signature out of it.
       signatureAuthPdfUrl: z.string().url().optional(),
+      // When true, click REMOVE on an existing signature before
+      // uploading fresh. Without this, the bot's "REMOVE+EDIT
+      // visible → already-done" heuristic strands producers with
+      // a stale/broken signature that Fastlane refuses ("N issues").
+      // Set by the main app's activationPipeline when input.force===true.
+      forceReupload: z.boolean().optional(),
     })
     .optional(),
 })

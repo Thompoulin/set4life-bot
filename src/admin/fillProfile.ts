@@ -127,6 +127,13 @@ export interface ProfileFillInput {
      * store the URL on applications.signatureAuthPdfUrl.
      */
     signatureAuthPdfUrl?: string
+    /**
+     * When true, click REMOVE on an existing signature before
+     * uploading fresh. Used by force-run paths to recover producers
+     * whose stale signature blocks Fastlane ("N issues"). Without
+     * this, the REMOVE+EDIT detector below returns alreadyDone=true.
+     */
+    forceReupload?: boolean
   }
   /** Per-question explanation texts, keyed by SureLC question slug. */
   explanations?: Record<string, string>
@@ -2134,8 +2141,47 @@ async function fillSignature(
     /Signature Authorization\s*\n?\s*\d{2}\/\d{2}\/\d{4}/i.test(sigText) ||
     (/REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText))
   if (hasUploaded) {
-    logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (REMOVE/EDIT visible) — skipping")
-    return { ok: true, alreadyDone: true, details: { detected: "removeEditButtons" } }
+    if (!input?.forceReupload) {
+      logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (REMOVE/EDIT visible) — skipping")
+      return { ok: true, alreadyDone: true, details: { detected: "removeEditButtons" } }
+    }
+    // forceReupload=true: the existing signature is stale/broken
+    // (Fastlane flagged "N issues" with the producer despite the
+    // signature tab being green). Click REMOVE, accept the confirm
+    // dialog, wait for the upload-method screen to render, then fall
+    // through into the normal upload path below.
+    logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature")
+    const removeBtn =
+      (await page.$('button:has-text("REMOVE")')) ||
+      (await page.$('button:has-text("Remove")'))
+    if (!removeBtn) {
+      return {
+        ok: false,
+        reason: "forceReupload=true but REMOVE button not found",
+      }
+    }
+    // SureLC's REMOVE on signature triggers a Material confirm
+    // dialog ("Are you sure?"). Accept it so the actual delete fires.
+    page.once("dialog", (d) => d.accept().catch(() => {}))
+    await removeBtn.click().catch(() => undefined)
+    // Wait for the SPA to swap back to the choose-method screen
+    // (UPLOAD IT NOW + DRAW IT NOW + TYPE IT NOW). Without this the
+    // immediate file-input lookup below races a stale DOM and
+    // returns "file input not found".
+    try {
+      await page.waitForSelector(
+        'button:has-text("UPLOAD IT NOW"), button:has-text("Upload it now"), button:has-text("Upload")',
+        { timeout: 20_000 },
+      )
+    } catch {
+      await snapshot(ctx, "tab-signature-01b-remove-stuck")
+      return {
+        ok: false,
+        reason: "REMOVE clicked but upload screen never rendered (20s timeout)",
+      }
+    }
+    await snapshot(ctx, "tab-signature-01c-after-remove")
+    logger.info("[Signature] REMOVE confirmed; proceeding with fresh upload")
   }
 
   // ── Step 1 — Click "UPLOAD IT NOW" if the choose-method screen
