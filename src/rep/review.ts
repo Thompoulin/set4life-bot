@@ -190,12 +190,31 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
 const ISSUING_COMPANY_PATTERN =
   /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request)/i
 
+/**
+ * Affirmative product-line questions ("Will you be selling Final
+ * Expense products through this Marketing Organization relationship?",
+ * carrier-asked variants of "Will you sell <product> with us?", etc).
+ * Set4Life agents sell across the full life product line through
+ * their MGA (Quility), so these always default to YES.
+ *
+ * Verified against Mutual of Omaha's Producer Questions screen
+ * 2026-05-23 (Kimberly Bates): the FE question was the ONE answer
+ * the bot defaulted to N when it should have been Y. Background
+ * disclosures + the BMO152.017 agreement checkbox both filled
+ * correctly.
+ */
+const PRODUCT_OPT_IN_PATTERN =
+  /will\s+you\s+be\s+selling\s+(?:final\s+expense|life|annuity|medicare|whole\s+life|term)\s+products?/i
+
 function pickYnForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): "Y" | "N" {
   // Carrier sub-opt-in always YES — rep wants the appointment included.
   if (ISSUING_COMPANY_PATTERN.test(label)) return "Y"
+  // Product-line opt-in always YES — Set4Life agents sell the
+  // standard life portfolio (FE, Term, Whole Life, Annuity, etc).
+  if (PRODUCT_OPT_IN_PATTERN.test(label)) return "Y"
   if (!disclosures) return "N"
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
     if (pattern.test(label) && disclosures[key]) return "Y"
