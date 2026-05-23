@@ -174,10 +174,28 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
  * regex matches AND the corresponding flag is true; otherwise "N" (the
  * safe default for all the questions on a typical clean producer).
  */
+/**
+ * Carrier sub-opt-in questions ("Select YES to include Pioneer American
+ * Ins Co with this request", "ISSUING COMPANY (...)", etc) are NOT
+ * background disclosures — they're per-carrier flags asking the rep
+ * which underwriting entities under the umbrella carrier they want to
+ * appoint with. Default = YES (rep wants every sub-carrier appointment).
+ *
+ * Pattern verified against American Amicable's Producer Questions screen
+ * 2026-05-23 (Pioneer American / Pioneer Security / Occidental / IA
+ * American Life). Other carriers may use similar wording — we match on
+ * the "Select YES to include" / "ISSUING COMPANY" phrasing so we don't
+ * have to enumerate every sub-carrier name.
+ */
+const ISSUING_COMPANY_PATTERN =
+  /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request)/i
+
 function pickYnForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): "Y" | "N" {
+  // Carrier sub-opt-in always YES — rep wants the appointment included.
+  if (ISSUING_COMPANY_PATTERN.test(label)) return "Y"
   if (!disclosures) return "N"
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
     if (pattern.test(label) && disclosures[key]) return "Y"
