@@ -178,6 +178,13 @@ const repReviewSchema = z.object({
   dob: z.string(),
   policyAccepted: z.boolean().optional(),
   maxCarriers: z.number().int().positive().optional(),
+  /**
+   * Pre-fill the wizard for the rep but bail BEFORE the Step 6 sign
+   * action. SureLC auto-saves each step on Next so the rep lands on
+   * Step 6 with disclosures + carrier-questions already filled when
+   * they later log in. See rep/review.ts RepReviewInput.prefillOnly.
+   */
+  prefillOnly: z.boolean().optional(),
   /** Per-carrier text inputs (cellPhone, placeOfBirth, residentCounty). */
   producerProfile: z
     .object({

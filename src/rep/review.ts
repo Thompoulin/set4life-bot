@@ -50,6 +50,20 @@ export interface RepReviewInput {
   /** When set, run only this many carrier reviews then stop. */
   maxCarriers?: number
   /**
+   * Pre-fill the wizard for the rep WITHOUT signing. Bot walks steps
+   * 1-5 (welcome, training, E&O, carrier questions, questionnaire),
+   * letting SureLC auto-save each step's data, then bails BEFORE Step
+   * 6 (Review & Sign). When the rep logs in via their SureLC email
+   * link, they land on Step 6 with all earlier data already filled —
+   * they only have to scroll the PDF + click "Apply My Signature".
+   *
+   * Use case: 2026-05-23 — owner manually sent rep-review emails for
+   * 46 stuck producers. Without pre-fill, each rep has to slog
+   * through 5 wizard steps per carrier (9 carriers × 5 steps = 45
+   * clicks per rep). With pre-fill they sign in one click per carrier.
+   */
+  prefillOnly?: boolean
+  /**
    * Optional producer profile fields used to fill carrier-specific
    * required text inputs on Step 4 (e.g. Occidental requires cellPhone
    * + placeOfBirth in addition to the standard Y/N questions). Map keys
@@ -526,6 +540,19 @@ async function reviewOneCarrier(
   await page.waitForTimeout(800)
   await snapshot(ctx, `rep-carrier${idx}-step5-questionnaire-answered`)
   await clickNextWhenEnabled(ctx)
+
+  // Pre-fill mode bails here. Steps 1-5 are auto-saved by SureLC on
+  // each Next click, so when the rep returns via their email link
+  // they land on Step 6 with disclosures + carrier-questions already
+  // answered. The rep only has to scroll the PDF + Apply Signature.
+  if (input.prefillOnly) {
+    logger.info(
+      { carrier: idx },
+      "[Rep prefillOnly] steps 1-5 saved; skipping Step 6 sign",
+    )
+    await snapshot(ctx, `rep-carrier${idx}-prefill-complete`)
+    return { ok: true, details: { prefilled: true } }
+  }
 
   // Step 6 — Review & Sign: PDF viewer renders, then Apply My
   // Signature button enables once the rep has scrolled to the bottom.
