@@ -538,6 +538,16 @@ async function reviewOneCarrier(
 
   // Step 3 — E&O (auto-filled) → Next
   await clickNextWhenEnabled(ctx)
+  // Step 4 (Carrier Questions) hits SureLC's heavier per-step API
+  // (the wizard fetches the carrier's question template + the rep's
+  // saved answers). On slow carriers the page transition takes
+  // 5–15s; without an explicit settle, fillRadiosByLabelLookup races
+  // past the empty DOM and reports answered:0 even though the
+  // questions later render. Verified Kimberly 2026-05-23 MoO where
+  // 3 mat-radio-group questions existed but the bot found 0.
+  await page
+    .waitForLoadState("networkidle", { timeout: 15_000 })
+    .catch(() => undefined)
   await snapshot(ctx, `rep-carrier${idx}-step4-carrier-questions`)
 
   // Step 4 — Carrier Questions: per-question Y/N from the rep's
@@ -560,6 +570,11 @@ async function reviewOneCarrier(
   await page.waitForTimeout(800)
   await snapshot(ctx, `rep-carrier${idx}-step4-carrier-questions-answered`)
   await clickNextWhenEnabled(ctx)
+  // Same wait pattern for step 5 — Questionnaire is another heavy
+  // page transition; without networkidle the radios race the fill.
+  await page
+    .waitForLoadState("networkidle", { timeout: 15_000 })
+    .catch(() => undefined)
   await snapshot(ctx, `rep-carrier${idx}-step5-questionnaire`)
 
   // Step 5 — Questionnaire: SureLC uses value="true" / value="false"
@@ -1097,13 +1112,13 @@ async function fillRadiosByLabelLookup(
   // Wait for at least one mat-radio-group to render. Without this,
   // the enumerate-then-click logic can race past Angular's bind step
   // and find zero groups on a page that visibly has multiple Y/N
-  // questions (Paul Magistri 2026-05-08 Corebridge: page had 3
-  // unanswered radios but bot reported answered:0 because the DOM
-  // hadn't materialized yet). 8s timeout is generous; on most pages
-  // the first group appears in <500ms, but FL Counties → Carrier
-  // Questions transitions are heavier.
+  // questions (Paul Magistri 2026-05-08 Corebridge: 3 unanswered
+  // radios but bot reported 0; Kimberly Bates 2026-05-23 MoO: same
+  // 3 radios, same answered:0). Bumped from 8s → 20s after the
+  // 2026-05-23 incident where the step 4 page took ~12s to settle
+  // on MoO and the bot lost every prefill answer for that carrier.
   await page
-    .waitForSelector("mat-radio-group input[type=\"radio\"]", { timeout: 8_000 })
+    .waitForSelector("mat-radio-group input[type=\"radio\"]", { timeout: 20_000 })
     .catch(() => undefined)
 
   // Collect (label, group-name) pairs from the live DOM.
