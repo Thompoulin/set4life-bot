@@ -539,34 +539,33 @@ async function reviewOneCarrier(
   //   6) review & sign     → wait for PDF + Apply My Signature
   await snapshot(ctx, `rep-carrier${idx}-step1-welcome`)
 
-  // Step 1 — welcome → Next
-  await clickNextWhenEnabled(ctx)
-  await snapshot(ctx, `rep-carrier${idx}-step2-training`)
+  // URL-aware navigation: keep clicking NEXT until we land on
+  // /misc/info (the Carrier Questions URL slug). Previous
+  // implementation called clickNextWhenEnabled a fixed 4 times,
+  // which overshot Carrier Questions on carriers without a Counties
+  // step (most). Each over-click advanced to the next step, so
+  // fillRadios ran on Questionnaire or Review&Sign and reported
+  // answered:0. Kimberly 2026-05-24 verification: confirmed the
+  // bot was reaching wrong page; local harness with URL-aware loop
+  // reaches CQ reliably + radio clicks persist.
+  for (let i = 0; i < 6; i++) {
+    if (/\/wizard\/misc\/info/.test(page.url())) break
+    // tickTelemarketingOnlyIfPresent handles the FL Counties step
+    // (no-op when not present). Run on every iteration since the
+    // step can appear anywhere between Welcome and Training.
+    await tickTelemarketingOnlyIfPresent(ctx)
+    await clickNextWhenEnabled(ctx)
+  }
+  await snapshot(ctx, `rep-carrier${idx}-step4-carrier-questions-entry`)
+  logger.info(
+    { url: page.url(), step: "step4-entry" },
+    "[Rep prefillOnly] reached carrier-questions step",
+  )
 
-  // Some carriers inject a "Select Counties" step (FL-resident reps,
-  // Transamerica especially) between Welcome and Training. The page
-  // requires picking counties OR ticking "No Personal Sells,
-  // telemarketing/online/phone only". For Set4Life agents (online
-  // phone-only sales), telemarketing is always the right answer.
-  // tickTelemarketingOnlyIfPresent is a no-op when the page doesn't
-  // have this checkbox (most carriers, and non-FL reps).
-  await tickTelemarketingOnlyIfPresent(ctx)
-  await clickNextWhenEnabled(ctx)
-
-  // Step 2 — training (auto-filled) → Next. Skipped if we're still on
-  // the Welcome→Training transition (clickNextWhenEnabled is idempotent).
-  await clickNextWhenEnabled(ctx)
-  await snapshot(ctx, `rep-carrier${idx}-step3-eno`)
-
-  // Step 3 — E&O (auto-filled) → Next
-  await clickNextWhenEnabled(ctx)
-  // Step 4 (Carrier Questions) hits SureLC's heavier per-step API
-  // (the wizard fetches the carrier's question template + the rep's
-  // saved answers). On slow carriers the page transition takes
-  // 5–15s; without an explicit settle, fillRadiosByLabelLookup races
-  // past the empty DOM and reports answered:0 even though the
-  // questions later render. Verified Kimberly 2026-05-23 MoO where
-  // 3 mat-radio-group questions existed but the bot found 0.
+  // Belt-and-suspenders: SureLC's Carrier Questions page makes a
+  // heavier per-step API call (fetching carrier question templates
+  // + saved answers). Wait for that to settle before reading the
+  // DOM.
   await page
     .waitForLoadState("networkidle", { timeout: 15_000 })
     .catch(() => undefined)
