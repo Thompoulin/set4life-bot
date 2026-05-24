@@ -1400,7 +1400,14 @@ async function clickNextWhenEnabled(ctx: TabContext): Promise<void> {
     return true
   })
   if (clicked) {
-    await settle(page, 1000)
+    // SureLC's wizard step transition takes 2-3s for the new step's
+    // Angular Material components to render. Without a sufficient wait
+    // the next operation (fillRadios) reads the OUTGOING page's DOM
+    // and finds zero radio groups even though the new step has many.
+    // 1s settle (the old value) was the root cause of answered:0
+    // across every carrier (Kimberly 2026-05-24 verification).
+    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined)
+    await settle(page, 2500)
     return
   }
   // Fallback to clickNext to keep the flow moving (and fail loudly later).
