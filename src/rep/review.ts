@@ -498,12 +498,33 @@ async function reviewOneCarrier(
   await page.waitForTimeout(2000)
   const url = page.url()
   if (/\/appointment\/[^/]+\/reviewed/.test(url)) {
-    logger.info(
-      { url },
-      "[Rep step6] appointment already signed (auth landed on /reviewed) — skipping",
-    )
-    await snapshot(ctx, `rep-carrier${idx}-already-signed`)
-    return { ok: true, alreadyDone: true }
+    // prefillOnly mode wants to walk EVERY carrier's wizard fresh —
+    // SureLC sometimes redirects to /reviewed for in-progress
+    // appointments (not just fully-signed ones), and we lose the
+    // opportunity to update prefill answers when we short-circuit
+    // here. Kimberly 2026-05-23: every retry hit this fast-path
+    // even though her contracts were all PRODUCER stage.
+    if (input.prefillOnly) {
+      // Navigate explicitly to /wizard/welcome to force the bot
+      // through the step-by-step flow.
+      const match = url.match(/\/appointment\/([^/]+)/)
+      const appt = match ? match[1] : null
+      if (appt) {
+        const welcomeUrl = `https://surelc.surancebay.com/ar-review/appointment/${appt}/wizard/welcome`
+        logger.info({ url, welcomeUrl }, "[Rep prefillOnly] forcing walk via /wizard/welcome (skipping fast-path)")
+        await page.goto(welcomeUrl, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined)
+        await page.waitForTimeout(3000)
+      } else {
+        logger.warn({ url }, "[Rep prefillOnly] couldn't extract appointmentId from /reviewed URL — proceeding anyway")
+      }
+    } else {
+      logger.info(
+        { url },
+        "[Rep step6] appointment already signed (auth landed on /reviewed) — skipping",
+      )
+      await snapshot(ctx, `rep-carrier${idx}-already-signed`)
+      return { ok: true, alreadyDone: true }
+    }
   }
 
   // SureLC ar-review wizard (verified Sydney 2026-05-07 step5-pdf.html
