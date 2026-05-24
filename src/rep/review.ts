@@ -175,20 +175,21 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
  * safe default for all the questions on a typical clean producer).
  */
 /**
- * Carrier sub-opt-in questions ("Select YES to include Pioneer American
- * Ins Co with this request", "ISSUING COMPANY (...)", etc) are NOT
- * background disclosures — they're per-carrier flags asking the rep
- * which underwriting entities under the umbrella carrier they want to
- * appoint with. Default = YES (rep wants every sub-carrier appointment).
+ * Carrier sub-opt-in questions are NOT background disclosures — they
+ * ask which underwriting entities under the umbrella carrier the rep
+ * wants to appoint with. Default = YES (include every sub-carrier).
  *
- * Pattern verified against American Amicable's Producer Questions screen
- * 2026-05-23 (Pioneer American / Pioneer Security / Occidental / IA
- * American Life). Other carriers may use similar wording — we match on
- * the "Select YES to include" / "ISSUING COMPANY" phrasing so we don't
- * have to enumerate every sub-carrier name.
+ * Variants seen in the wild (2026-05-23 Kimberly verification):
+ *   - American Amicable: "ISSUING COMPANY (Pioneer American): Select
+ *     YES to include Pioneer American Ins Co with this request"
+ *   - Transamerica: "COMPANY APPOINTMENT REQUEST (Select ALL that
+ *     apply): Transamerica Casualty Insurance" (and Life / Financial)
+ *
+ * Match on either phrasing so we don't have to enumerate every
+ * sub-carrier name.
  */
 const ISSUING_COMPANY_PATTERN =
-  /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request)/i
+  /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request|company\s+appointment\s+request)/i
 
 /**
  * Affirmative product-line questions ("Will you be selling Final
