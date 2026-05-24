@@ -1364,18 +1364,42 @@ async function tickTelemarketingOnlyIfPresent(ctx: TabContext): Promise<void> {
 
 async function clickNextWhenEnabled(ctx: TabContext): Promise<void> {
   const { page } = ctx
-  const enabled = await page
+  // The previous selector picked the FIRST visible "Next"/"Continue"
+  // button on the page — but SureLC's ar-review SPA renders a
+  // decorative "Next" button at the top-right (header navigation
+  // chevron) AND the actual wizard NEXT button at the bottom-right
+  // of the page content area. The selector reliably matched the top
+  // one, whose click does nothing for wizard progression. Verified
+  // 2026-05-24 (Kimberly): clicks succeeded selector-side but the
+  // wizard URL never advanced past /welcome.
+  //
+  // Pick the BOTTOM-MOST enabled Next/Continue/Submit button via
+  // in-page JS. The wizard's primary action button is always the
+  // farthest down the viewport.
+  //
+  // Also: clicking via in-page JS bypasses Playwright's visibility
+  // check, which intermittently rejects the wizard's Material button
+  // even with force:true (the ripple's stability check is finicky).
+  await page
     .waitForSelector(
-      'button.mat-mdc-unelevated-button:not([disabled]):not(.mat-mdc-button-disabled), ' +
-        'button.mat-mdc-raised-button:not([disabled]):not(.mat-mdc-button-disabled), ' +
-        'button:has-text("Next"):not([disabled]):not(.mat-mdc-button-disabled), ' +
-        'button:has-text("Continue"):not([disabled]):not(.mat-mdc-button-disabled), ' +
-        'button:has-text("Submit"):not([disabled]):not(.mat-mdc-button-disabled)',
+      'button:has-text("NEXT"), button:has-text("Next"), button:has-text("Continue"), button:has-text("Submit")',
       { timeout: 15_000 },
     )
     .catch(() => null)
-  if (enabled) {
-    await enabled.click().catch(() => undefined)
+  const clicked = await page.evaluate(() => {
+    const candidates = Array.from(document.querySelectorAll("button")).filter((b) => {
+      if (b.disabled) return false
+      if (b.classList.contains("mat-mdc-button-disabled")) return false
+      const txt = (b.textContent || "").trim()
+      return /^(NEXT|Next|Continue|Submit)$/.test(txt)
+    })
+    if (candidates.length === 0) return false
+    // Bottom-most candidate is the wizard's primary action button.
+    candidates.sort((a, b) => b.getBoundingClientRect().y - a.getBoundingClientRect().y)
+    candidates[0].click()
+    return true
+  })
+  if (clicked) {
     await settle(page, 1000)
     return
   }
