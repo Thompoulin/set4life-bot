@@ -312,21 +312,81 @@ export async function runFastlaneOneProducerManyCarriers(
   //    is mostly a verification + safety net for any carrier where
   //    the rep doesn't have a state license (those checkboxes appear
   //    disabled and clicking them is a no-op).
+  //
+  // Kimberly 2026-05-25: previous sweep ran immediately after the NEXT
+  // click into Step 3, before Angular finished hydrating per-carrier
+  // state grids. Only the first-rendered grid (resident + 1 sibling)
+  // got ticked; the rest sat at default (which for licensed-only-in-
+  // a-few-states reps is empty). Fix: settle networkidle, scroll
+  // through the whole wizard panel to force lazy carriers to mount,
+  // sweep, then re-sweep once after another settle to catch any
+  // last late mounts. Also try Material's wrapper labels via .click()
+  // since `.check({ force: true })` no-ops on Angular Material mat-
+  // checkbox components that proxy clicks via the parent label.
+  await page
+    .waitForLoadState("networkidle", { timeout: 15_000 })
+    .catch(() => undefined)
+  await settle(page, 1500)
+  // Force lazy carrier-card mounts by scrolling top → bottom.
+  await page.evaluate(() => {
+    const scrollable =
+      document.scrollingElement || document.documentElement || document.body
+    scrollable.scrollTop = 0
+  })
+  await settle(page, 400)
+  await page.evaluate(() => {
+    const scrollable =
+      document.scrollingElement || document.documentElement || document.body
+    scrollable.scrollTop = scrollable.scrollHeight
+  })
+  await settle(page, 800)
+  await page.evaluate(() => {
+    const scrollable =
+      document.scrollingElement || document.documentElement || document.body
+    scrollable.scrollTop = 0
+  })
+  await settle(page, 600)
   await snapshot(ctx, "fastlane-05-step3-states")
-  try {
-    const checkboxes = await page.$$('input[type="checkbox"]:not([disabled])')
-    for (const cb of checkboxes) {
-      try {
-        const checked = await cb.isChecked()
-        if (!checked) await cb.check({ force: true })
-      } catch {
-        /* ignore */
+  async function tickAllStateBoxes(label: string) {
+    let toggled = 0
+    let alreadyOn = 0
+    let skipped = 0
+    try {
+      // .check({force:true}) is idempotent (no-op if already checked,
+      // sets checked=true otherwise) so it's safe to call on every
+      // visible checkbox. Iterate over native inputs — Material wraps
+      // them in mat-checkbox+label but .check still routes through
+      // Angular's event handlers correctly with force:true.
+      const boxes = await page.$$('input[type="checkbox"]:not([disabled])')
+      for (const cb of boxes) {
+        try {
+          const checked = await cb.isChecked()
+          if (checked) {
+            alreadyOn++
+            continue
+          }
+          await cb.check({ force: true, timeout: 2000 })
+          toggled++
+        } catch {
+          skipped++
+        }
       }
+    } catch (err: any) {
+      logger.warn(`[Fastlane] state checkbox sweep (${label}) failed`, {
+        err: err.message,
+      })
     }
-    logger.info("[Fastlane] ensured all state checkboxes are checked")
-  } catch (err: any) {
-    logger.warn("[Fastlane] state checkbox sweep failed", { err: err.message })
+    logger.info(
+      `[Fastlane] state checkbox sweep (${label}): toggled=${toggled} alreadyOn=${alreadyOn} skipped=${skipped}`,
+    )
+    return { toggled, alreadyOn, skipped }
   }
+  await tickAllStateBoxes("first-pass")
+  await settle(page, 1500)
+  // Second pass — catches any carrier grid that lazy-mounted while
+  // we were ticking the first batch (Angular CDK can defer rendering
+  // virtualized rows until scroll triggers them).
+  await tickAllStateBoxes("second-pass")
   await snapshot(ctx, "fastlane-06-states-after-check-all")
   await clickNextSafe(ctx)
 
