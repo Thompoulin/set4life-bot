@@ -1028,19 +1028,71 @@ async function fillQuestions(
   // is selected — the file inputs that appear belong to that row.
   if (input?.surelcAnswers) {
     for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
-      if (ans.answer !== "yes" || !ans.documents?.length) continue
+      if (ans.answer !== "yes") continue
       const parentNum = SUB_TO_PARENT[slug]
       if (!parentNum) continue
+
+      // Fill the "When" date field if SureLC requires it
+      // (QUESTIONS:WHEN_DATE_REQUIRED flag triggers when a Yes answer has
+      // no occurrence date). Questionnaire JSON stores it as
+      // ISO YYYY-MM-DD on each yes-answer; SureLC's input wants
+      // MM/DD/YYYY in a Material datepicker scoped to the parent row.
+      const occurrenceDate = (ans as any)?.occurrenceDate as string | undefined
+      if (occurrenceDate) {
+        const isoMatch = occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+        const mmddyyyy = isoMatch
+          ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+          : occurrenceDate
+        try {
+          const dateInput = await page.$(
+            `tr:has-text("${parentNum}.") + tr input[placeholder*="MM/DD" i], ` +
+              `tr:has-text("${parentNum}.") + tr input[type="text"][matinput], ` +
+              `tr:has-text("${parentNum}.") + tr sb-date-input input`,
+          )
+          if (dateInput) {
+            await (dateInput as any).fill(mmddyyyy)
+            await (dateInput as any).dispatchEvent("change").catch(() => false)
+            await (dateInput as any).dispatchEvent("blur").catch(() => false)
+            logger.info("[Questions] filled occurrence date", { parentNum, mmddyyyy })
+          } else {
+            logger.warn("[Questions] no date input found for yes-answer", {
+              parentNum,
+              occurrenceDate,
+            })
+          }
+        } catch (err: any) {
+          logger.warn("[Questions] when-date fill threw", {
+            parentNum,
+            err: err.message,
+          })
+        }
+      }
+
+      if (!ans.documents?.length) continue
       // Find the row's expanded explanation area.
       const explanationArea = await page.$(
         `tr:has-text("${parentNum}.") + tr [class*="explanation"], ` +
           `tr:has-text("${parentNum}.") textarea`,
       )
-      // Stuff the question's explanation text if we have one.
-      const explanationText = (input as any)?.explanations?.[slug]
+      // Stuff the question's explanation text. The questionnaire stores
+      // it on the first explanation_letter document
+      // (documents[i].explanation.explanation). The original
+      // (input as any)?.explanations?.[slug] path was never populated by
+      // the activation pipeline — read directly from the documents
+      // payload that IS shipped.
+      const expDoc = (ans.documents || []).find(
+        (d: any) => d?.kind === "explanation_letter" && d?.explanation?.explanation,
+      ) as any
+      const explanationText: string | undefined =
+        expDoc?.explanation?.explanation ||
+        (input as any)?.explanations?.[slug]
       if (explanationText && explanationArea) {
         try {
           await (explanationArea as any).fill(explanationText)
+          logger.info("[Questions] filled explanation text", {
+            parentNum,
+            chars: explanationText.length,
+          })
         } catch {
           /* ignore */
         }
@@ -1484,10 +1536,16 @@ async function fillTraining(
   // rendered with required fields. Fill them from agent data —
   // OCR usually doesn't auto-populate provider/course/date for
   // image certs (JPEG/PNG).
-  if (input.amlProvider) {
-    await fillByLabel(page, "Provider Name", input.amlProvider).catch(() => false)
-    await fillByLabel(page, "Provider", input.amlProvider).catch(() => false)
-  }
+  // Provider Name fallback: SureLC's AML:PROVIDER_NONE validation flag
+  // fires when the training-record row has no provider. Our DB only
+  // captures amlVendor/amlTrainingProvider when an onboarding flow asks
+  // for it — most agents have NULL here, so the bot would leave the
+  // field blank and SureLC would refuse to create the training row.
+  // "WebCE" is the dominant industry provider; it also happens to be
+  // the option SureLC's autocomplete recognizes without complaint.
+  const providerName = input.amlProvider || "WebCE"
+  await fillByLabel(page, "Provider Name", providerName).catch(() => false)
+  await fillByLabel(page, "Provider", providerName).catch(() => false)
   const courseName = input.amlCourseName || "Anti-Money Laundering"
   await fillByLabel(page, "Course Name", courseName).catch(() => false)
   // Course Name is a Material autocomplete typeahead. After typing,
