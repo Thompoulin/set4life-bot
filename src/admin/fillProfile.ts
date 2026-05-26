@@ -2266,77 +2266,135 @@ async function fillSignature(
     }
   }
 
-  // SureLC shows a "Recognition…" spinner while it generates the
-  // image and runs auto-detect. The cropper dialog opens once the
-  // <img class="ngx-ic-source-image"> renders. Wait for that element
-  // explicitly instead of a fixed sleep — auto-detect can take 5-15s
-  // on larger PDFs and a fixed 2.5s sleep was racy.
-  try {
-    await page.waitForSelector(".ngx-ic-source-image", { timeout: 30_000 })
-  } catch {
-    await snapshot(ctx, "tab-signature-03-cropper-never-opened")
-    return { ok: false, reason: "cropper dialog did not open within 30s" }
+  // Skip the cropper UI entirely. SureLC's ngx-image-cropper has been
+  // flaky for 8+ days (modal fails to open ~10x/week, blocking new
+  // producers from clearing SIGN). The direct PUT API endpoint
+  // (`overwriteSignatureImageViaApi` below, proven 2026-05-18 in
+  // commit d78647c against Beam) works as long as SureLC has a PDF
+  // attachment for the producer — which the uploadRemoteFile call
+  // above has already established. The cropper was only ever about
+  // UX; the file-input upload alone is what gets the bytes onto
+  // SureLC's servers.
+  if (!input?.signatureImageUrl) {
+    await snapshot(ctx, "tab-signature-03-no-sig-png")
+    return {
+      ok: false,
+      reason: "no signatureImageUrl on input — cannot use API bypass",
+    }
   }
-  await snapshot(ctx, "tab-signature-03-cropper-open")
-
-  // ── Step 2 — Crop. SureLC's cropper is ngx-image-cropper.
-  // Verified live 2026-05-05 that our generated Signature
-  // Authorization PDF is auto-detected successfully — the cropper
-  // opens with the rectangle already positioned over the signature
-  // box (no "drag to select" warning banner). Happy path is one
-  // click on CROP. We keep manual-drag fallback only for the case
-  // where auto-detect fails (warning banner present).
-  const failedDetect = await page
-    .$('text=/didn.?t detect|drag and resize/i')
-    .catch(() => null)
-  if (failedDetect && isPdf) {
-    logger.warn("[Signature] auto-detect failed — attempting manual drag")
-    try {
-      await positionCropBoxOverSignatureLine(page, logger)
-      await snapshot(ctx, "tab-signature-04-after-manual-drag")
-    } catch (err: any) {
-      logger.warn("[Signature] manual drag threw", { err: err.message })
+  // Give SureLC a moment to persist the uploaded PDF + run its
+  // server-side auto-detect before we GET its attachment id. Auto-
+  // detect happens server-side regardless of whether the cropper
+  // modal opens client-side.
+  await settle(page, 4000)
+  try {
+    await overwriteSignatureImageViaApi(
+      page,
+      producerId,
+      input.signatureImageUrl,
+      logger,
+    )
+    await snapshot(ctx, "tab-signature-03b-api-bypass-done")
+  } catch (apiErr: any) {
+    logger.error({ err: apiErr?.message }, "[Signature] API bypass failed")
+    return {
+      ok: false,
+      reason: `API bypass failed: ${apiErr?.message}`,
     }
   }
 
-  // Cropper-dialog buttons (CANCEL | CROP). Both are mat-mdc-button.
-  // The CROP button has color="primary" / mat-primary; we target the
-  // primary one to avoid clicking CANCEL by mistake.
-  const cropBtn = await firstVisible(page, [
-    'button.mat-primary:has-text("CROP")',
-    'button[color="primary"]:has-text("CROP")',
-    'button:has-text("CROP")',
-  ])
-  if (!cropBtn) {
-    await snapshot(ctx, "tab-signature-04-no-crop-button")
-    return { ok: false, reason: "CROP button not found in cropper dialog" }
-  }
-  await cropBtn.click().catch(() => undefined)
-  await settle(page, 1500)
-  await snapshot(ctx, "tab-signature-05-after-crop-click")
+  const cleared = await waitForTabClear(page, "signature", 12_000)
+  return cleared
+    ? {
+        ok: true,
+        details: { autoSaved: true, warningCleared: true, viaApi: true },
+      }
+    : {
+        ok: false,
+        reason: `API bypass succeeded but Signature tab did not clear. ${await describeUploadablePage(page)}`,
+        details: { viaApi: true, warningCleared: false },
+      }
+}
 
-  // ── Step 3 — Edit Authorized Signature preview screen
-  // (DISCARD | CROP AGAIN | ENHANCE | CONFIRM). Click CONFIRM.
-  const confirmBtn = await firstVisible(page, [
-    'button.mat-primary:has-text("CONFIRM")',
-    'button[color="primary"]:has-text("CONFIRM")',
-    'button:has-text("CONFIRM")',
-    'button:has-text("Confirm")',
-  ])
-  if (confirmBtn) {
-    await confirmBtn.click().catch(() => undefined)
-    await settle(page, 1500)
-    await snapshot(ctx, "tab-signature-06-after-confirm")
-    const cleared = await waitForTabClear(page, "signature", 8_000)
-    return cleared
-      ? { ok: true, details: { autoSaved: true, warningCleared: cleared } }
-      : {
-          ok: false,
-          reason: `Signature confirmed, but Signature tab did not verify complete. ${await describeUploadablePage(page)}`,
-          details: { autoSaved: true, warningCleared: cleared },
-        }
+/**
+ * Overwrite SureLC's auto-detected signature crop with the agent's
+ * pristine source signature PNG via SureLC's direct API. Bypasses the
+ * ngx-image-cropper UI entirely.
+ *
+ * Endpoints discovered 2026-05-18 (commit d78647c, lost during
+ * deploy-withdrawn-fix branch merge; restored 2026-05-26 after Thomas
+ * reported all post-5/18 producers stuck SIGN-flagged):
+ *   GET  /surecrm/signature/{producerId}/pdf   — current PDF attachment
+ *   PUT  /surecrm/signature/{producerId}/{attachId}/confirmImage
+ *        body: { payload: "data:image/png;base64,...", width, height }
+ *
+ * Bearer token is read from the page's localStorage (the BGA SPA stores
+ * its access_token there).
+ */
+async function overwriteSignatureImageViaApi(
+  page: import("playwright").Page,
+  producerId: string,
+  signatureImageUrl: string,
+  logger: import("pino").Logger,
+): Promise<void> {
+  const bearer = await page.evaluate(() => {
+    return (
+      localStorage.getItem("access_token") ||
+      localStorage.getItem("accessToken") ||
+      localStorage.getItem("bga.access_token") ||
+      ""
+    )
+  })
+  if (!bearer) throw new Error("no BGA bearer in localStorage")
+
+  // 1. Fetch the current PDF attachment id from SureLC
+  const pdfMetaRes = await fetch(
+    `https://surelc.surancebay.com/surecrm/signature/${producerId}/pdf`,
+    { headers: { Authorization: `Bearer ${bearer}` } },
+  )
+  if (!pdfMetaRes.ok) {
+    throw new Error(`GET signature/pdf failed: HTTP ${pdfMetaRes.status}`)
   }
-  return { ok: false, reason: "CONFIRM button not found after crop" }
+  const pdfMeta = (await pdfMetaRes.json()) as { id: number }
+  if (!pdfMeta?.id) throw new Error("no PDF attachment id on signature record")
+
+  // 2. Download the source signature PNG
+  const pngRes = await fetch(signatureImageUrl)
+  if (!pngRes.ok) {
+    throw new Error(`fetch signaturePng failed: HTTP ${pngRes.status}`)
+  }
+  const pngBuf = Buffer.from(await pngRes.arrayBuffer())
+
+  // 3. Get image dimensions via sharp
+  const sharp = (await import("sharp")).default
+  const meta = await sharp(pngBuf).metadata()
+  const width = meta.width || 491
+  const height = meta.height || 200
+
+  // 4. Build payload (must be data: URL — bare base64 fails server-side
+  // decoding with "Last unit does not have enough valid bits")
+  const payload = `data:image/png;base64,${pngBuf.toString("base64")}`
+
+  // 5. PUT confirmImage
+  const putUrl = `https://surelc.surancebay.com/surecrm/signature/${producerId}/${pdfMeta.id}/confirmImage`
+  const putRes = await fetch(putUrl, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${bearer}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ payload, width, height }),
+  })
+  if (!putRes.ok) {
+    const errBody = await putRes.text().catch(() => "")
+    throw new Error(
+      `PUT confirmImage failed: HTTP ${putRes.status} ${errBody.slice(0, 200)}`,
+    )
+  }
+  logger.info(
+    { producerId, pdfAttachId: pdfMeta.id, width, height, pngBytes: pngBuf.length },
+    "[Signature] API confirmImage succeeded — signature image set via direct API (no cropper UI)",
+  )
 }
 
 /**
