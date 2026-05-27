@@ -2203,12 +2203,50 @@ async function fillSignature(
       logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (REMOVE/EDIT visible) — skipping")
       return { ok: true, alreadyDone: true, details: { detected: "removeEditButtons" } }
     }
-    // forceReupload=true: the existing signature is stale/broken
-    // (Fastlane flagged "N issues" with the producer despite the
-    // signature tab being green). Click REMOVE, confirm in the
-    // Material modal that SureLC pops, wait for the upload-method
-    // screen to render, then fall through into the normal upload
-    // path below.
+    // forceReupload=true: try the API push FIRST — it overwrites the
+    // existing signature without any UI manipulation, so we never end
+    // up with an erased-but-not-replaced signature. 2026-05-27
+    // incident: nightly retry sweep ran with force=true → REMOVE
+    // succeeded → API push threw on missing `sharp` package → 14
+    // producers lost their signature flags they previously had.
+    // Order: API push first, REMOVE only if it fails.
+    if (input?.signatureImageUrl) {
+      try {
+        const overwriteResult = await pushSignatureViaApi(
+          page,
+          producerId,
+          fileUrl,
+          input.signatureImageUrl,
+          logger,
+        )
+        if (overwriteResult.ok) {
+          await snapshot(ctx, "tab-signature-02-api-overwrite")
+          logger.info(
+            { formId: overwriteResult.formId },
+            "[Signature] API push overwrote existing signature without REMOVE",
+          )
+          return {
+            ok: true,
+            details: {
+              autoSaved: true,
+              warningCleared: true,
+              viaApi: true,
+              viaOverwrite: true,
+              formId: overwriteResult.formId,
+            },
+          }
+        }
+        logger.warn(
+          { reason: overwriteResult.reason },
+          "[Signature] API overwrite failed; falling back to REMOVE + UI re-upload",
+        )
+      } catch (err: any) {
+        logger.warn(
+          { err: err?.message },
+          "[Signature] API overwrite threw; falling back to REMOVE + UI re-upload",
+        )
+      }
+    }
     logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature")
     const removeBtn =
       (await page.$('button:has-text("REMOVE")')) ||
