@@ -621,8 +621,35 @@ app.post("/create-appointment-requests", async (req, res) => {
       )
 
       // Get an existing appointment from the producer (any) to copy
-      // npn/dbaId/email/phone fields from
+      // npn/dbaId/email/phone fields from. For a fresh producer this is
+      // undefined — the producer-info fallback below covers that case.
       const repSample = (Array.isArray(existing) ? existing : [])[0]
+
+      // Always GET the producer record so we have authoritative
+      // npn/email/name fields. Without this, fresh producers (no prior
+      // appointments → repSample undefined) had producerEmailUsed=null
+      // on every created request — Thomas then saw editable/unsigned
+      // agreements at BGA stage with no producer email to send back to
+      // (Javier Castro 2026-05-27). The SureLC SPA exposes the producer
+      // resource under /surecrm/producer/{id}.
+      const producerRecord = await fetch(
+        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      )
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null)
+      const producerEmail: string | null =
+        producerRecord?.email || producerRecord?.effectiveEmail || null
+      const producerEffectiveEmail: string | null =
+        producerRecord?.effectiveEmail || producerRecord?.email || null
+      const producerNpn: string | null = producerRecord?.npn || null
+      const producerName: string | null =
+        producerRecord?.fullName ||
+        (producerRecord?.lastName && producerRecord?.firstName
+          ? `${producerRecord.lastName}, ${producerRecord.firstName}`
+          : null)
+      const producerPhone: string | null =
+        producerRecord?.phone || producerRecord?.cell || null
 
       // Pull template producer's signed Carrier-stage appointments
       const templates = await fetch(
@@ -639,13 +666,30 @@ app.post("/create-appointment-requests", async (req, res) => {
           ...t,
           appointmentRequestId: undefined,
           producerId: Number(producerId),
-          npn: repSample?.npn || t.npn,
+          // Priority: repSample (prior real appointment for THIS producer)
+          // → producer record (always available for any producer SureLC
+          // knows about) → template clone (last resort). The template
+          // values are someone ELSE's data (Sydney 11482453), so they
+          // are the worst possible source for producer-identity fields.
+          npn: repSample?.npn || producerNpn || t.npn,
           dbaId: repSample?.dbaId || t.dbaId,
-          producerName: repSample?.producerName || t.producerName,
-          producerEmail: repSample?.producerEmail || t.producerEmail,
-          producerEffectiveEmail: repSample?.producerEffectiveEmail || t.producerEffectiveEmail,
-          producerEmailUsed: repSample?.producerEmailUsed || repSample?.producerEffectiveEmail,
-          producerEffectivePhone: repSample?.producerEffectivePhone,
+          producerName: repSample?.producerName || producerName || t.producerName,
+          producerEmail: repSample?.producerEmail || producerEmail || t.producerEmail,
+          producerEffectiveEmail:
+            repSample?.producerEffectiveEmail ||
+            producerEffectiveEmail ||
+            t.producerEffectiveEmail,
+          // producerEmailUsed is the address SureLC will send the
+          // rep-review email to. MUST be the target producer's own
+          // address — never the template's. Falling through to null
+          // (the old bug) produces editable BGA-stage requests with no
+          // way to send the producer-review email.
+          producerEmailUsed:
+            repSample?.producerEmailUsed ||
+            repSample?.producerEffectiveEmail ||
+            producerEffectiveEmail ||
+            producerEmail,
+          producerEffectivePhone: repSample?.producerEffectivePhone || producerPhone,
           carrierStatus: "ProducerReview",
           stage: "Producer",
           reviewed: "N",
@@ -661,6 +705,19 @@ app.post("/create-appointment-requests", async (req, res) => {
         delete (newAppt as any).confirmationDate
         delete (newAppt as any).confirmationIP
         delete (newAppt as any).comments
+
+        // Guard: refuse to POST if producerEmailUsed is missing — that
+        // path produces unsigned BGA-stage orphans that block the BGA
+        // admin from promoting to Carrier. Skip the carrier and log so
+        // the caller can fix the producer record before retrying.
+        if (!newAppt.producerEmailUsed) {
+          logger.warn(
+            { producerId, carrier: t.carrierName },
+            "[create-appointment-requests] skipping carrier — producerEmailUsed unresolved",
+          )
+          created.push({ carrier: t.carrierName, status: 0 })
+          continue
+        }
 
         const r = await fetch("https://surelc.surancebay.com/surecrm/appointments-requests", {
           method: "POST",
@@ -681,6 +738,150 @@ app.post("/create-appointment-requests", async (req, res) => {
     }
   } catch (err: any) {
     logger.error({ err: err?.message }, "/create-appointment-requests threw")
+    return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
+/**
+ * POST /recover-orphan-bga-requests
+ *
+ * Recover orphan BGA-stage appointment-requests for a producer. An
+ * "orphan" is an appointment-request at stage="BGA" whose
+ * producerEmailUsed is null/empty — created by the old
+ * fastlane_fallback_direct_post path before the 2026-05-27 fix.
+ * These have unsigned/editable agreement segments and block the BGA
+ * admin from promoting to Carrier ("send back to producer for review"
+ * error). Move them back to stage="Producer" so the producer-review
+ * email is dispatched and the rep can sign.
+ *
+ * Body: { producerId, gaId?, adminCreds, comment? }
+ * Returns: { ok, total, reverted, failed }
+ */
+const recoverOrphanSchema = z.object({
+  producerId: z.string().min(1),
+  adminCreds: adminCredsSchema,
+  gaId: z.number().int().positive().optional(),
+  comment: z.string().max(500).optional(),
+})
+app.post("/recover-orphan-bga-requests", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = recoverOrphanSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, adminCreds } = parsed.data
+  const gaId = parsed.data.gaId ?? 1322
+  const comment = parsed.data.comment ?? "Set4Life bot — revert orphan back to producer for review"
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const loginResult = await loginAdmin(page, adminCreds, logger)
+      if (!loginResult.ok) {
+        return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
+      }
+      let bearer = ""
+      const handler = (req: any) => {
+        const a = req.headers()["authorization"]
+        if (!bearer && req.url().includes("/surecrm/") && typeof a === "string" && a.startsWith("Bearer ")) {
+          bearer = a.replace(/^Bearer /, "")
+          page.off("request", handler)
+        }
+      }
+      page.on("request", handler)
+      await page
+        .evaluate((id) => {
+          history.pushState({}, "", `/bga/producers/${id}/profile`)
+          window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+        }, producerId)
+        .catch(() => undefined)
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline && !bearer) await page.waitForTimeout(250)
+      if (!bearer) {
+        return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
+      }
+
+      const listRes = await fetch(
+        `https://surelc.surancebay.com/surecrm/appointments-requests?producerId=${producerId}&gaId=${gaId}`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      )
+      if (!listRes.ok) {
+        return res.status(502).json({ ok: false, error: `appointments-requests HTTP ${listRes.status}` })
+      }
+      const all = (await listRes.json()) as Array<{
+        appointmentRequestId: number
+        stage: string
+        carrierName: string
+        producerEmailUsed?: string | null
+      }>
+      const orphans = (Array.isArray(all) ? all : []).filter((r) => {
+        if (r.stage !== "BGA") return false
+        const v = (r.producerEmailUsed || "").trim()
+        return v === "" || v === "null"
+      })
+
+      logger.info(
+        { producerId, totalAtBga: all.filter((r) => r.stage === "BGA").length, orphans: orphans.length },
+        "[recover-orphan-bga-requests] discovery",
+      )
+
+      const reverted: Array<{ id: number; carrierName: string; status: number }> = []
+      const failed: Array<{ id: number; carrierName: string; status: number; reason: string }> = []
+      for (const o of orphans) {
+        const url = `https://surelc.surancebay.com/surecrm/appointments-requests/${o.appointmentRequestId}/stage`
+        try {
+          const r = await fetch(url, {
+            method: "PUT",
+            headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+            body: JSON.stringify({ stage: "Producer", comment, isPrivate: false }),
+          })
+          if (r.ok) {
+            reverted.push({ id: o.appointmentRequestId, carrierName: o.carrierName, status: r.status })
+            logger.info(
+              { id: o.appointmentRequestId, carrier: o.carrierName },
+              "[recover-orphan-bga-requests] reverted BGA → Producer",
+            )
+          } else {
+            const body = (await r.text().catch(() => "")).slice(0, 200)
+            failed.push({
+              id: o.appointmentRequestId,
+              carrierName: o.carrierName,
+              status: r.status,
+              reason: body || `HTTP ${r.status}`,
+            })
+          }
+        } catch (err: any) {
+          failed.push({
+            id: o.appointmentRequestId,
+            carrierName: o.carrierName,
+            status: 0,
+            reason: err?.message || "fetch threw",
+          })
+        }
+      }
+
+      return res.json({
+        ok: failed.length === 0,
+        producerId,
+        total: orphans.length,
+        reverted,
+        failed,
+      })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/recover-orphan-bga-requests threw")
     return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
   }
 })

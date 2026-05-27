@@ -2186,22 +2186,47 @@ async function fillSignature(
   }
 
   // Content-presence "already done" detector: when a signature is on
-  // file, SureLC renders a "Signature Authorization" header card with
-  // a date and **REMOVE / EDIT** buttons (no UPLOAD IT NOW button).
-  // The Signature Image preview also shows the rep's typed signature.
-  // Sydney 2026-05-07 03:33 — bot reported "file input not found" and
-  // bailed because the upload form isn't rendered when a signature is
-  // already present.
+  // file AND cropper-confirmed, SureLC renders a "Signature
+  // Authorization" header card with the confirmation date. Only treat
+  // the DATED line as definitive evidence of a complete signature.
+  //
+  // 2026-05-27: the looser `REMOVE + EDIT + Signature Image` clause
+  // matched signatures that had been uploaded via /uploadForm but
+  // never reached cropper-confirmed state (confirmImage failed or was
+  // skipped on a prior run). Bot reported alreadyDone, Fastlane saw
+  // the producer as unsignatured, refused to expose the SELECT button,
+  // and the activationPipeline fastlane_fallback_direct_post fired,
+  // creating orphan BGA-stage requests with producerEmailUsed=null
+  // (Javier Castro, Shingai Gurira, Doriz Lopez, Demetrius Early Jr).
+  // Forcing the API push (uploadForm + confirmImage) when only the
+  // loose pattern is present is safe — pushSignatureViaApi overwrites
+  // idempotently and the REMOVE-then-reupload fallback handles the
+  // rare case where overwrite fails.
   const sigText = await page
     .$$eval("body", (els) => (els[0]?.innerText || ""))
     .catch(() => "")
-  const hasUploaded =
-    /Signature Authorization\s*\n?\s*\d{2}\/\d{2}\/\d{4}/i.test(sigText) ||
-    (/REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText))
+  const hasDatedAuthorization = /Signature Authorization\s*\n?\s*\d{2}\/\d{2}\/\d{4}/i.test(
+    sigText,
+  )
+  const hasLooseRemoveEdit =
+    /REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText)
+  const hasUploaded = hasDatedAuthorization
+  if (!hasUploaded && hasLooseRemoveEdit) {
+    // Partial-upload state: signature exists in DOM (REMOVE+EDIT
+    // buttons visible) but never reached cropper-confirmed (no dated
+    // header). Don't skip — fall through to the API push at the end
+    // of this function which overwrites idempotently via uploadForm +
+    // confirmImage. This is the codepath the 2026-05-27 Javier/Shingai/
+    // Doriz/Demetrius cohort needed.
+    logger.warn(
+      { excerpt: sigText.slice(0, 200) },
+      "[Signature] partial upload detected (REMOVE/EDIT visible, no dated Signature Authorization) — forcing API push to confirm",
+    )
+  }
   if (hasUploaded) {
     if (!input?.forceReupload) {
-      logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (REMOVE/EDIT visible) — skipping")
-      return { ok: true, alreadyDone: true, details: { detected: "removeEditButtons" } }
+      logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (dated Signature Authorization visible) — skipping")
+      return { ok: true, alreadyDone: true, details: { detected: "datedAuthorization" } }
     }
     // forceReupload=true: try the API push FIRST — it overwrites the
     // existing signature without any UI manipulation, so we never end
