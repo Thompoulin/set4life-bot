@@ -2369,10 +2369,18 @@ async function pushSignatureViaApi(
   if (!pngRes.ok) return { ok: false, reason: `fetch pngUrl failed: HTTP ${pngRes.status}` }
   const pngBuf = Buffer.from(await pngRes.arrayBuffer())
 
-  const sharp = (await import("sharp")).default
-  const meta = await sharp(pngBuf).metadata()
-  const width = meta.width || 491
-  const height = meta.height || 200
+  // PNG IHDR chunk encodes width (uint32 BE at offset 16) and height
+  // (offset 20). Read directly from the buffer — sharp isn't in
+  // dependencies and pulling it in just for two integers triggered a
+  // 2026-05-27 ESM resolve failure that broke every signature push.
+  let width = 491
+  let height = 200
+  if (pngBuf.length >= 24 && pngBuf[0] === 0x89 && pngBuf[1] === 0x50 && pngBuf[2] === 0x4e && pngBuf[3] === 0x47) {
+    width = pngBuf.readUInt32BE(16) || 491
+    height = pngBuf.readUInt32BE(20) || 200
+  } else {
+    logger.warn({ pngBufHead: pngBuf.slice(0, 8).toString("hex") }, "[Signature] PNG magic bytes missing — using default dimensions")
+  }
 
   // Step 1 — POST /uploadForm
   const fd = new FormData()
