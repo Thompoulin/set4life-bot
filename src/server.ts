@@ -887,6 +887,117 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
 })
 
 /**
+ * POST /set-producer-fields
+ *
+ * General-purpose producer-record patcher. Same plumbing as
+ * /set-producer-email — login as admin, harvest the SureCRM Bearer
+ * JWT, PUT /surecrm/producers/{id}/update with `{producer: {...fields}}`.
+ *
+ * Use case (2026-05-27): Javier Castro went through onboarding on
+ * our app with full data (DL, address, cell, E&O) but never
+ * completed Phase B on SureLC — so SureLC's producer profile fields
+ * stayed null and Fastlane refuses to expose SELECT (the wizard
+ * pre-flight checks producer completeness). Pre-populating the
+ * profile via this endpoint lets Fastlane succeed without needing
+ * the producer to come back and re-sign on the SPA portal.
+ *
+ * Body: { producerId, fields, adminCreds }
+ *   fields: any subset of producer fields SureLC accepts on /update
+ *     (driverLic, driverLicState, driverLicenseExp, cell, email,
+ *     domicileState, etc.) — sent verbatim inside `{producer: {...}}`.
+ *
+ * Returns: { ok, producerId, fieldsSent, putStatus, response }
+ */
+const setProducerFieldsSchema = z.object({
+  producerId: z.string().min(1),
+  fields: z.record(z.string(), z.any()),
+  adminCreds: adminCredsSchema,
+})
+app.post("/set-producer-fields", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = setProducerFieldsSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, fields, adminCreds } = parsed.data
+  if (Object.keys(fields).length === 0) {
+    return res.status(400).json({ error: "fields must be non-empty" })
+  }
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const lr = await loginAdmin(page, adminCreds, logger)
+      if (!lr.ok) {
+        return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      }
+      let bearer = ""
+      page.on("request", (req) => {
+        const a = req.headers()["authorization"]
+        if (!bearer && req.url().includes("/surecrm/") && typeof a === "string" && a.startsWith("Bearer ")) {
+          bearer = a.replace(/^Bearer /, "")
+        }
+      })
+      await page.evaluate((id) => {
+        history.pushState({}, "", `/bga/producers/${id}/profile`)
+        window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+      }, producerId).catch(() => undefined)
+      const dl = Date.now() + 15_000
+      while (Date.now() < dl && !bearer) await page.waitForTimeout(250)
+      if (!bearer) {
+        return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
+      }
+
+      const body = JSON.stringify({ producer: fields })
+      const r = await fetch(
+        `https://surelc.surancebay.com/surecrm/producers/${producerId}/update`,
+        {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+          body,
+        },
+      )
+      const responseText = (await r.text().catch(() => "")).slice(0, 800)
+      if (!r.ok) {
+        return res.status(502).json({
+          ok: false,
+          producerId,
+          fieldsSent: Object.keys(fields),
+          putStatus: r.status,
+          error: responseText,
+        })
+      }
+      logger.info(
+        { producerId, fields: Object.keys(fields), putStatus: r.status },
+        "[set-producer-fields] PUT ok",
+      )
+      return res.json({
+        ok: true,
+        producerId,
+        fieldsSent: Object.keys(fields),
+        putStatus: r.status,
+        response: responseText.slice(0, 200),
+      })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/set-producer-fields threw")
+    return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
+/**
  * POST /set-producer-email
  *
  * Update the SureLC producer record's `email` field via the BGA SPA's
