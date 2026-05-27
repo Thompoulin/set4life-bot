@@ -956,27 +956,26 @@ app.post("/set-producer-email", async (req, res) => {
         return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
       }
 
-      // 1) Fetch the full producer model. The SPA uses
-      //    GET /surecrm/producers/{id}/model — confirmed via network
-      //    probe of the admin Change-Email dialog 2026-05-27 (Holton
-      //    Buggs producerId 11096584). The model endpoint returns the
-      //    nested object the SPA edits in-place; we splice in the new
-      //    email and PUT the whole thing back.
-      const getRes = await fetch(
-        `https://surelc.surancebay.com/surecrm/producers/${producerId}/model`,
-        { headers: { Authorization: `Bearer ${bearer}` } },
-      )
-      if (!getRes.ok) {
-        return res
-          .status(502)
-          .json({ ok: false, error: `GET /surecrm/producers/${producerId}/model HTTP ${getRes.status}` })
+      // 1) Read current email via the public x-api-key API. We use
+      //    this (not the SPA's /model) because the body we send to
+      //    /update is a tiny delta — no need to fetch the full model.
+      let beforeEmail: string | null = null
+      try {
+        const apiKey = process.env.SURELC_API_KEY || process.env.SURELC_API_TOKEN
+        if (apiKey) {
+          const cur = await fetch(
+            `https://surelc.surancebay.com/api/v2/producers/${producerId}`,
+            { headers: { "x-api-key": apiKey } },
+          )
+          if (cur.ok) {
+            const j = (await cur.json()) as { email?: string }
+            beforeEmail = j.email ?? null
+          }
+        }
+      } catch {
+        /* fall through — beforeEmail just stays null */
       }
-      const model = (await getRes.json()) as Record<string, any>
-      // Locate the email field — the model is nested; the SPA reads it
-      // from model.email at the top level (same as the public-API
-      // producer record).
-      const beforeEmail = (model.email || model.contactInfo?.email || "") as string
-      if ((beforeEmail || "").toLowerCase() === newEmail.toLowerCase()) {
+      if (beforeEmail && beforeEmail.toLowerCase() === newEmail.toLowerCase()) {
         return res.json({
           ok: true,
           producerId,
@@ -987,20 +986,20 @@ app.post("/set-producer-email", async (req, res) => {
         })
       }
 
-      // 2) PUT /update with the modified model. Confirmed working path
-      //    (status 200) — Holton Buggs's email was successfully
-      //    changed from holton.buggs@… to holtonbuggs@… via this
-      //    endpoint during the 2026-05-27 probe run.
-      const patched: Record<string, any> = { ...model, email: newEmail }
-      if (model.contactInfo) {
-        patched.contactInfo = { ...model.contactInfo, email: newEmail }
-      }
+      // 2) PUT /update with the minimal `{producer: {email}}` delta.
+      //    Confirmed body shape via network probe of the admin
+      //    Change-Email dialog 2026-05-27 — exactly this payload
+      //    successfully changed Holton Buggs (11096584) and Vanda
+      //    Jamison (3924805) emails to the agency mailbox (verified
+      //    via public-API GET post-PUT, both modifiedOn stamps moved).
+      //    Sending the FULL /model back triggers SureLC's Java NPE
+      //    on certain producers; the delta-only body avoids that.
       const putRes = await fetch(
         `https://surelc.surancebay.com/surecrm/producers/${producerId}/update`,
         {
           method: "PUT",
           headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
-          body: JSON.stringify(patched),
+          body: JSON.stringify({ producer: { email: newEmail } }),
         },
       )
       if (!putRes.ok) {
