@@ -887,6 +887,103 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
 })
 
 /**
+ * POST /diagnose-producer
+ *
+ * Returns SureLC's authoritative validation errors for a producer —
+ * the same data the BGA SPA reads to render the "N issues" badges
+ * and the popover tooltips. Use this instead of guessing what
+ * Fastlane is complaining about.
+ *
+ * Calls POST /surecrm/validation/list with [producerId] via the
+ * SureCRM Bearer JWT. Returns whatever SureLC sends back.
+ *
+ * 2026-05-27 motivation: Javier Castro keeps failing Fastlane with
+ * the misleading "[signature] delete_outline REMOVE" diagnostic
+ * (which actually means signature IS present). The bot's profile-
+ * scan can't surface the real blockers. /validation/list is the
+ * source of truth.
+ *
+ * Body: { producerId, adminCreds }
+ * Returns: { ok, validation: <raw SureLC response> }
+ */
+const diagnoseProducerSchema = z.object({
+  producerId: z.string().min(1),
+  adminCreds: adminCredsSchema,
+})
+app.post("/diagnose-producer", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = diagnoseProducerSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, adminCreds } = parsed.data
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const lr = await loginAdmin(page, adminCreds, logger)
+      if (!lr.ok) {
+        return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      }
+      let bearer = ""
+      page.on("request", (req) => {
+        const a = req.headers()["authorization"]
+        if (!bearer && req.url().includes("/surecrm/") && typeof a === "string" && a.startsWith("Bearer ")) {
+          bearer = a.replace(/^Bearer /, "")
+        }
+      })
+      await page.evaluate((id) => {
+        history.pushState({}, "", `/bga/producers/${id}/profile`)
+        window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+      }, producerId).catch(() => undefined)
+      const dl = Date.now() + 15_000
+      while (Date.now() < dl && !bearer) await page.waitForTimeout(250)
+      if (!bearer) {
+        return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
+      }
+
+      // The /surecrm/validation/list endpoint takes an array of
+      // producerIds and returns validation issues per producer.
+      // Captured from the SPA's network probe on 2026-05-27.
+      const r = await fetch(
+        `https://surelc.surancebay.com/surecrm/validation/list`,
+        {
+          method: "POST",
+          headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+          body: JSON.stringify([Number(producerId)]),
+        },
+      )
+      const text = await r.text().catch(() => "")
+      let body: any = null
+      try { body = JSON.parse(text) } catch { body = text }
+      if (!r.ok) {
+        return res.status(502).json({
+          ok: false,
+          producerId,
+          error: `validation/list HTTP ${r.status}: ${text.slice(0, 300)}`,
+        })
+      }
+      return res.json({ ok: true, producerId, validation: body })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/diagnose-producer threw")
+    return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
+/**
  * POST /set-producer-fields
  *
  * General-purpose producer-record patcher. Same plumbing as
