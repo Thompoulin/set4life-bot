@@ -887,6 +887,159 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
 })
 
 /**
+ * POST /set-producer-email
+ *
+ * Update the SureLC producer record's `email` field via the BGA SPA's
+ * own Bearer-JWT endpoint (PUT /surecrm/producer/{id}). The public
+ * x-api-key API path (PUT /api/v2/producers/) silently NO-OPs the
+ * email field on UPDATE — likely because SureLC pins NIPR-sourced
+ * values there. The BGA admin SPA is the source-of-truth path admins
+ * use when they manually edit email in the portal; calling its
+ * underlying endpoint directly mimics that behavior.
+ *
+ * 2026-05-27 context: Javier Castro + 12 other agents drifted to
+ * NIPR-pinned personal emails. The boot migration reported success
+ * but SureLC kept the old email. This endpoint lets the email-drift
+ * sweep auto-heal instead of just alerting.
+ *
+ * Body: { producerId, newEmail, adminCreds }
+ * Returns: { ok, beforeEmail, afterEmail }
+ */
+const setProducerEmailSchema = z.object({
+  producerId: z.string().min(1),
+  newEmail: z.string().email(),
+  adminCreds: adminCredsSchema,
+})
+app.post("/set-producer-email", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = setProducerEmailSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, newEmail, adminCreds } = parsed.data
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const loginResult = await loginAdmin(page, adminCreds, logger)
+      if (!loginResult.ok) {
+        return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
+      }
+      let bearer = ""
+      const handler = (req: any) => {
+        const a = req.headers()["authorization"]
+        if (!bearer && req.url().includes("/surecrm/") && typeof a === "string" && a.startsWith("Bearer ")) {
+          bearer = a.replace(/^Bearer /, "")
+          page.off("request", handler)
+        }
+      }
+      page.on("request", handler)
+      await page
+        .evaluate((id) => {
+          history.pushState({}, "", `/bga/producers/${id}/profile`)
+          window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+        }, producerId)
+        .catch(() => undefined)
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline && !bearer) await page.waitForTimeout(250)
+      if (!bearer) {
+        return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
+      }
+
+      // 1) Fetch current producer record (we need the full body for the
+      //    PUT — SureLC's SPA send the whole record back, not a patch).
+      const getRes = await fetch(
+        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      )
+      if (!getRes.ok) {
+        return res
+          .status(502)
+          .json({ ok: false, error: `GET /surecrm/producer/${producerId} HTTP ${getRes.status}` })
+      }
+      const producer = (await getRes.json()) as Record<string, any>
+      const beforeEmail = producer.email
+      if ((beforeEmail || "").toLowerCase() === newEmail.toLowerCase()) {
+        return res.json({
+          ok: true,
+          producerId,
+          beforeEmail,
+          afterEmail: beforeEmail,
+          noOp: true,
+          message: "email already matches — no PUT issued",
+        })
+      }
+
+      // 2) PUT the modified record back. Keep every other field as-is.
+      const patched = { ...producer, email: newEmail }
+      const putRes = await fetch(
+        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        {
+          method: "PUT",
+          headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+          body: JSON.stringify(patched),
+        },
+      )
+      if (!putRes.ok) {
+        const body = (await putRes.text().catch(() => "")).slice(0, 300)
+        return res.status(502).json({
+          ok: false,
+          producerId,
+          beforeEmail,
+          error: `PUT /surecrm/producer/${producerId} HTTP ${putRes.status}: ${body}`,
+        })
+      }
+
+      // 3) Verify via fresh GET — same trust-but-verify pattern as
+      //    producerEmailMigration.ts. If SureLC silently kept the old
+      //    email despite our PUT, surface as failed so the caller can
+      //    escalate (e.g. fall back to UI clicking or owner alert).
+      const verifyRes = await fetch(
+        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      )
+      const verifyBody = verifyRes.ok ? ((await verifyRes.json()) as Record<string, any>) : null
+      const afterEmail = verifyBody?.email
+      const matched = (afterEmail || "").toLowerCase() === newEmail.toLowerCase()
+      if (!matched) {
+        return res.status(409).json({
+          ok: false,
+          producerId,
+          beforeEmail,
+          afterEmail,
+          error: `PUT accepted (HTTP ${putRes.status}) but verification GET shows email is still "${afterEmail || "(empty)"}" — SureLC likely refused the field update`,
+        })
+      }
+      logger.info(
+        { producerId, beforeEmail, afterEmail },
+        "[set-producer-email] success",
+      )
+      return res.json({
+        ok: true,
+        producerId,
+        beforeEmail,
+        afterEmail,
+      })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/set-producer-email threw")
+    return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
+/**
  * POST /patch-appointments-to-resident-state
  *
  * Workaround for Phase B wizard rejections (Keyon Foresters 2026-05-10):
