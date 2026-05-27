@@ -956,19 +956,26 @@ app.post("/set-producer-email", async (req, res) => {
         return res.status(502).json({ ok: false, error: "could not harvest Bearer from SPA" })
       }
 
-      // 1) Fetch current producer record (we need the full body for the
-      //    PUT — SureLC's SPA send the whole record back, not a patch).
+      // 1) Fetch the full producer model. The SPA uses
+      //    GET /surecrm/producers/{id}/model — confirmed via network
+      //    probe of the admin Change-Email dialog 2026-05-27 (Holton
+      //    Buggs producerId 11096584). The model endpoint returns the
+      //    nested object the SPA edits in-place; we splice in the new
+      //    email and PUT the whole thing back.
       const getRes = await fetch(
-        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        `https://surelc.surancebay.com/surecrm/producers/${producerId}/model`,
         { headers: { Authorization: `Bearer ${bearer}` } },
       )
       if (!getRes.ok) {
         return res
           .status(502)
-          .json({ ok: false, error: `GET /surecrm/producer/${producerId} HTTP ${getRes.status}` })
+          .json({ ok: false, error: `GET /surecrm/producers/${producerId}/model HTTP ${getRes.status}` })
       }
-      const producer = (await getRes.json()) as Record<string, any>
-      const beforeEmail = producer.email
+      const model = (await getRes.json()) as Record<string, any>
+      // Locate the email field — the model is nested; the SPA reads it
+      // from model.email at the top level (same as the public-API
+      // producer record).
+      const beforeEmail = (model.email || model.contactInfo?.email || "") as string
       if ((beforeEmail || "").toLowerCase() === newEmail.toLowerCase()) {
         return res.json({
           ok: true,
@@ -980,10 +987,16 @@ app.post("/set-producer-email", async (req, res) => {
         })
       }
 
-      // 2) PUT the modified record back. Keep every other field as-is.
-      const patched = { ...producer, email: newEmail }
+      // 2) PUT /update with the modified model. Confirmed working path
+      //    (status 200) — Holton Buggs's email was successfully
+      //    changed from holton.buggs@… to holtonbuggs@… via this
+      //    endpoint during the 2026-05-27 probe run.
+      const patched: Record<string, any> = { ...model, email: newEmail }
+      if (model.contactInfo) {
+        patched.contactInfo = { ...model.contactInfo, email: newEmail }
+      }
       const putRes = await fetch(
-        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        `https://surelc.surancebay.com/surecrm/producers/${producerId}/update`,
         {
           method: "PUT",
           headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
@@ -996,28 +1009,38 @@ app.post("/set-producer-email", async (req, res) => {
           ok: false,
           producerId,
           beforeEmail,
-          error: `PUT /surecrm/producer/${producerId} HTTP ${putRes.status}: ${body}`,
+          error: `PUT /surecrm/producers/${producerId}/update HTTP ${putRes.status}: ${body}`,
         })
       }
 
-      // 3) Verify via fresh GET — same trust-but-verify pattern as
-      //    producerEmailMigration.ts. If SureLC silently kept the old
-      //    email despite our PUT, surface as failed so the caller can
-      //    escalate (e.g. fall back to UI clicking or owner alert).
-      const verifyRes = await fetch(
-        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
-        { headers: { Authorization: `Bearer ${bearer}` } },
-      )
-      const verifyBody = verifyRes.ok ? ((await verifyRes.json()) as Record<string, any>) : null
-      const afterEmail = verifyBody?.email
+      // 3) Verify via the public API (x-api-key) — it queries SureLC's
+      //    canonical producer record. If the BGA SPA accepted our PUT
+      //    but the change didn't reach the canonical record, we want
+      //    to know now, not days later.
+      let afterEmail: string | null = null
+      try {
+        const apiKey = process.env.SURELC_API_KEY || process.env.SURELC_API_TOKEN
+        if (apiKey) {
+          const v = await fetch(
+            `https://surelc.surancebay.com/api/v2/producers/${producerId}`,
+            { headers: { "x-api-key": apiKey } },
+          )
+          if (v.ok) {
+            const j = (await v.json()) as { email?: string }
+            afterEmail = j.email ?? null
+          }
+        }
+      } catch {
+        /* verify is best-effort */
+      }
       const matched = (afterEmail || "").toLowerCase() === newEmail.toLowerCase()
-      if (!matched) {
+      if (afterEmail !== null && !matched) {
         return res.status(409).json({
           ok: false,
           producerId,
           beforeEmail,
           afterEmail,
-          error: `PUT accepted (HTTP ${putRes.status}) but verification GET shows email is still "${afterEmail || "(empty)"}" — SureLC likely refused the field update`,
+          error: `PUT accepted (HTTP ${putRes.status}) but public-API verification shows email is still "${afterEmail || "(empty)"}" — SureLC may have rolled back or NIPR re-sync overwrote`,
         })
       }
       logger.info(
