@@ -2593,13 +2593,63 @@ async function pushSignatureViaApi(
  * Returns "" if no Authorization header has been seen.
  */
 async function harvestBgaBearer(page: import("playwright").Page): Promise<string> {
+  // Strategy 1 (reliable) — read directly from browser storage. SureLC's
+  // BGA SPA persists its Bearer JWT under the localStorage key
+  // `sb:id_token` (verified bgaTokenCapture.ts:347 — same pattern used by
+  // /get-bga-tokens). This bypasses ALL network-listener race conditions
+  // (the previous approach failed 80%+ of Phase A runs 2026-05-28 because
+  // the SPA's interceptor sometimes fired the /surecrm/* request before
+  // our page.on("request") handler attached, or the JWT-shape check ran
+  // before resolve was invoked).
+  //
+  // Poll storage for up to 5s — the SPA might be mid-mount on first goto.
+  const isJwt = (s: string) => typeof s === "string" && s.split(".").length === 3
+  const storageDeadline = Date.now() + 5_000
+  while (Date.now() < storageDeadline) {
+    const fromStorage = await page
+      .evaluate(() => {
+        const buckets: Record<string, string> = {}
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i)
+          if (k) buckets[`local:${k}`] = localStorage.getItem(k) || ""
+        }
+        for (let i = 0; i < sessionStorage.length; i++) {
+          const k = sessionStorage.key(i)
+          if (k) buckets[`session:${k}`] = sessionStorage.getItem(k) || ""
+        }
+        return buckets
+      })
+      .catch(() => ({}) as Record<string, string>)
+    // Try the SureLC-specific keys first.
+    for (const [k, v] of Object.entries(fromStorage)) {
+      if (!v) continue
+      if (/(?:^|:)id_token$/i.test(k) && isJwt(v)) return v
+      if (/access(?:_?token)?/i.test(k) && isJwt(v)) return v
+      // JSON-wrapped formats (older SDK versions).
+      try {
+        const obj = JSON.parse(v)
+        if (obj && typeof obj === "object") {
+          if (isJwt(obj.access_token)) return obj.access_token
+          if (isJwt(obj.accessToken)) return obj.accessToken
+        }
+      } catch {
+        /* not JSON */
+      }
+    }
+    await page.waitForTimeout(250)
+  }
+
+  // Strategy 2 (fallback) — original network-listener approach. If the
+  // SPA hasn't put the token in storage yet, force an outbound call and
+  // grab the Authorization header. Kept as belt-and-suspenders in case
+  // SureLC changes their storage key in a future SPA build.
   return new Promise((resolve) => {
     let bearer = ""
     const handler = (req: import("playwright").Request) => {
       const a = req.headers()["authorization"]
       if (a?.startsWith("Bearer ") && req.url().includes("/surecrm/")) {
         const token = a.replace("Bearer ", "")
-        if (token.split(".").length === 3) {
+        if (isJwt(token)) {
           bearer = token
           page.off("request", handler)
           resolve(bearer)
@@ -2607,12 +2657,7 @@ async function harvestBgaBearer(page: import("playwright").Page): Promise<string
       }
     }
     page.on("request", handler)
-    // Force the SPA to make at least one /surecrm/* call by polling
-    // validation/list for an arbitrary producer (the current page's).
-    // The fetch goes through the SPA's HttpClient → bearer attached.
     page.evaluate(() => {
-      // The SPA is Angular; window.fetch is the same global. Make a
-      // harmless GET that the SPA's interceptor will sign.
       fetch("/surecrm/user/timezone", { method: "POST", body: "-240" }).catch(() => {})
     }).catch(() => {})
     setTimeout(() => {
