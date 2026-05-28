@@ -1586,8 +1586,41 @@ async function fillTraining(
   // "WebCE" is the dominant industry provider; it also happens to be
   // the option SureLC's autocomplete recognizes without complaint.
   const providerName = input.amlProvider || "WebCE"
-  await fillByLabel(page, "Provider Name", providerName).catch(() => false)
-  await fillByLabel(page, "Provider", providerName).catch(() => false)
+  // Provider Name is a Material autocomplete (sb-provider-autocomplete
+  // or sb-autocomplete depending on SureLC version). Plain fillByLabel
+  // types text but doesn't COMMIT — the form keeps the field empty
+  // until an mat-option is selected from the open panel. Same pattern
+  // as Course Name below.
+  //
+  // Verified pattern 2026-05-28 (Julissa Chacon producer 2157902 + 4
+  // other agents): every nightly Phase A failed with "Contracting
+  // BLOCKED — AML file attached, but Training Provider not selected"
+  // because the typed-but-not-selected value never saved. SureLC's
+  // server-side validation flags AML:PROVIDER_NONE on these rows.
+  let providerTyped = await fillByLabel(page, "Provider Name", providerName).catch(() => false)
+  if (!providerTyped) providerTyped = await fillByLabel(page, "Provider", providerName).catch(() => false)
+  if (providerTyped) {
+    await page.waitForTimeout(800)
+    const providerOption = await firstVisible(page, [
+      `mat-option:has-text("${providerName}")`,
+      'mat-option:has-text("WebCE")',
+      'mat-option:has-text("LIMRA")',
+      '.cdk-overlay-pane mat-option',
+    ])
+    if (providerOption) {
+      logger.info(
+        { providerName },
+        "[Training] selecting Provider Name from autocomplete",
+      )
+      await (providerOption as any).click().catch(() => undefined)
+      await settle(page, 600)
+    } else {
+      logger.warn(
+        { providerName },
+        "[Training] no provider mat-option visible after typing — typed value will not commit (SureLC AML:PROVIDER_NONE will remain)",
+      )
+    }
+  }
   const courseName = input.amlCourseName || "Anti-Money Laundering"
   await fillByLabel(page, "Course Name", courseName).catch(() => false)
   // Course Name is a Material autocomplete typeahead. After typing,
