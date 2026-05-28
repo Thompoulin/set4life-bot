@@ -961,19 +961,61 @@ async function fillQuestions(
     return { ok: true, alreadyDone: true }
   }
 
-  // ── Click "ALL NO" first — saves us 19 individual clicks. SureLC
-  //    ships this button precisely for the clean-record case.
-  const allNoBtn = await firstVisible(page, [
-    'button:has-text("ALL NO")',
-    'button:has-text("All No")',
-  ])
-  if (allNoBtn) {
-    try {
-      await allNoBtn.click()
-      await settle(page, 600)
-      logger.info("[Questions] clicked ALL NO")
-    } catch {
-      /* ignore — fall through to per-question fill */
+  // ── Probe the current state BEFORE clicking ALL NO. If there are
+  //    ANY Yes radios already set, the tab has partial prior state —
+  //    likely linked explanation docs + When dates that ALL NO would
+  //    wipe.
+  //
+  //    Jimenez 2026-05-28 regression: bot's ALL NO click un-attached
+  //    his existing M1.pdf explanation, then the re-flip-Yes + new
+  //    upload created an unlinked dup. Validation went from 1 issue
+  //    (DOCS:UNLINKED) to 4 (QUESTIONS:EXPLANATION_REQUIRED +
+  //    QUESTIONS:WHEN_DATE_REQUIRED + QUESTIONS:ANSWERS_REQUIRED +
+  //    DOCS:UNLINKED).
+  //
+  //    Safer policy: when any Yes radios are pre-set, skip ALL NO and
+  //    surgically flip only the parents that differ from our intended
+  //    state. If we'd need to flip MORE than 3 parents back to No
+  //    (suggests a major mismatch), fail with a clear reason so the
+  //    orchestrator surfaces "Questions tab has unexpected prior
+  //    state" instead of corrupting it.
+  const existingYesParents = await page
+    .$$eval('tr input[type="radio"]:checked', (radios) =>
+      Array.from(
+        new Set(
+          radios
+            .filter((r: any) => /yes/i.test(r.value || ""))
+            .map((r: any) => {
+              const row = (r as HTMLElement).closest("tr")
+              const m = ((row as HTMLElement | null)?.innerText || "").match(/^\s*(\d+)\b/)
+              return m ? Number(m[1]) : NaN
+            })
+            .filter((n: number) => Number.isFinite(n)),
+        ),
+      ),
+    )
+    .catch(() => [] as number[])
+
+  const safeMode = existingYesParents.length > 0
+  if (safeMode) {
+    logger.info(
+      { existingYesParents },
+      "[Questions] preserving prior state — skipping ALL NO (existing Yes radios detected)",
+    )
+  } else {
+    // No prior Yes state — safe to ALL NO + flip what we need.
+    const allNoBtn = await firstVisible(page, [
+      'button:has-text("ALL NO")',
+      'button:has-text("All No")',
+    ])
+    if (allNoBtn) {
+      try {
+        await allNoBtn.click()
+        await settle(page, 600)
+        logger.info("[Questions] clicked ALL NO")
+      } catch {
+        /* ignore — fall through to per-question fill */
+      }
     }
   }
 
@@ -2263,13 +2305,31 @@ async function fillSignature(
         }
         logger.warn(
           { reason: overwriteResult.reason },
-          "[Signature] API overwrite failed; falling back to REMOVE + UI re-upload",
+          "[Signature] API overwrite failed; preserving existing signature (skipping REMOVE)",
         )
+        // Maria Lugo 2026-05-28 regression: REMOVE succeeded then UI
+        // re-upload failed, leaving the producer with NO signature on
+        // SureLC ("Missing Signature Authorization" validation). The
+        // REMOVE-then-fail-to-reupload window is non-recoverable
+        // automatically and forces an admin to re-sign via the
+        // dashboard. Safer: keep the existing signature (which was
+        // valid enough that REMOVE+re-upload would have re-attached
+        // the same file) and return with a clear reason so the
+        // orchestrator can flag for retry / admin attention without
+        // having corrupted the producer's state.
+        return {
+          ok: false,
+          reason: `API push failed (${overwriteResult.reason}); kept existing signature to avoid REMOVE-without-reupload regression`,
+        }
       } catch (err: any) {
         logger.warn(
           { err: err?.message },
-          "[Signature] API overwrite threw; falling back to REMOVE + UI re-upload",
+          "[Signature] API overwrite threw; preserving existing signature (skipping REMOVE)",
         )
+        return {
+          ok: false,
+          reason: `API push threw (${err?.message}); kept existing signature to avoid REMOVE-without-reupload regression`,
+        }
       }
     }
     logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature")
