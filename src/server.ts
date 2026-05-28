@@ -1359,6 +1359,135 @@ app.post("/patch-appointments-to-resident-state", async (req, res) => {
   }
 })
 
+/**
+ * POST /patch-appointment-email
+ *
+ * Update the `producerEmailUsed` field on existing appointment-requests
+ * so SureLC's email/resend flow delivers to a mailbox we actually poll.
+ *
+ * Verified pattern 2026-05-28 (Sean Way 14881, Gittelman 5188892):
+ * the producer record already has the correct agency email, but
+ * existing appointment-requests snapshotted an old/external value
+ * (sunsera, gmail) at creation time. Resend hits the snapshot, not
+ * the producer's current email, so emails keep going to the wrong
+ * place until each appointment-request is individually patched.
+ *
+ * Body: { producerId, appointmentIds: [number], newEmail, adminCreds, triggerResend? }
+ * Returns: { ok, patched: [{ id, status, resendStatus? }] }
+ */
+const patchAppointmentEmailSchema = z.object({
+  producerId: z.string().min(1),
+  appointmentIds: z.array(z.number().int().positive()).min(1),
+  newEmail: z.string().email(),
+  adminCreds: adminCredsSchema,
+  /** Optional — also POST /surecrm/appointments-requests/{id}/email after each patch. */
+  triggerResend: z.boolean().optional(),
+})
+app.post("/patch-appointment-email", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`)
+    return res.status(401).json({ error: "unauthorized" })
+  const parsed = patchAppointmentEmailSchema.safeParse(req.body)
+  if (!parsed.success)
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  const { producerId, appointmentIds, newEmail, adminCreds, triggerResend } = parsed.data
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+      ],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const lr = await loginAdmin(page, adminCreds, logger)
+      if (!lr.ok)
+        return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      let bearer = ""
+      const handler = (req: any) => {
+        const a = req.headers()["authorization"]
+        if (
+          !bearer &&
+          req.url().includes("/surecrm/") &&
+          typeof a === "string" &&
+          a.startsWith("Bearer ")
+        ) {
+          bearer = a.replace(/^Bearer /, "")
+          page.off("request", handler)
+        }
+      }
+      page.on("request", handler)
+      await page
+        .evaluate((id) => {
+          history.pushState({}, "", `/bga/producers/${id}/profile`)
+          window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+        }, producerId)
+        .catch(() => undefined)
+      const dl = Date.now() + 15_000
+      while (Date.now() < dl && !bearer) await page.waitForTimeout(250)
+      if (!bearer)
+        return res.status(502).json({ ok: false, error: "could not harvest Bearer" })
+
+      const patched: Array<{ id: number; status: number; resendStatus?: number; reason?: string }> = []
+      for (const id of appointmentIds) {
+        const cur = await fetch(
+          `https://surelc.surancebay.com/surecrm/appointments-requests/${id}`,
+          { headers: { Authorization: `Bearer ${bearer}` } },
+        ).then((r) => (r.ok ? r.json() : null))
+        if (!cur) {
+          patched.push({ id, status: 404, reason: "GET failed" })
+          continue
+        }
+        const updated = {
+          ...cur,
+          producerEmailUsed: newEmail,
+          producerEffectiveEmail: newEmail,
+        }
+        const r = await fetch(
+          `https://surelc.surancebay.com/surecrm/appointments-requests/${id}`,
+          {
+            method: "PUT",
+            headers: {
+              Authorization: `Bearer ${bearer}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(updated),
+          },
+        )
+        const entry: { id: number; status: number; resendStatus?: number; reason?: string } = {
+          id,
+          status: r.status,
+        }
+        if (!r.ok) {
+          entry.reason = (await r.text().catch(() => "")).slice(0, 200)
+        } else if (triggerResend) {
+          const resend = await fetch(
+            `https://surelc.surancebay.com/surecrm/appointments-requests/${id}/email`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${bearer}` },
+            },
+          )
+          entry.resendStatus = resend.status
+        }
+        patched.push(entry)
+      }
+      return res.json({ ok: true, count: patched.length, patched })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/patch-appointment-email threw")
+    return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
 app.post("/get-bga-tokens", async (req, res) => {
   const auth = req.headers.authorization || ""
   if (!BEARER || auth !== `Bearer ${BEARER}`) {
