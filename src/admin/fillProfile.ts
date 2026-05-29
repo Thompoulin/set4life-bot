@@ -1046,58 +1046,115 @@ async function driveAddExplanationModal(
     const fs = await import("node:fs/promises")
     const os = await import("node:os")
     let uploadedSlots = 0
-    for (const doc of documents) {
-      const slotKey = doc.slot || "statement"
-      const re = SLOT_KEYWORD[slotKey] || SLOT_KEYWORD.statement
-      // The category buttons live inside the modal. Find by partial
-      // text match.
-      const allCatBtns = await page.$$(
+    // Modal layout detection: the criminal-question modal has 3
+    // category accordions (statement / notice / resolution). The
+    // bankruptcy / civil-question modal has NO accordions — just a
+    // direct UPLOAD NEW DOCUMENT button at the top. Detect by
+    // looking for any of the criminal-category buttons; if none
+    // exist, use the simple-modal codepath that uploads docs
+    // directly without category routing.
+    const anyCategoryBtnExists = await (async () => {
+      const allBtns = await page.$$(
         'mat-dialog-container button, .cdk-overlay-pane button',
       )
-      let catBtn: any = null
-      for (const b of allCatBtns) {
+      for (const b of allBtns) {
         const t = await (b as any).innerText().catch(() => "")
-        if (re.test(t)) {
-          catBtn = b
-          break
+        if (/written statement|Notice of Hearing|official document/i.test(t)) {
+          return true
         }
       }
-      if (!catBtn) {
-        logger.warn({ parentNumLog, slotKey }, "[Questions/v2] category button not found")
-        continue
+      return false
+    })()
+    if (!anyCategoryBtnExists) {
+      logger.info(
+        { parentNumLog },
+        "[Questions/v2] simple modal detected (no category accordions) — uploading docs directly",
+      )
+      // Upload each doc directly via the modal-level UPLOAD NEW
+      // DOCUMENT button. Iterating ensures multi-doc questions still
+      // get every file attached.
+      for (const doc of documents) {
+        try {
+          const res = await fetch(doc.url)
+          if (!res.ok) continue
+          const buf = Buffer.from(await res.arrayBuffer())
+          const localPath = path.join(
+            os.tmpdir(),
+            `surelc-v2-simple-${Date.now()}-${doc.fileName || "doc"}`,
+          )
+          await fs.writeFile(localPath, buf)
+          const uploadBtn = await page.$(
+            'mat-dialog-container button:has-text("UPLOAD NEW DOCUMENT"), ' +
+              '.cdk-overlay-pane button:has-text("UPLOAD NEW DOCUMENT")',
+          )
+          if (!uploadBtn) break
+          const [fc] = await Promise.all([
+            page.waitForEvent("filechooser", { timeout: 8_000 }),
+            (uploadBtn as any).click(),
+          ])
+          await fc.setFiles(localPath)
+          await page.waitForTimeout(2000)
+          uploadedSlots++
+        } catch (err: any) {
+          logger.warn(
+            { parentNumLog, err: err.message },
+            "[Questions/v2] simple-modal upload threw",
+          )
+        }
       }
-      try {
-        await (catBtn as any).click()
-        await page.waitForTimeout(500)
-        const res = await fetch(doc.url)
-        if (!res.ok) continue
-        const buf = Buffer.from(await res.arrayBuffer())
-        const localPath = path.join(
-          os.tmpdir(),
-          `surelc-v2-${slotKey}-${Date.now()}-${doc.fileName || "doc"}`,
+    } else {
+      // Criminal-category modal — route per slot
+      for (const doc of documents) {
+        const slotKey = doc.slot || "statement"
+        const re = SLOT_KEYWORD[slotKey] || SLOT_KEYWORD.statement
+        const allCatBtns = await page.$$(
+          'mat-dialog-container button, .cdk-overlay-pane button',
         )
-        await fs.writeFile(localPath, buf)
-        const uploadBtn = await page.$(
-          'mat-dialog-container button:has-text("UPLOAD NEW DOCUMENT"), ' +
-            '.cdk-overlay-pane button:has-text("UPLOAD NEW DOCUMENT")',
-        )
-        if (!uploadBtn) {
-          logger.warn({ parentNumLog, slotKey }, "[Questions/v2] UPLOAD button not visible")
+        let catBtn: any = null
+        for (const b of allCatBtns) {
+          const t = await (b as any).innerText().catch(() => "")
+          if (re.test(t)) {
+            catBtn = b
+            break
+          }
+        }
+        if (!catBtn) {
+          logger.warn({ parentNumLog, slotKey }, "[Questions/v2] category button not found")
           continue
         }
-        const [fc] = await Promise.all([
-          page.waitForEvent("filechooser", { timeout: 8_000 }),
-          (uploadBtn as any).click(),
-        ])
-        await fc.setFiles(localPath)
-        await page.waitForTimeout(2000)
-        uploadedSlots++
-        logger.info({ parentNumLog, slotKey }, "[Questions/v2] slot uploaded")
-      } catch (err: any) {
-        logger.warn(
-          { parentNumLog, slotKey, err: err.message },
-          "[Questions/v2] slot upload threw",
-        )
+        try {
+          await (catBtn as any).click()
+          await page.waitForTimeout(500)
+          const res = await fetch(doc.url)
+          if (!res.ok) continue
+          const buf = Buffer.from(await res.arrayBuffer())
+          const localPath = path.join(
+            os.tmpdir(),
+            `surelc-v2-${slotKey}-${Date.now()}-${doc.fileName || "doc"}`,
+          )
+          await fs.writeFile(localPath, buf)
+          const uploadBtn = await page.$(
+            'mat-dialog-container button:has-text("UPLOAD NEW DOCUMENT"), ' +
+              '.cdk-overlay-pane button:has-text("UPLOAD NEW DOCUMENT")',
+          )
+          if (!uploadBtn) {
+            logger.warn({ parentNumLog, slotKey }, "[Questions/v2] UPLOAD button not visible")
+            continue
+          }
+          const [fc] = await Promise.all([
+            page.waitForEvent("filechooser", { timeout: 8_000 }),
+            (uploadBtn as any).click(),
+          ])
+          await fc.setFiles(localPath)
+          await page.waitForTimeout(2000)
+          uploadedSlots++
+          logger.info({ parentNumLog, slotKey }, "[Questions/v2] slot uploaded")
+        } catch (err: any) {
+          logger.warn(
+            { parentNumLog, slotKey, err: err.message },
+            "[Questions/v2] slot upload threw",
+          )
+        }
       }
     }
     if (uploadedSlots === 0) {
