@@ -443,10 +443,12 @@ async function fillMiscTextInputs(
       name: string
       value: string
     }> = []
-    // Plain text + date inputs
+    // ANY input[formcontrolname] matching a key in the map. Material
+    // datepickers render input[type="text"] under the hood (the date
+    // is bound via mat-datepicker overlay), so don't filter by type.
     const inputs = Array.from(
       document.querySelectorAll(
-        'input[type="text"], input:not([type]), input[type="email"], input[type="date"]',
+        "input[formcontrolname], input[name]",
       ),
     ) as HTMLInputElement[]
     for (const inp of inputs) {
@@ -455,8 +457,14 @@ async function fillMiscTextInputs(
       if (!name) continue
       if (!(name in map)) continue
       if (inp.value && inp.value.trim() !== "") continue
+      // Detect date pickers by attached matDatepicker attribute or
+      // by sibling mat-datepicker-toggle in the host wrapper.
+      const isDatePicker =
+        inp.hasAttribute("matdatepicker") ||
+        !!inp.closest("mat-form-field")?.querySelector("mat-datepicker-toggle") ||
+        inp.type === "date"
       const sel = `input[formcontrolname="${name}"], input[name="${name}"]`
-      const kind = inp.type === "date" ? "date" : "text"
+      const kind = isDatePicker ? "date" : "text"
       out.push({ kind, selector: sel, name, value: map[name] })
     }
     // mat-select dropdowns (state lists, comboboxes)
