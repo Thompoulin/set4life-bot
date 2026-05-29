@@ -154,6 +154,24 @@ export async function fillMiscWizard(
       stepName.includes("compliance") ||
       stepName.includes("misc")
 
+    // Always dump the visible mat-radio-group labels on every step
+    // so we can see which step actually carries the AR_MISCELLANEOUS
+    // ComplianceDetails questions. Important: "Carrier Questions"
+    // step in some templates carries PER-AGENCY yes/no overrides
+    // (Mutual: New Producer / etc.) — different from ComplianceDetails.
+    const labels = await page.evaluate(() => {
+      const groups = Array.from(document.querySelectorAll("mat-radio-group"))
+      return groups.map((g) => {
+        const labelEl = g
+          .closest("sb-question, .wrap, mat-form-field, .form-field")
+          ?.querySelector(".question__text, label, .question-label")
+        return (labelEl?.textContent || "").trim().slice(0, 80)
+      })
+    })
+    if (labels.length > 0) {
+      logger.info({ step: stepName, labels }, "[fillMiscWizard] radio labels on this step")
+    }
+
     if (isMiscStep) {
       miscStepReached = true
       await snapshot(ctx, `fillMisc-${input.appointmentRequestId}-step${step}-pre`)
@@ -196,15 +214,12 @@ export async function fillMiscWizard(
     }
     await settle(page, 2500)
 
-    // If we've already satisfied misc on this step AND clicked Next,
-    // the PUT should have fired. Wait briefly for the network sniffer.
-    if (miscStepReached && miscPutResponses.length > 0) {
-      logger.info(
-        { count: miscPutResponses.length },
-        "[fillMiscWizard] misc PUT fired — exiting wizard early",
-      )
-      break
-    }
+    // Continue walking even after misc PUT fires — Americo's
+    // AR_MISCELLANEOUS may actually be on a later step (the bundle
+    // catalogs MISC step under AR_MISCELLANEOUS / AR_MISCELLANEOUS_AGENCY
+    // / AR_ASSISTANTS / AR_OPTIONAL_PRODUCER_FORMS — multiple steps
+    // can map to "MISC"). We stop only at Documents (hard stop) or
+    // when Next button doesn't appear (step disabled).
   }
 
   page.off("response", onResponse)
