@@ -1111,6 +1111,147 @@ async function fillQuestions(
       }
 
       if (!ans.documents?.length) continue
+
+      // ─── NEW PATH: SureLC's "ADD EXPLANATION" modal flow ───────────
+      // As of late May 2026 SureLC's Questions tab no longer accepts
+      // inline-attached docs for Yes-answers. Instead each Yes-question
+      // renders an "An explanation is required for this question" notice
+      // plus an "ADD EXPLANATION" button that opens a modal with:
+      //   - Occurrence Date combobox
+      //   - 3 doc category slots: Written statement / Notice of Hearing
+      //     / Official resolution document
+      //   - UPLOAD NEW DOCUMENT button per slot
+      //   - CANCEL / CREATE buttons (CREATE enables once date + at least
+      //     one doc are set)
+      // Verified 2026-05-29 on Jhovanny Jimenez's questions tab.
+      //
+      // Strategy: try this new modal path first. Falls back to the old
+      // inline-upload path below if no ADD EXPLANATION button is found
+      // on the page (handles older SureLC instance configs).
+      const addExplanationButtons = await page
+        .$$('button:has-text("ADD EXPLANATION")')
+        .catch(() => [] as any[])
+      const addExplBtn = addExplanationButtons[0]
+      if (addExplBtn) {
+        // Map our document.slot values → SureLC's category button text
+        // (substrings on the modal's category buttons).
+        const SLOT_BUTTON_TEXT: Record<string, string> = {
+          statement: "written statement",
+          notice: "Notice of Hearing",
+          resolution: "official document",
+        }
+        try {
+          await (addExplBtn as any).click()
+          await page.waitForTimeout(800)
+          // Set Occurrence Date if we have one — uses the same Material
+          // datepicker pattern as the other date fields. Modal scoped.
+          if (occurrenceDate) {
+            const isoMatch = occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+            const mmddyyyy = isoMatch
+              ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+              : occurrenceDate
+            const dateField = await page.$(
+              '.cdk-overlay-pane input[placeholder*="MM/DD" i], ' +
+                '.cdk-overlay-pane input[type="text"][matinput], ' +
+                'mat-dialog-container input[type="text"][matinput]',
+            )
+            if (dateField) {
+              await (dateField as any).fill(mmddyyyy)
+              await (dateField as any).dispatchEvent("change").catch(() => undefined)
+              await (dateField as any).dispatchEvent("blur").catch(() => undefined)
+            }
+          }
+          // For each document our DB has, find the matching slot button
+          // and upload the file.
+          const path = await import("node:path")
+          const fs = await import("node:fs/promises")
+          const os = await import("node:os")
+          let uploadedSlots = 0
+          for (const doc of ans.documents) {
+            const slotKey = (doc as any).slot as string | undefined
+            // Old data has docs without a slot field — treat as
+            // "statement" (slot 1) since that's the only required one.
+            const targetText = SLOT_BUTTON_TEXT[slotKey || "statement"]
+            if (!targetText) continue
+            try {
+              // Find the category accordion button + click to expand
+              const catBtn = await page.$(
+                `button:has-text("${targetText}")`,
+              )
+              if (!catBtn) continue
+              await (catBtn as any).click()
+              await page.waitForTimeout(500)
+              // Download our copy of the doc to a temp file
+              const res = await fetch(doc.url)
+              if (!res.ok) continue
+              const buf = Buffer.from(await res.arrayBuffer())
+              const localPath = path.join(
+                os.tmpdir(),
+                `surelc-modal-q${parentNum}-${slotKey}-${Date.now()}-${doc.fileName || "doc.pdf"}`,
+              )
+              await fs.writeFile(localPath, buf)
+              // Trigger the UPLOAD NEW DOCUMENT button — opens a file
+              // chooser dialog.
+              const uploadBtn = await page.$(
+                'button:has-text("UPLOAD NEW DOCUMENT"), button:has-text("Upload New Document")',
+              )
+              if (!uploadBtn) continue
+              try {
+                const [fc] = await Promise.all([
+                  page.waitForEvent("filechooser", { timeout: 8_000 }),
+                  (uploadBtn as any).click(),
+                ])
+                await fc.setFiles(localPath)
+                await page.waitForTimeout(1500)
+                uploadedSlots++
+                logger.info("[Questions/modal] uploaded slot", { parentNum, slotKey })
+              } catch (err: any) {
+                logger.warn("[Questions/modal] filechooser timeout", {
+                  parentNum,
+                  slotKey,
+                  err: err.message,
+                })
+              }
+            } catch (err: any) {
+              logger.warn("[Questions/modal] slot upload threw", {
+                parentNum,
+                slotKey,
+                err: err.message,
+              })
+            }
+          }
+          // Click CREATE on the modal — enabled once date + ≥1 doc.
+          const createBtn = await page.$(
+            'mat-dialog-container button:has-text("CREATE"), ' +
+              '.cdk-overlay-pane button:has-text("CREATE")',
+          )
+          if (createBtn) {
+            const isDisabled = await (createBtn as any).getAttribute("disabled")
+            if (isDisabled === null || isDisabled === "false") {
+              await (createBtn as any).click()
+              await page.waitForTimeout(2000)
+              logger.info("[Questions/modal] clicked CREATE", { parentNum, uploadedSlots })
+            } else {
+              logger.warn("[Questions/modal] CREATE still disabled — bailing modal", {
+                parentNum,
+                uploadedSlots,
+              })
+              // Close the modal so we don't block subsequent questions.
+              const cancelBtn = await page.$(
+                'mat-dialog-container button:has-text("CANCEL"), ' +
+                  '.cdk-overlay-pane button:has-text("CANCEL")',
+              )
+              if (cancelBtn) await (cancelBtn as any).click()
+              await page.waitForTimeout(800)
+            }
+          }
+        } catch (err: any) {
+          logger.warn("[Questions/modal] flow threw", { parentNum, err: err.message })
+        }
+        continue
+      }
+
+      // ─── OLD PATH: inline upload (kept for backwards-compat) ───────
       // Find the row's expanded explanation area.
       const explanationArea = await page.$(
         `tr:has-text("${parentNum}.") + tr [class*="explanation"], ` +
