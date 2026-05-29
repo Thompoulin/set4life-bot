@@ -1143,15 +1143,31 @@ async function fillQuestionsV2(
       await page.waitForTimeout(800)
       yesSet++
     }
-    if (!ans.documents || ans.documents.length === 0) {
-      logger.info({ slug }, "[Questions/v2] no documents in DB; skipping explanation")
-      continue
-    }
     if (!probeResult.hasAddBtn) {
       skipped++
       logger.info({ slug }, "[Questions/v2] explanation already linked; skipping")
       continue
     }
+    // Slug-share fallback: when our DB has no doc for this slug but
+    // the rep has yes-answered a RELATED slug whose doc covers the same
+    // disclosure, the SureLC producer-level Explanations bucket may
+    // already hold a usable attachment (one OCR-able file frequently
+    // covers felony+chargedFelony, misdemeanor+chargedMisdemeanor,
+    // wasBankrupt+bankruptcyPending). Continue to ADD EXPLANATION ->
+    // SELECT FROM UPLOADED — SureLC's picker lists ALL explanation-type
+    // attachments at producer level, so a SELECT click on the first
+    // available item creates the missing linkage without uploading
+    // a new file (and orphaning later if CREATE fails).
+    //
+    // If our DB has a doc, we still prefer SELECT FROM UPLOADED so the
+    // attachment gets reused instead of duplicated. The fallback to
+    // UPLOAD NEW DOCUMENT below covers the case where SureLC's picker
+    // is genuinely empty.
+    const hasDbDoc = !!(ans.documents && ans.documents.length > 0)
+    logger.info(
+      { slug, hasDbDoc },
+      "[Questions/v2] linking explanation (uses existing producer-level attachments if our DB has none)",
+    )
     // Click ADD EXPLANATION → navigates to /questions/question/{slug}
     // Use a fresh element lookup since the inventory loop's handles
     // (if any) are stale. Playwright's elementHandle.click() fires
@@ -1207,7 +1223,7 @@ async function fillQuestionsV2(
     // because it doesn't create new attachments (which can become
     // orphans if CREATE later fails). If no existing docs are
     // available, fall back to UPLOAD NEW DOCUMENT.
-    const doc = ans.documents[0]
+    const doc = ans.documents && ans.documents.length > 0 ? ans.documents[0] : null
     let uploadOk = false
     // ── Path A: SELECT FROM UPLOADED DOCUMENTS (preferred) ────────
     try {
@@ -1270,7 +1286,7 @@ async function fillQuestionsV2(
       logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw")
     }
     // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
-    if (!uploadOk) {
+    if (!uploadOk && doc) {
       try {
         const path = await import("node:path")
         const fs = await import("node:fs/promises")
