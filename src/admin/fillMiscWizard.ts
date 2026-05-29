@@ -433,21 +433,50 @@ async function fillMiscTextInputs(
   const { page } = ctx
   if (Object.keys(textValues).length === 0) return 0
   // Discover which fields exist on the page and match our values.
+  // Includes type=date (carrier conviction-date fields) and
+  // mat-select dropdowns (state-list fields). Each gets a tagged
+  // kind so the filler can dispatch the right interaction.
   const candidates = await page.evaluate((map: Record<string, string>) => {
+    const out: Array<{
+      kind: "text" | "date" | "select"
+      selector: string
+      name: string
+      value: string
+    }> = []
+    // Plain text + date inputs
     const inputs = Array.from(
       document.querySelectorAll(
-        'input[type="text"], input:not([type]), input[type="email"]',
+        'input[type="text"], input:not([type]), input[type="email"], input[type="date"]',
       ),
     ) as HTMLInputElement[]
-    const out: Array<{ selector: string; name: string; value: string }> = []
     for (const inp of inputs) {
-      const name = inp.getAttribute("formcontrolname") || inp.getAttribute("name") || ""
+      const name =
+        inp.getAttribute("formcontrolname") || inp.getAttribute("name") || ""
       if (!name) continue
       if (!(name in map)) continue
       if (inp.value && inp.value.trim() !== "") continue
-      // Build a stable selector — formcontrolname is unique on the misc form.
       const sel = `input[formcontrolname="${name}"], input[name="${name}"]`
-      out.push({ selector: sel, name, value: map[name] })
+      const kind = inp.type === "date" ? "date" : "text"
+      out.push({ kind, selector: sel, name, value: map[name] })
+    }
+    // mat-select dropdowns (state lists, comboboxes)
+    const matSelects = Array.from(
+      document.querySelectorAll("mat-select[formcontrolname], mat-select[name]"),
+    ) as HTMLElement[]
+    for (const sel of matSelects) {
+      const name =
+        sel.getAttribute("formcontrolname") || sel.getAttribute("name") || ""
+      if (!name) continue
+      if (!(name in map)) continue
+      const valueLabel = sel.querySelector(".mat-mdc-select-value-text")
+      const current = (valueLabel?.textContent || "").trim()
+      if (current && current !== "") continue
+      out.push({
+        kind: "select",
+        selector: `mat-select[formcontrolname="${name}"], mat-select[name="${name}"]`,
+        name,
+        value: map[name],
+      })
     }
     return out
   }, textValues)
@@ -457,19 +486,49 @@ async function fillMiscTextInputs(
     try {
       const loc = page.locator(c.selector).first()
       await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined)
-      await loc.fill(c.value, { timeout: 5000 })
-      // Blur to trigger Angular's reactive form change detection.
-      await loc.evaluate((el: HTMLInputElement) => el.blur())
-      await page.waitForTimeout(150)
+      if (c.kind === "text") {
+        await loc.fill(c.value, { timeout: 5000 })
+        await loc.evaluate((el: HTMLInputElement) => el.blur())
+      } else if (c.kind === "date") {
+        // SureLC date inputs accept yyyy-MM-dd as native input.value.
+        await loc.fill(c.value, { timeout: 5000 })
+        await loc.evaluate((el: HTMLInputElement) => {
+          el.dispatchEvent(new Event("input", { bubbles: true }))
+          el.dispatchEvent(new Event("change", { bubbles: true }))
+          el.blur()
+        })
+      } else if (c.kind === "select") {
+        // mat-select: open the panel, click the option whose text or
+        // value matches. Use the keyboard fallback if the panel doesn't
+        // render — Material caches them outside the host.
+        await loc.click({ timeout: 5000 })
+        await page.waitForTimeout(300)
+        const opt = page.locator(
+          `mat-option:has-text("${c.value}"), .mat-mdc-option:has-text("${c.value}")`,
+        )
+        const optCount = await opt.count()
+        if (optCount > 0) {
+          await opt.first().click({ timeout: 5000 })
+        } else {
+          // Close the panel and skip.
+          await page.keyboard.press("Escape")
+          ctx.logger.warn(
+            { name: c.name, value: c.value },
+            "[fillMiscWizard] mat-select option not found",
+          )
+          continue
+        }
+      }
+      await page.waitForTimeout(200)
       ctx.logger.info(
-        { name: c.name, value: c.value.slice(0, 40) },
-        "[fillMiscWizard] text field filled",
+        { kind: c.kind, name: c.name, value: c.value.slice(0, 40) },
+        "[fillMiscWizard] text/select field filled",
       )
       filled++
     } catch (err: any) {
       ctx.logger.warn(
-        { err: err?.message, name: c.name },
-        "[fillMiscWizard] text field fill failed",
+        { err: err?.message, name: c.name, kind: c.kind },
+        "[fillMiscWizard] text/select field fill failed",
       )
     }
   }
