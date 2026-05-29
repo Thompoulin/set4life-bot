@@ -984,6 +984,117 @@ app.post("/diagnose-producer", async (req, res) => {
 })
 
 /**
+ * POST /cleanup-orphan-explanations
+ *
+ * Lists a producer's attachments via /surecrm/attachments/{producerId}
+ * and DELETE-s any unlinked ones whose filename matches our bot's
+ * temp-upload naming pattern. Used to clean up orphans left by
+ * failed Questions v2 modal flows (Gurira 2026-05-29 accumulated 8
+ * before pointer-sequence CREATE was figured out).
+ *
+ * Body: { producerId, adminCreds, deletePatterns? }
+ *   deletePatterns: regex strings (default: bot's temp-upload prefixes)
+ * Returns: { ok, producerId, scanned, deleted: [{id, fileName}] }
+ */
+const cleanupOrphansSchema = z.object({
+  producerId: z.string().min(1),
+  adminCreds: adminCredsSchema,
+  deletePatterns: z.array(z.string()).optional(),
+})
+app.post("/cleanup-orphan-explanations", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = cleanupOrphansSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, adminCreds } = parsed.data
+  const patterns = (parsed.data.deletePatterns ?? [
+    "surelc-v2-simple-",
+    "surelc-v2-statement-",
+    "surelc-v2-notice-",
+    "surelc-v2-resolution-",
+    "surelc-modal-",
+    "surelc-upload-",
+  ]).map((p) => new RegExp(p, "i"))
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    })
+    try {
+      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const lr = await loginAdmin(page, adminCreds, logger)
+      if (!lr.ok) return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      let bearer = ""
+      page.on("request", (req) => {
+        const a = req.headers()["authorization"]
+        if (!bearer && req.url().includes("/surecrm/") && typeof a === "string" && a.startsWith("Bearer ")) {
+          bearer = a.replace(/^Bearer /, "")
+        }
+      })
+      await page.evaluate((id) => {
+        history.pushState({}, "", `/bga/producers/${id}/profile`)
+        window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+      }, producerId).catch(() => undefined)
+      const dl = Date.now() + 15_000
+      while (Date.now() < dl && !bearer) await page.waitForTimeout(250)
+      if (!bearer) return res.status(502).json({ ok: false, error: "no Bearer harvested" })
+      // List attachments
+      const listRes = await fetch(
+        `https://surelc.surancebay.com/surecrm/attachments/${producerId}?withUndefined=true&withUnlinkedBusinessChecks=false`,
+        { headers: { Authorization: `Bearer ${bearer}` } },
+      )
+      if (!listRes.ok) {
+        const t = await listRes.text().catch(() => "")
+        return res.status(502).json({ ok: false, error: `list HTTP ${listRes.status}: ${t.slice(0, 200)}` })
+      }
+      const attachments = (await listRes.json().catch(() => [])) as Array<{
+        id: number | string
+        fileName?: string
+        formType?: string
+        entityId?: string | number
+      }>
+      const candidates = attachments.filter((a) => {
+        const fn = a.fileName || ""
+        const matches = patterns.some((p) => p.test(fn))
+        // Only delete if entityId is "0" (unlinked) or 0
+        const unlinked = String(a.entityId ?? "") === "0"
+        return matches && unlinked
+      })
+      const deleted: Array<{ id: number | string; fileName: string }> = []
+      for (const a of candidates) {
+        const r = await fetch(
+          `https://surelc.surancebay.com/surecrm/attachments/${a.id}`,
+          { method: "DELETE", headers: { Authorization: `Bearer ${bearer}` } },
+        )
+        if (r.status === 204 || r.ok) {
+          deleted.push({ id: a.id, fileName: a.fileName || "" })
+        }
+      }
+      return res.json({
+        ok: true,
+        producerId,
+        scanned: attachments.length,
+        candidates: candidates.length,
+        deleted,
+      })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/cleanup-orphan-explanations threw")
+    return res.status(500).json({ ok: false, error: err?.message || "crashed" })
+  }
+})
+
+/**
  * POST /set-producer-fields
  *
  * General-purpose producer-record patcher. Same plumbing as
