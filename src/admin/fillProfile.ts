@@ -1002,6 +1002,28 @@ async function fillQuestions(
       { existingYesParents },
       "[Questions] preserving prior state — skipping ALL NO (existing Yes radios detected)",
     )
+    // Defensive: if existing Yes-questions all have explanations (no
+    // "ADD EXPLANATION" buttons visible), short-circuit the entire
+    // questions-tab fill. The bot's per-question upload code targets
+    // the old tr-based layout and silently fails on SureLC's new
+    // modal-based layout; running it on a producer whose questions
+    // were filled manually (Lopez/Gurira/Jimenez 2026-05-29) creates
+    // unlinked-explanation duplicates that Thomas then has to clean
+    // up. Mark the tab "already done" and let Phase A continue.
+    const addExplBtnCount = await page
+      .$$('button:has-text("ADD EXPLANATION")')
+      .then((els) => els.length)
+      .catch(() => -1)
+    if (addExplBtnCount === 0) {
+      logger.info(
+        "[Questions] all Yes-questions have explanations on file — skipping per-question fill",
+      )
+      return { ok: true, alreadyDone: true, details: { reason: "preserved-prior-state" } }
+    }
+    logger.info(
+      { addExplBtnCount },
+      "[Questions] some explanations still missing — continuing to per-question fill",
+    )
   } else {
     // No prior Yes state — safe to ALL NO + flip what we need.
     const allNoBtn = await firstVisible(page, [
