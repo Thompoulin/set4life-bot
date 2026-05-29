@@ -86,6 +86,30 @@ export async function fillMiscWizard(
   }
   page.on("response", onResponse)
 
+  // Warm up the SPA session by visiting the producer profile first.
+  // Cold sessions sometimes bounce the wizard URL straight to OAuth on
+  // the first /bga/* navigation after login — visiting the profile
+  // first gives the Angular SPA a chance to settle.
+  const profileUrl = `https://surelc.surancebay.com/bga/producers/${input.producerId}/profile`
+  logger.info({ profileUrl }, "[fillMiscWizard] warming up session via profile page")
+  try {
+    await page.goto(profileUrl, {
+      waitUntil: "domcontentloaded",
+      timeout: 45_000,
+    })
+    await settle(page, 4000)
+  } catch (err: any) {
+    page.off("response", onResponse)
+    return { ok: false, reason: `profile warmup goto failed: ${err.message}` }
+  }
+  if (page.url().includes("accounts.surancebay.com") || page.url().includes("/bga/oauth")) {
+    page.off("response", onResponse)
+    return {
+      ok: false,
+      reason: `profile warmup bounced to OAuth (${page.url()}) — session not real after login`,
+    }
+  }
+
   const wizardUrl = `https://surelc.surancebay.com/bga/producers/${input.producerId}/appointments/wizard/guard/${input.appointmentRequestId}`
   logger.info({ wizardUrl }, "[fillMiscWizard] navigating to wizard")
   try {
