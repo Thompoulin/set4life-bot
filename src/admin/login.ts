@@ -65,7 +65,7 @@ export async function loginAdmin(
   // for an input that's already in the DOM.
   await page.waitForTimeout(1_500)
 
-  const emailField = await firstVisible(page, [
+  const emailSelectors = [
     'input[data-cy="email-input"]',
     'input[formcontrolname="username"]',
     'input[type="email"]',
@@ -77,7 +77,18 @@ export async function loginAdmin(
     'input[autocomplete="email"]',
     'input[aria-label*="email" i]',
     'input[placeholder*="email" i]',
-  ])
+  ]
+  let emailField = await firstVisible(page, emailSelectors)
+  if (!emailField) {
+    // Transient: form rendered (the formReady selector above matched in
+    // the DOM) but firstVisible() couldn't pin a visible field — often a
+    // mid-animation race or an off-screen Material wrapper. Reload once
+    // and retry. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
+    logger.warn({ url: page.url() }, "admin login: email input invisible after wait — reloading and retrying once")
+    await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined)
+    await page.waitForTimeout(3_000)
+    emailField = await firstVisible(page, emailSelectors)
+  }
   if (!emailField) {
     logger.warn({ url: page.url() }, "admin login: email input not found")
     return { ok: false, reason: `Email input not found at ${page.url()}` }
