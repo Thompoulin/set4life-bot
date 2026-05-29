@@ -1024,25 +1024,17 @@ async function driveAddExplanationModal(
       const mmddyyyy = isoMatch
         ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
         : occurrenceDate
-      // "Occurrence Date" is rendered as a mat-form-field containing a
-      // hidden mat-datepicker-input. The visible part shows as a combobox
-      // with an Open calendar button next to it. Target the INNER input
-      // inside the form field — Material's MatDatepickerInput listens to
-      // input events on it and commits to the FormControl.
-      const dateField = await page
-        .locator(
-          'mat-form-field:has(mat-label:text-is("Occurrence Date")) input, ' +
-            'mat-form-field:has-text("Occurrence Date") input',
-        )
-        .first()
-        .elementHandle()
-        .catch(() => null)
+      // Page-wide: simple modal may not be wrapped in mat-dialog-container.
+      // Try labeled "Occurrence Date" first, then placeholder MM/DD.
+      const dateField =
+        (await page.$('input[placeholder*="MM/DD" i]')) ||
+        (await page.$(
+          'mat-label:has-text("Occurrence Date") >> xpath=ancestor::*[self::mat-form-field][1] >> input',
+        ))
       if (dateField) {
-        await (dateField as any).fill(mmddyyyy).catch(() => undefined)
-        await (dateField as any).dispatchEvent("input").catch(() => undefined)
+        await (dateField as any).fill(mmddyyyy)
         await (dateField as any).dispatchEvent("change").catch(() => undefined)
         await (dateField as any).dispatchEvent("blur").catch(() => undefined)
-        await page.waitForTimeout(400)
         logger.info({ parentNumLog, mmddyyyy }, "[Questions/v2] occurrence date set")
       } else {
         logger.warn({ parentNumLog }, "[Questions/v2] occurrence date field not found")
