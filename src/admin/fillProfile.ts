@@ -1071,28 +1071,17 @@ async function fillQuestionsV2(
       continue
     }
     // Click ADD EXPLANATION → navigates to /questions/question/{slug}
-    const fired = await page.evaluate((slugText) => {
-      const target = Array.from(document.querySelectorAll("sb-question")).find(
-        (q) => {
-          const t = (q.textContent || "").replace(/\s+/g, " ")
-          return new RegExp(`!\\d+[a-z]*\\.\\s*Have you ever`, "i").test(t)
-            && q
-              .querySelectorAll("button")
-              .length > 0
-        },
-      )
-      if (!target) return false
-      const btn = Array.from(target.querySelectorAll("button")).find((b) =>
-        /ADD EXPLANATION/i.test(b.textContent || ""),
-      )
-      if (!btn) return false
-      ;(btn as HTMLButtonElement).click()
-      return true
-    }, slug)
-    if (!fired) {
-      logger.warn({ slug }, "[Questions/v2] could not click ADD EXPLANATION via JS")
+    // Use Playwright's native click which fires the full pointer event
+    // sequence — Angular's MatButton routing handler does NOT fire on
+    // a plain DOM element.click() (verified the same gotcha that
+    // blocked CREATE on the modal page). Playwright's click also waits
+    // for the element to be ready.
+    const addBtnHandle = await (sbQ as any).$('button:has-text("ADD EXPLANATION")')
+    if (!addBtnHandle) {
+      logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found")
       continue
     }
+    await (addBtnHandle as any).click().catch(() => undefined)
     // Wait for the explanation page route to load
     await page.waitForTimeout(1500)
     // Set Occurrence Date via direct value + events
