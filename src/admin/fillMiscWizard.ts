@@ -250,17 +250,25 @@ export async function fillMiscWizard(
  * questions (1994 Crime Act, 1033 form, civil judgments, FINRA
  * sanctions, etc.) and commission-assignment overrides.
  *
+ * Uses Playwright's native mouse.click() on the mat-radio-button host
+ * because synthetic `element.click()` in page.evaluate doesn't fire
+ * Angular Material's full pointer-event sequence — the radio visually
+ * updates but the Reactive Form value doesn't change, so the subsequent
+ * Next click triggers no PUT (or fires a stale empty PUT). Verified
+ * 2026-05-29 against Bates Americo 117916924: synthetic clicks gave
+ * "7 filled" + 200 PUT but model didn't persist.
+ *
  * Returns the number of groups that got a click.
  */
 async function fillMiscRadios(
   ctx: TabContext,
   answers: Record<string, string>,
 ): Promise<number> {
-  return ctx.page.evaluate((map: Record<string, string>) => {
+  const { page } = ctx
+  const targets = await page.evaluate((map: Record<string, string>) => {
     const groups = Array.from(document.querySelectorAll("mat-radio-group"))
-    let clicked = 0
+    const out: Array<{ x: number; y: number; label: string; value: string }> = []
     for (const g of groups) {
-      // Skip groups already set to a non-empty value.
       const checked = g.querySelector(
         'input[type="radio"]:checked',
       ) as HTMLInputElement | null
@@ -278,18 +286,38 @@ async function fillMiscRadios(
           break
         }
       }
-      const target = g.querySelector(
+      const inp = g.querySelector(
         `input[type="radio"][value="${value}"]`,
       ) as HTMLInputElement | null
-      if (!target) continue
-
-      const host = target.closest("mat-radio-button") as HTMLElement | null
-      if (host) host.click()
-      else target.click()
-      clicked++
+      if (!inp) continue
+      const host = (inp.closest("mat-radio-button") || inp) as HTMLElement
+      // Scroll the radio into view so its bounding rect is valid.
+      host.scrollIntoView({ block: "center", inline: "center" })
+      const r = host.getBoundingClientRect()
+      if (r.width === 0 || r.height === 0) continue
+      out.push({
+        x: Math.round(r.left + r.width / 2),
+        y: Math.round(r.top + r.height / 2),
+        label: label.slice(0, 60),
+        value,
+      })
     }
-    return clicked
+    return out
   }, answers)
+
+  let clicked = 0
+  for (const t of targets) {
+    try {
+      // Native pointer-event sequence — Angular Material reads pointerdown
+      // through click and updates the reactive form value.
+      await page.mouse.click(t.x, t.y, { delay: 30 })
+      await page.waitForTimeout(150)
+      clicked++
+    } catch (err: any) {
+      ctx.logger.warn({ err: err?.message, label: t.label }, "[fillMiscWizard] radio click failed")
+    }
+  }
+  return clicked
 }
 
 /** Bottom-right Next button. Wait up to 15s for enable. */
