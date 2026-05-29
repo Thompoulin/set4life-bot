@@ -297,10 +297,26 @@ async function fillMiscRadios(
         const groups = Array.from(document.querySelectorAll("mat-radio-group"))
         const g = groups[args.idx]
         if (!g) return null
+
+        // Sniff the radio variant: misc step uses value="Y"/"N",
+        // questionnaire step uses value="true"/"false". Detect from
+        // available inputs.
+        const inputs = Array.from(
+          g.querySelectorAll('input[type="radio"]'),
+        ) as HTMLInputElement[]
+        const values = inputs.map((i) => i.value)
+        const hasYN = values.includes("Y") || values.includes("N")
+        const hasTF = values.includes("true") || values.includes("false")
+        const negVal = hasYN ? "N" : hasTF ? "false" : null
+        const posVal = hasYN ? "Y" : hasTF ? "true" : null
+        if (!negVal || !posVal) {
+          return { skip: true, reason: "unknown-radio-variant", value: "?" }
+        }
+
         const checked = g.querySelector(
           'input[type="radio"]:checked',
         ) as HTMLInputElement | null
-        if (checked && (checked.value === "Y" || checked.value === "N")) {
+        if (checked && (checked.value === posVal || checked.value === negVal)) {
           return { skip: true, reason: "already-checked", value: checked.value }
         }
         const labelEl = g
@@ -308,28 +324,29 @@ async function fillMiscRadios(
           ?.querySelector(".question__text, label, .question-label")
         const label = (labelEl?.textContent || "").trim()
 
-        let value: "Y" | "N" = "N"
+        let answer: "Y" | "N" = "N"
         for (const [key, ans] of Object.entries(args.map)) {
           if (label.toLowerCase().includes(key.toLowerCase())) {
-            value = ans.toLowerCase().startsWith("y") ? "Y" : "N"
+            answer = ans.toLowerCase().startsWith("y") ? "Y" : "N"
             break
           }
         }
+        const targetVal = answer === "Y" ? posVal : negVal
         const inp = g.querySelector(
-          `input[type="radio"][value="${value}"]`,
+          `input[type="radio"][value="${targetVal}"]`,
         ) as HTMLInputElement | null
-        if (!inp) return { skip: true, reason: "no-input", value }
+        if (!inp) return { skip: true, reason: "no-input", value: targetVal }
         const host = (inp.closest("mat-radio-button") || inp) as HTMLElement
         host.scrollIntoView({ block: "center", inline: "center" })
         const r = host.getBoundingClientRect()
         if (r.width === 0 || r.height === 0)
-          return { skip: true, reason: "zero-rect", value }
+          return { skip: true, reason: "zero-rect", value: targetVal }
         return {
           skip: false as const,
           x: Math.round(r.left + r.width / 2),
           y: Math.round(r.top + r.height / 2),
           label: label.slice(0, 60),
-          value,
+          value: targetVal,
         }
       },
       { idx, map: answers },
