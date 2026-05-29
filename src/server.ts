@@ -1019,6 +1019,10 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
     "surelc-modal-",
     "surelc-upload-",
   ]).map((p) => new RegExp(p, "i"))
+  // SureLC strips fileName off uploads — they show as empty strings in
+  // the /surecrm/attachments listing. The reliable orphan-detector is
+  // formType === "Explanation" AND entityId === "0" (unlinked).
+  const treatAllExplanationsUnlinkedAsOrphans = true
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
@@ -1062,11 +1066,21 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
         entityId?: string | number
       }>
       const candidates = attachments.filter((a) => {
-        const fn = a.fileName || ""
-        const matches = patterns.some((p) => p.test(fn))
-        // Only delete if entityId is "0" (unlinked) or 0
         const unlinked = String(a.entityId ?? "") === "0"
-        return matches && unlinked
+        if (!unlinked) return false
+        // Primary path: any unlinked Explanation attachment is an
+        // orphan from a failed CREATE flow. We never UPLOAD an
+        // Explanation that's already linked, so unlinked = orphan.
+        if (
+          treatAllExplanationsUnlinkedAsOrphans &&
+          a.formType === "Explanation"
+        ) {
+          return true
+        }
+        // Fallback path: filename pattern match (kept for callers
+        // that want stricter filtering).
+        const fn = a.fileName || ""
+        return patterns.some((p) => p.test(fn))
       })
       const deleted: Array<{ id: number | string; fileName: string }> = []
       for (const a of candidates) {
