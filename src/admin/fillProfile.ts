@@ -1065,6 +1065,30 @@ async function fillQuestions(
     }
   }
 
+  // After re-checking Yes radios SureLC takes a beat to render the
+  // conditional "An explanation is required" notice + ADD EXPLANATION
+  // buttons. Without this wait the per-question loop below queries the
+  // page before the buttons exist → addExplanationButtons returns empty
+  // → bot falls through to the legacy inline-upload path which the
+  // late-May 2026 SureLC backend silently ignores. Verified Jimenez
+  // 2026-05-29 12:08 ran fillQuestions to "success" but SureLC's
+  // validation/list still showed QUESTIONS:EXPLANATION_REQUIRED.
+  if (input?.surelcAnswers) await page.waitForTimeout(2_000)
+
+  // Diagnostic — quick check of how many ADD EXPLANATION buttons we
+  // can see right now. If we set Yes on N parents we expect ≥ N
+  // buttons. Logged so we can see in container output whether the
+  // modal-flow code below was skipped because the buttons hadn't
+  // rendered yet.
+  if (input?.surelcAnswers) {
+    const modalBtnCount = await page
+      .$$eval('button:has-text("ADD EXPLANATION")', (els) => els.length)
+      .catch(() => 0)
+    logger.info("[Questions] ADD EXPLANATION buttons visible", {
+      modalBtnCount,
+    })
+  }
+
   // Upload each sub-question's supporting documents under the matching
   // parent's row. SureLC opens an explanation/upload area when a Yes
   // is selected — the file inputs that appear belong to that row.
