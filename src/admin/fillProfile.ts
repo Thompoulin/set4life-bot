@@ -2563,20 +2563,73 @@ async function pushSignatureViaApi(
 
   // Step 2 — PUT /confirmImage
   const payload = `data:image/png;base64,${pngBuf.toString("base64")}`
-  const confRes = await fetch(
-    `https://surelc.surancebay.com/surecrm/signature/${producerId}/${formId}/confirmImage`,
-    {
-      method: "PUT",
-      headers: {
-        Authorization: `Bearer ${bearer}`,
-        "Content-Type": "application/json",
+  const callConfirm = async (
+    base64Payload: string,
+  ): Promise<{ ok: boolean; status: number; text: string }> => {
+    const r = await fetch(
+      `https://surelc.surancebay.com/surecrm/signature/${producerId}/${formId}/confirmImage`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${bearer}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ payload: base64Payload, width, height }),
       },
-      body: JSON.stringify({ payload, width, height }),
-    },
-  )
-  if (!confRes.ok) {
-    const t = await confRes.text().catch(() => "")
-    return { ok: false, reason: `confirmImage HTTP ${confRes.status}: ${t.slice(0, 200)}` }
+    )
+    const txt = await r.text().catch(() => "")
+    return { ok: r.ok, status: r.status, text: txt }
+  }
+
+  let conf = await callConfirm(payload)
+  if (!conf.ok && conf.status === 500 && /Failed to create transparent PNG/i.test(conf.text)) {
+    // SureLC's image processor occasionally rejects our drawn RGBA PNGs
+    // with HTTP 500 "Failed to create transparent PNG" — Beam 2026-05-29
+    // is the canonical case. The PNG is well-formed (verified with file +
+    // PNG header read); SureLC's alpha-handling pipeline just chokes on
+    // certain alpha patterns. Workaround: composite the PNG onto a white
+    // background in headless Chrome to strip transparency, then retry.
+    logger.warn(
+      { producerId, formId },
+      "[Signature] confirmImage 500 'Failed to create transparent PNG' — flattening alpha and retrying",
+    )
+    const flattenedDataUrl = await page
+      .evaluate(
+        async (b64: string) =>
+          new Promise<string>((resolve, reject) => {
+            const img = new Image()
+            img.onload = () => {
+              const c = document.createElement("canvas")
+              c.width = img.width
+              c.height = img.height
+              const ctx = c.getContext("2d")
+              if (!ctx) return reject(new Error("no 2d ctx"))
+              ctx.fillStyle = "white"
+              ctx.fillRect(0, 0, c.width, c.height)
+              ctx.drawImage(img, 0, 0)
+              resolve(c.toDataURL("image/png"))
+            }
+            img.onerror = () => reject(new Error("img load failed"))
+            img.src = `data:image/png;base64,${b64}`
+          }),
+        pngBuf.toString("base64"),
+      )
+      .catch((e: unknown) => {
+        logger.warn({ err: String(e) }, "[Signature] PNG flatten in canvas failed")
+        return ""
+      })
+    if (flattenedDataUrl) {
+      conf = await callConfirm(flattenedDataUrl)
+      if (conf.ok) {
+        logger.info(
+          { producerId, formId },
+          "[Signature] flattened PNG accepted on retry",
+        )
+      }
+    }
+  }
+  if (!conf.ok) {
+    return { ok: false, reason: `confirmImage HTTP ${conf.status}: ${conf.text.slice(0, 200)}` }
   }
 
   logger.info(
