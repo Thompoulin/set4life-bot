@@ -1024,31 +1024,24 @@ async function driveAddExplanationModal(
       const mmddyyyy = isoMatch
         ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
         : occurrenceDate
-      // "Occurrence Date" is rendered as a mat-form-field with a hidden
-      // mat-datepicker-input inside. The visible part looks like a
-      // combobox, but the actual <input> driving MatDatepickerInput is
-      // there. Use JS to find it — Playwright's :has() / :text-is()
-      // combinations were throwing the worker on this DOM, crashing
-      // the entire bot process.
-      const dateSetOk = await page
-        .evaluate((mmddyyyyValue: string) => {
-          const labels = Array.from(document.querySelectorAll("mat-label"))
-          const occLabel = labels.find(
-            (el) => (el.textContent || "").trim() === "Occurrence Date",
-          )
-          if (!occLabel) return false
-          let host: Element | null = occLabel.closest("mat-form-field")
-          if (!host) return false
-          const inp = host.querySelector("input")
-          if (!inp) return false
-          ;(inp as HTMLInputElement).value = mmddyyyyValue
-          inp.dispatchEvent(new Event("input", { bubbles: true }))
-          inp.dispatchEvent(new Event("change", { bubbles: true }))
-          inp.dispatchEvent(new Event("blur", { bubbles: true }))
-          return true
-        }, mmddyyyy)
-        .catch(() => false)
-      if (dateSetOk) {
+      // "Occurrence Date" is rendered as a mat-form-field containing a
+      // hidden mat-datepicker-input. The visible part shows as a combobox
+      // with an Open calendar button next to it. Target the INNER input
+      // inside the form field — Material's MatDatepickerInput listens to
+      // input events on it and commits to the FormControl.
+      const dateField = await page
+        .locator(
+          'mat-form-field:has(mat-label:text-is("Occurrence Date")) input, ' +
+            'mat-form-field:has-text("Occurrence Date") input',
+        )
+        .first()
+        .elementHandle()
+        .catch(() => null)
+      if (dateField) {
+        await (dateField as any).fill(mmddyyyy).catch(() => undefined)
+        await (dateField as any).dispatchEvent("input").catch(() => undefined)
+        await (dateField as any).dispatchEvent("change").catch(() => undefined)
+        await (dateField as any).dispatchEvent("blur").catch(() => undefined)
         await page.waitForTimeout(400)
         logger.info({ parentNumLog, mmddyyyy }, "[Questions/v2] occurrence date set")
       } else {
