@@ -1614,6 +1614,92 @@ app.post("/patch-appointment-email", async (req, res) => {
   }
 })
 
+const fillMiscWizardSchema = z.object({
+  producerId: z.string(),
+  appointmentRequestId: z.string(),
+  adminCreds: adminCredsSchema,
+  answers: z.record(z.enum(["Y", "N"])).optional(),
+})
+
+/**
+ * POST /fill-misc-via-wizard
+ *
+ * Drives the BGA admin wizard up to and including the Carrier Questions
+ * step, fills every ComplianceDetails radio with the supplied answer
+ * (default "N"), clicks Next on that step to commit the misc PUT via
+ * the wizard-session context, and exits BEFORE the Documents/Process
+ * step. Use this to clear AR_MISCELLANEOUS WARNING on appointments that
+ * skipped the wizard during Fastlane fill.
+ *
+ * Direct PUT /surecrm/appointments-requests/{id}/miscellaneous returns
+ * 200 but silently no-ops (verified Bates 117916924, 2026-05-29 — see
+ * src/admin/fillMiscWizard.ts header for endpoint reverse-engineering
+ * notes). The wizard is the only mechanism that persists.
+ *
+ * Does NOT release the contract to the carrier — Process step is
+ * skipped by design (per the 2026-05-12 Phase-C-disabled directive).
+ */
+app.post("/fill-misc-via-wizard", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = fillMiscWizardSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res
+      .status(400)
+      .json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, appointmentRequestId, adminCreds, answers } = parsed.data
+  try {
+    const { chromium } = await import("playwright")
+    const { loginAdmin } = await import("./admin/login.js")
+    const { fillMiscWizard } = await import("./admin/fillMiscWizard.js")
+    const browser = await chromium.launch({
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+      ],
+    })
+    try {
+      const ctx = await browser.newContext({
+        viewport: { width: 1440, height: 900 },
+      })
+      const page = await ctx.newPage()
+      page.setDefaultTimeout(30_000)
+      const loginResult = await loginAdmin(page, adminCreds, logger)
+      if (!loginResult.ok) {
+        return res
+          .status(502)
+          .json({ ok: false, error: loginResult.reason || "admin login failed" })
+      }
+      const jobId = `misc-${appointmentRequestId}-${Date.now()}`
+      const tabCtx = {
+        page,
+        logger,
+        jobId,
+        evidenceDir: `/tmp/surelc-evidence/${jobId}`,
+        evidenceFiles: [] as string[],
+      }
+      const result = await fillMiscWizard(tabCtx, {
+        producerId,
+        appointmentRequestId,
+        answers,
+      })
+      return res.json(result)
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/fill-misc-via-wizard threw")
+    return res
+      .status(500)
+      .json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
 app.post("/get-bga-tokens", async (req, res) => {
   const auth = req.headers.authorization || ""
   if (!BEARER || auth !== `Bearer ${BEARER}`) {
