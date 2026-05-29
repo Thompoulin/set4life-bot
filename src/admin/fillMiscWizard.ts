@@ -265,56 +265,85 @@ async function fillMiscRadios(
   answers: Record<string, string>,
 ): Promise<number> {
   const { page } = ctx
-  const targets = await page.evaluate((map: Record<string, string>) => {
-    const groups = Array.from(document.querySelectorAll("mat-radio-group"))
-    const out: Array<{ x: number; y: number; label: string; value: string }> = []
-    for (const g of groups) {
-      const checked = g.querySelector(
-        'input[type="radio"]:checked',
-      ) as HTMLInputElement | null
-      if (checked && (checked.value === "Y" || checked.value === "N")) continue
 
-      const labelEl = g
-        .closest("sb-question, .wrap, mat-form-field, .form-field")
-        ?.querySelector(".question__text, label, .question-label")
-      const label = (labelEl?.textContent || "").trim()
-
-      let value: "Y" | "N" = "N"
-      for (const [key, ans] of Object.entries(map)) {
-        if (label.toLowerCase().includes(key.toLowerCase())) {
-          value = ans.toLowerCase().startsWith("y") ? "Y" : "N"
-          break
-        }
-      }
-      const inp = g.querySelector(
-        `input[type="radio"][value="${value}"]`,
-      ) as HTMLInputElement | null
-      if (!inp) continue
-      const host = (inp.closest("mat-radio-button") || inp) as HTMLElement
-      // Scroll the radio into view so its bounding rect is valid.
-      host.scrollIntoView({ block: "center", inline: "center" })
-      const r = host.getBoundingClientRect()
-      if (r.width === 0 || r.height === 0) continue
-      out.push({
-        x: Math.round(r.left + r.width / 2),
-        y: Math.round(r.top + r.height / 2),
-        label: label.slice(0, 60),
-        value,
-      })
-    }
-    return out
-  }, answers)
+  // Discover the unfilled groups by index so we can re-query coords
+  // FRESH for each one. Capturing all 7 coords up-front breaks: the
+  // first click scrolls the page, so coords 2..N are stale and clicks
+  // land in the wrong places. Verified Bates 2026-05-29 — fields 4..8
+  // persisted but 2..3 didn't because their captured coords were
+  // off-screen after the page settled.
+  const groupCount = await page.evaluate(() => {
+    return document.querySelectorAll("mat-radio-group").length
+  })
 
   let clicked = 0
-  for (const t of targets) {
+  for (let idx = 0; idx < groupCount; idx++) {
+    const click = await page.evaluate(
+      (args: { idx: number; map: Record<string, string> }) => {
+        const groups = Array.from(document.querySelectorAll("mat-radio-group"))
+        const g = groups[args.idx]
+        if (!g) return null
+        const checked = g.querySelector(
+          'input[type="radio"]:checked',
+        ) as HTMLInputElement | null
+        if (checked && (checked.value === "Y" || checked.value === "N")) {
+          return { skip: true, reason: "already-checked", value: checked.value }
+        }
+        const labelEl = g
+          .closest("sb-question, .wrap, mat-form-field, .form-field")
+          ?.querySelector(".question__text, label, .question-label")
+        const label = (labelEl?.textContent || "").trim()
+
+        let value: "Y" | "N" = "N"
+        for (const [key, ans] of Object.entries(args.map)) {
+          if (label.toLowerCase().includes(key.toLowerCase())) {
+            value = ans.toLowerCase().startsWith("y") ? "Y" : "N"
+            break
+          }
+        }
+        const inp = g.querySelector(
+          `input[type="radio"][value="${value}"]`,
+        ) as HTMLInputElement | null
+        if (!inp) return { skip: true, reason: "no-input", value }
+        const host = (inp.closest("mat-radio-button") || inp) as HTMLElement
+        host.scrollIntoView({ block: "center", inline: "center" })
+        const r = host.getBoundingClientRect()
+        if (r.width === 0 || r.height === 0)
+          return { skip: true, reason: "zero-rect", value }
+        return {
+          skip: false as const,
+          x: Math.round(r.left + r.width / 2),
+          y: Math.round(r.top + r.height / 2),
+          label: label.slice(0, 60),
+          value,
+        }
+      },
+      { idx, map: answers },
+    )
+    if (!click) continue
+    if (click.skip) {
+      ctx.logger.info(
+        { idx, reason: click.reason, value: click.value },
+        "[fillMiscWizard] skipping radio group",
+      )
+      continue
+    }
+    // Wait briefly for any scroll animation triggered by scrollIntoView
+    // to settle before clicking.
+    await page.waitForTimeout(250)
     try {
-      // Native pointer-event sequence — Angular Material reads pointerdown
-      // through click and updates the reactive form value.
-      await page.mouse.click(t.x, t.y, { delay: 30 })
-      await page.waitForTimeout(150)
+      await page.mouse.click(click.x, click.y, { delay: 30 })
+      ctx.logger.info(
+        { idx, x: click.x, y: click.y, value: click.value, label: click.label },
+        "[fillMiscWizard] radio clicked",
+      )
+      await page.waitForTimeout(250)
       clicked++
     } catch (err: any) {
-      ctx.logger.warn({ err: err?.message, label: t.label }, "[fillMiscWizard] radio click failed")
+      ctx.logger.warn(
+        { err: err?.message, label: click.label },
+        "[fillMiscWizard] radio click failed",
+      )
     }
   }
   return clicked
