@@ -991,6 +991,45 @@ const matchQuestionSlug = (text: string): string | null => {
 }
 
 /**
+ * Returns the regex pattern (as a string for cross-context use) that
+ * a question's text must match for the given slug. Used by
+ * page.evaluate calls so the matcher works inside the browser.
+ */
+const getSlugQuestionPattern = (slug: string): string => {
+  const map: Record<string, string> = {
+    chargedFelony: "charged with any felony",
+    chargedMisdemeanor: "charged with any misdemeanor",
+    probation: "been on probation",
+    felony: "(?<!charged.{0,40})convicted.*felony",
+    misdemeanor: "(?<!charged.{0,40})convicted.*misdemeanor",
+    securitiesRegulations: "federal or state securities|investment.*regulation",
+    securitiesRegulationsState: "state insurance department",
+    foreignRegulations: "foreign government|foreign.*regulatory",
+    beingInvestigated: "currently under investigation",
+    wereInvestigated: "under investigation by any insurance",
+    inLawSuit: "pending indictments|civil judgments",
+    lawSuitInsurance: "named as a defendant|sued or been sued",
+    allegedOfFraud: "alleged to have engaged in any fraud",
+    provenFraud: "been found to have engaged in any fraud",
+    wasFiredRegulations: "terminated.*accused.*violating insurance",
+    wasFiredOfFraud: "terminated.*accused of fraud|wrongful taking",
+    wasFiredStatutes: "failure to supervise",
+    deniedAppointment: "appointment.*terminated for cause|denied an appointment",
+    oweToInsurance: "commission chargeback|indebtedness",
+    suretyRefused: "bonding or surety|denied.*bond",
+    eoRefused: "errors\\s*&\\s*omissions|e&o.*denied|e&o.*claims",
+    secLicense: "insurance or securities license.*denied",
+    firmSecLicense: "state or federal regulatory body.*found",
+    wasBankrupt: "personally filed a bankruptcy",
+    firmBankrupt: "brokerage firm.*bankrupt",
+    bankruptcyPending: "bankruptcy pending",
+    hasLiens: "liens|unsatisfied judgments",
+    alias: "used any other name|alias",
+  }
+  return map[slug] || slug
+}
+
+/**
  * v2 driver for SureLC's late-May 2026 Questions tab redesign.
  *
  * Layout: each question is a <sb-question> element. Per Yes-answer
@@ -1023,19 +1062,21 @@ async function fillQuestionsV2(
   await page
     .waitForSelector("sb-question", { timeout: 10_000 })
     .catch(() => undefined)
-  // Inventory the on-screen questions and match each to a slug
-  const sbQuestions = await page.$$("sb-question")
-  const slugToHandle: Record<string, any> = {}
-  for (const q of sbQuestions) {
-    const txt = await (q as any)
-      .innerText()
-      .catch(() => "")
-      .then((t: string) => (t || "").replace(/\s+/g, " ").trim())
+  // Inventory which slugs are on-screen (text → slug map). We don't
+  // keep ElementHandles because each ADD EXPLANATION click navigates
+  // to a new route, invalidating prior handles → "Target page, context
+  // or browser has been closed". Re-query DOM for each iteration.
+  const initialSlugs = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll("sb-question"))
+      .map((q) => (q.textContent || "").replace(/\s+/g, " ").trim())
+  })
+  const presentSlugs = new Set<string>()
+  for (const txt of initialSlugs) {
     const slug = matchQuestionSlug(txt)
-    if (slug && !slugToHandle[slug]) slugToHandle[slug] = q
+    if (slug) presentSlugs.add(slug)
   }
   logger.info(
-    { matchedSlugs: Object.keys(slugToHandle).length },
+    { matchedSlugs: presentSlugs.size },
     "[Questions/v2] question inventory",
   )
   let yesSet = 0
@@ -1043,45 +1084,102 @@ async function fillQuestionsV2(
   let skipped = 0
   for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
     if (!ans || ans.answer !== "yes") continue
-    const sbQ = slugToHandle[slug]
-    if (!sbQ) {
+    if (!presentSlugs.has(slug)) {
       logger.warn({ slug }, "[Questions/v2] no on-screen question matched our slug")
       continue
     }
-    // Set Yes radio if not already
-    const yesRadio = await (sbQ as any).$('input[type="radio"][value="true"]')
-    if (yesRadio) {
-      const checked = await (yesRadio as any).isChecked().catch(() => false)
-      if (!checked) {
-        await (yesRadio as any).check({ force: true }).catch(() => undefined)
-        await page.waitForTimeout(400)
-        yesSet++
+    // Make sure we're on the questions list (not stuck on a previous
+    // question's route). Each iteration starts fresh.
+    if (!page.url().match(/\/questions(?:[?#]|$)/)) {
+      await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined)
+      await page.waitForTimeout(800)
+    }
+    await page
+      .waitForSelector("sb-question", { timeout: 8_000 })
+      .catch(() => undefined)
+    // Set Yes radio + check if ADD EXPLANATION is present. Use
+    // page.evaluate to find the question by text match — handles are
+    // not reusable across navigations.
+    const probeResult = await page.evaluate((slugRegexMap) => {
+      const sbQs = Array.from(document.querySelectorAll("sb-question"))
+      let target: Element | null = null
+      for (const q of sbQs) {
+        const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+        const wanted = slugRegexMap.some((re: any) => new RegExp(re.pattern, re.flags).test(txt))
+        if (wanted) { target = q; break }
       }
+      if (!target) return { matched: false }
+      const yes = target.querySelector('input[type="radio"][value="true"]') as HTMLInputElement | null
+      const yesChecked = !!yes?.checked
+      const addBtn = Array.from(target.querySelectorAll("button")).find((b) =>
+        /ADD EXPLANATION/i.test(b.textContent || ""),
+      )
+      return { matched: true, yesChecked, hasAddBtn: !!addBtn }
+    }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+    if (!probeResult.matched) {
+      logger.warn({ slug }, "[Questions/v2] question disappeared from DOM")
+      continue
+    }
+    if (!probeResult.yesChecked) {
+      // Click Yes
+      await page
+        .evaluate((slugMap) => {
+          const sbQs = Array.from(document.querySelectorAll("sb-question"))
+          for (const q of sbQs) {
+            const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+            const wanted = slugMap.some((re: any) =>
+              new RegExp(re.pattern, re.flags).test(txt),
+            )
+            if (!wanted) continue
+            const yes = q.querySelector(
+              'input[type="radio"][value="true"]',
+            ) as HTMLInputElement | null
+            if (yes) yes.click()
+            return true
+          }
+          return false
+        }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+        .catch(() => undefined)
+      await page.waitForTimeout(800)
+      yesSet++
     }
     if (!ans.documents || ans.documents.length === 0) {
       logger.info({ slug }, "[Questions/v2] no documents in DB; skipping explanation")
       continue
     }
-    // Check if explanation is already present (no ADD EXPLANATION
-    // button visible on this question)
-    const addBtn = await (sbQ as any).$('button:has-text("ADD EXPLANATION")')
-    if (!addBtn) {
+    if (!probeResult.hasAddBtn) {
       skipped++
       logger.info({ slug }, "[Questions/v2] explanation already linked; skipping")
       continue
     }
     // Click ADD EXPLANATION → navigates to /questions/question/{slug}
-    // Use Playwright's native click which fires the full pointer event
-    // sequence — Angular's MatButton routing handler does NOT fire on
-    // a plain DOM element.click() (verified the same gotcha that
-    // blocked CREATE on the modal page). Playwright's click also waits
-    // for the element to be ready.
-    const addBtnHandle = await (sbQ as any).$('button:has-text("ADD EXPLANATION")')
-    if (!addBtnHandle) {
+    // Use a fresh element lookup since the inventory loop's handles
+    // (if any) are stale. Playwright's elementHandle.click() fires
+    // proper events.
+    let navOk = false
+    const addBtnFresh = await page.evaluateHandle((slugMap) => {
+      const sbQs = Array.from(document.querySelectorAll("sb-question"))
+      for (const q of sbQs) {
+        const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+        const wanted = slugMap.some((re: any) =>
+          new RegExp(re.pattern, re.flags).test(txt),
+        )
+        if (!wanted) continue
+        return Array.from(q.querySelectorAll("button")).find((b) =>
+          /ADD EXPLANATION/i.test(b.textContent || ""),
+        ) as HTMLButtonElement | undefined
+      }
+      return undefined
+    }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+    const addBtnEl = addBtnFresh.asElement()
+    if (addBtnEl) {
+      await (addBtnEl as any).click().catch(() => undefined)
+      navOk = true
+    }
+    if (!navOk) {
       logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found")
       continue
     }
-    await (addBtnHandle as any).click().catch(() => undefined)
     // Wait for the explanation page route to load
     await page.waitForTimeout(1500)
     // Set Occurrence Date via direct value + events
