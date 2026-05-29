@@ -1076,28 +1076,18 @@ async function driveAddExplanationModal(
       for (const doc of documents) {
         try {
           const res = await fetch(doc.url)
-          if (!res.ok) {
-            logger.warn(
-              { parentNumLog, status: res.status, url: doc.url.slice(0, 80) },
-              "[Questions/v2] doc fetch failed",
-            )
-            continue
-          }
+          if (!res.ok) continue
           const buf = Buffer.from(await res.arrayBuffer())
           const localPath = path.join(
             os.tmpdir(),
             `surelc-v2-simple-${Date.now()}-${doc.fileName || "doc"}`,
           )
           await fs.writeFile(localPath, buf)
-          // Page-wide selector — the simple modal may not be wrapped
-          // in mat-dialog-container, so don't require that scope.
           const uploadBtn = await page.$(
-            'button:has-text("UPLOAD NEW DOCUMENT")',
+            'mat-dialog-container button:has-text("UPLOAD NEW DOCUMENT"), ' +
+              '.cdk-overlay-pane button:has-text("UPLOAD NEW DOCUMENT")',
           )
-          if (!uploadBtn) {
-            logger.warn({ parentNumLog }, "[Questions/v2] UPLOAD NEW DOCUMENT button not visible")
-            break
-          }
+          if (!uploadBtn) break
           const [fc] = await Promise.all([
             page.waitForEvent("filechooser", { timeout: 8_000 }),
             (uploadBtn as any).click(),
@@ -1105,7 +1095,6 @@ async function driveAddExplanationModal(
           await fc.setFiles(localPath)
           await page.waitForTimeout(2000)
           uploadedSlots++
-          logger.info({ parentNumLog, fileName: doc.fileName }, "[Questions/v2] doc uploaded (simple modal)")
         } catch (err: any) {
           logger.warn(
             { parentNumLog, err: err.message },
@@ -1177,8 +1166,10 @@ async function driveAddExplanationModal(
       if (cancelBtn) await (cancelBtn as any).click()
       return { ok: false, reason: "no slots uploaded", uploadedSlots }
     }
-    // Page-wide CREATE button — simple modal may not be scoped.
-    const createBtn = await page.$('button:has-text("CREATE"):not(:has-text("CREATE EXPLANATION"))')
+    const createBtn = await page.$(
+      'mat-dialog-container button:has-text("CREATE"), ' +
+        '.cdk-overlay-pane button:has-text("CREATE")',
+    )
     if (!createBtn) {
       return { ok: false, reason: "CREATE button not found", uploadedSlots }
     }
