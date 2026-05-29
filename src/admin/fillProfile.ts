@@ -948,6 +948,257 @@ const SUB_TO_PARENT: Record<string, number> = {
   revenueServiceMatters: 19,
 }
 
+/**
+ * Question text matcher → our slug. Keyword-based, ordered
+ * most-specific first so "charged felony" wins over "felony".
+ */
+const QUESTION_KEYWORD_MAP: Array<{ slug: string; match: (t: string) => boolean }> = [
+  { slug: "chargedFelony", match: (t) => /charged with any felony/i.test(t) },
+  { slug: "chargedMisdemeanor", match: (t) => /charged with any misdemeanor/i.test(t) },
+  { slug: "probation", match: (t) => /been on probation/i.test(t) },
+  { slug: "felony", match: (t) => /convicted.*felony/i.test(t) && !/charged/i.test(t) },
+  { slug: "misdemeanor", match: (t) => /convicted.*misdemeanor/i.test(t) && !/charged/i.test(t) },
+  { slug: "securitiesRegulations", match: (t) => /federal or state securities|investment.*regulation/i.test(t) },
+  { slug: "securitiesRegulationsState", match: (t) => /state insurance department/i.test(t) },
+  { slug: "foreignRegulations", match: (t) => /foreign government|foreign.*regulatory/i.test(t) },
+  { slug: "beingInvestigated", match: (t) => /currently under investigation/i.test(t) },
+  { slug: "wereInvestigated", match: (t) => /under investigation by any insurance/i.test(t) },
+  { slug: "inLawSuit", match: (t) => /pending indictments|civil judgments/i.test(t) },
+  { slug: "lawSuitInsurance", match: (t) => /named as a defendant|sued or been sued/i.test(t) },
+  { slug: "allegedOfFraud", match: (t) => /alleged to have engaged in any fraud/i.test(t) },
+  { slug: "provenFraud", match: (t) => /been found to have engaged in any fraud/i.test(t) },
+  { slug: "wasFiredRegulations", match: (t) => /terminated.*accused.*violating insurance/i.test(t) },
+  { slug: "wasFiredOfFraud", match: (t) => /terminated.*accused of fraud|wrongful taking/i.test(t) },
+  { slug: "wasFiredStatutes", match: (t) => /failure to supervise/i.test(t) },
+  { slug: "deniedAppointment", match: (t) => /appointment.*terminated for cause|denied an appointment/i.test(t) },
+  { slug: "oweToInsurance", match: (t) => /commission chargeback|indebtedness/i.test(t) },
+  { slug: "suretyRefused", match: (t) => /bonding or surety|denied.*bond/i.test(t) },
+  { slug: "eoRefused", match: (t) => /errors\s*&\s*omissions|e&o.*denied|e&o.*claims/i.test(t) },
+  { slug: "secLicense", match: (t) => /insurance or securities license.*denied/i.test(t) },
+  { slug: "firmSecLicense", match: (t) => /state or federal regulatory body.*found/i.test(t) },
+  { slug: "wasBankrupt", match: (t) => /personally filed a bankruptcy|wasbankrupt/i.test(t) },
+  { slug: "firmBankrupt", match: (t) => /brokerage firm.*bankrupt/i.test(t) },
+  { slug: "bankruptcyPending", match: (t) => /bankruptcy pending/i.test(t) },
+  { slug: "hasLiens", match: (t) => /liens|unsatisfied judgments/i.test(t) },
+  { slug: "alias", match: (t) => /used any other name|alias/i.test(t) },
+]
+
+const matchQuestionSlug = (text: string): string | null => {
+  for (const { slug, match } of QUESTION_KEYWORD_MAP) {
+    if (match(text)) return slug
+  }
+  return null
+}
+
+/**
+ * v2 driver for SureLC's late-May 2026 Questions tab redesign.
+ *
+ * Layout: each question is a <sb-question> element. Per Yes-answer
+ * SureLC renders an ADD EXPLANATION button that navigates to a
+ * dedicated route /questions/question/{slug}. That route has:
+ *   - Occurrence Date input (placeholder="Occurrence Date")
+ *   - UPLOAD NEW DOCUMENT / CREATE EXPLANATION DOCUMENT /
+ *     SELECT FROM UPLOADED DOCUMENTS buttons
+ *   - CANCEL / CREATE buttons (CREATE enables when date + ≥1 doc set)
+ *
+ * Critical gotcha: CREATE button must be triggered with a full
+ * pointer-event sequence (pointerdown/mousedown/pointerup/mouseup/
+ * click). A plain element.click() doesn't fire Angular's MatButton
+ * handler, leaving the form in an unsaved state — the user (or bot)
+ * thinks CREATE worked but SureLC silently discards the data on
+ * navigation. Verified Gurira wasBankrupt 2026-05-29: simple click
+ * → no network call, no save; pointer sequence → save persists +
+ * validation drops to 0 issues.
+ */
+async function fillQuestionsV2(
+  ctx: TabContext,
+  input: ProfileFillInput["questions"],
+): Promise<TabResult> {
+  const { page, logger } = ctx
+  if (!input?.surelcAnswers) {
+    logger.info("[Questions/v2] no surelcAnswers — nothing to fill")
+    return { ok: true, alreadyDone: true }
+  }
+  // Wait for the new layout to render fully
+  await page
+    .waitForSelector("sb-question", { timeout: 10_000 })
+    .catch(() => undefined)
+  // Inventory the on-screen questions and match each to a slug
+  const sbQuestions = await page.$$("sb-question")
+  const slugToHandle: Record<string, any> = {}
+  for (const q of sbQuestions) {
+    const txt = await (q as any)
+      .innerText()
+      .catch(() => "")
+      .then((t: string) => (t || "").replace(/\s+/g, " ").trim())
+    const slug = matchQuestionSlug(txt)
+    if (slug && !slugToHandle[slug]) slugToHandle[slug] = q
+  }
+  logger.info(
+    { matchedSlugs: Object.keys(slugToHandle).length },
+    "[Questions/v2] question inventory",
+  )
+  let yesSet = 0
+  let saved = 0
+  let skipped = 0
+  for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
+    if (!ans || ans.answer !== "yes") continue
+    const sbQ = slugToHandle[slug]
+    if (!sbQ) {
+      logger.warn({ slug }, "[Questions/v2] no on-screen question matched our slug")
+      continue
+    }
+    // Set Yes radio if not already
+    const yesRadio = await (sbQ as any).$('input[type="radio"][value="true"]')
+    if (yesRadio) {
+      const checked = await (yesRadio as any).isChecked().catch(() => false)
+      if (!checked) {
+        await (yesRadio as any).check({ force: true }).catch(() => undefined)
+        await page.waitForTimeout(400)
+        yesSet++
+      }
+    }
+    if (!ans.documents || ans.documents.length === 0) {
+      logger.info({ slug }, "[Questions/v2] no documents in DB; skipping explanation")
+      continue
+    }
+    // Check if explanation is already present (no ADD EXPLANATION
+    // button visible on this question)
+    const addBtn = await (sbQ as any).$('button:has-text("ADD EXPLANATION")')
+    if (!addBtn) {
+      skipped++
+      logger.info({ slug }, "[Questions/v2] explanation already linked; skipping")
+      continue
+    }
+    // Click ADD EXPLANATION → navigates to /questions/question/{slug}
+    const fired = await page.evaluate((slugText) => {
+      const target = Array.from(document.querySelectorAll("sb-question")).find(
+        (q) => {
+          const t = (q.textContent || "").replace(/\s+/g, " ")
+          return new RegExp(`!\\d+[a-z]*\\.\\s*Have you ever`, "i").test(t)
+            && q
+              .querySelectorAll("button")
+              .length > 0
+        },
+      )
+      if (!target) return false
+      const btn = Array.from(target.querySelectorAll("button")).find((b) =>
+        /ADD EXPLANATION/i.test(b.textContent || ""),
+      )
+      if (!btn) return false
+      ;(btn as HTMLButtonElement).click()
+      return true
+    }, slug)
+    if (!fired) {
+      logger.warn({ slug }, "[Questions/v2] could not click ADD EXPLANATION via JS")
+      continue
+    }
+    // Wait for the explanation page route to load
+    await page.waitForTimeout(1500)
+    // Set Occurrence Date via direct value + events
+    if (ans.occurrenceDate) {
+      const isoMatch = ans.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+      const mmddyyyy = isoMatch
+        ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+        : ans.occurrenceDate
+      await page
+        .evaluate((v) => {
+          const inp = document.querySelector(
+            'input[placeholder="Occurrence Date"]',
+          ) as HTMLInputElement | null
+          if (!inp) return false
+          inp.value = v
+          inp.dispatchEvent(new Event("input", { bubbles: true }))
+          inp.dispatchEvent(new Event("change", { bubbles: true }))
+          inp.dispatchEvent(new Event("blur", { bubbles: true }))
+          return true
+        }, mmddyyyy)
+        .catch(() => undefined)
+      await page.waitForTimeout(500)
+    }
+    // Upload the first doc directly via UPLOAD NEW DOCUMENT.
+    // This populates the producer's explanation library; the modal
+    // auto-selects the just-uploaded file (REMOVE button appears).
+    const doc = ans.documents[0]
+    let uploadOk = false
+    try {
+      const path = await import("node:path")
+      const fs = await import("node:fs/promises")
+      const os = await import("node:os")
+      const res = await fetch(doc.url)
+      if (res.ok) {
+        const buf = Buffer.from(await res.arrayBuffer())
+        const localPath = path.join(
+          os.tmpdir(),
+          `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`,
+        )
+        await fs.writeFile(localPath, buf)
+        const uploadBtn = await page.$('button:has-text("UPLOAD NEW DOCUMENT")')
+        if (uploadBtn) {
+          const [fc] = await Promise.all([
+            page.waitForEvent("filechooser", { timeout: 8_000 }),
+            (uploadBtn as any).click(),
+          ])
+          await fc.setFiles(localPath)
+          await page.waitForTimeout(2000)
+          uploadOk = true
+        }
+      }
+    } catch (err: any) {
+      logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw")
+    }
+    if (!uploadOk) {
+      logger.warn({ slug }, "[Questions/v2] upload failed; cancelling modal")
+      // Bail out cleanly so we don't leave an orphan half-state
+      const cancelBtn = await page.$('button:has-text("CANCEL")')
+      if (cancelBtn) await (cancelBtn as any).click()
+      await page.waitForTimeout(800)
+      continue
+    }
+    // Click CREATE via pointer event sequence. A plain .click() does
+    // NOT trigger Angular's MatButton click handler — the form stays
+    // in unsaved state and SureLC discards the upload on navigation.
+    // Verified Gurira wasBankrupt 2026-05-29: only the full pointer
+    // sequence persists server-side (validation drops to 0).
+    const createOk = await page
+      .evaluate(() => {
+        const cb = Array.from(document.querySelectorAll("button")).find(
+          (b) =>
+            b.textContent?.trim() === "CREATE" &&
+            (b as HTMLElement).offsetWidth > 0 &&
+            !/EXPLANATION/i.test(b.textContent || ""),
+        )
+        if (!cb) return false
+        ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
+          (t) =>
+            cb.dispatchEvent(
+              new MouseEvent(t, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                button: 0,
+              }),
+            ),
+        )
+        return true
+      })
+      .catch(() => false)
+    if (createOk) {
+      await page.waitForTimeout(2500)
+      saved++
+      logger.info({ slug }, "[Questions/v2] CREATE pointer-sequence dispatched")
+    } else {
+      logger.warn({ slug }, "[Questions/v2] CREATE button not found / not visible")
+    }
+  }
+  logger.info(
+    { yesSet, saved, skipped },
+    "[Questions/v2] driver finished",
+  )
+  await snapshot(ctx, "tab-questions-after-v2")
+  return { ok: true, details: { yesSet, saved, skipped } as any }
+}
+
 async function fillQuestions(
   ctx: TabContext,
   producerId: string,
@@ -959,6 +1210,13 @@ async function fillQuestions(
 
   if (await isTabGreen(page, "Questions")) {
     return { ok: true, alreadyDone: true }
+  }
+
+  // v2 detection: new layout uses <sb-question> elements
+  const hasV2 = await page.$$("sb-question").then((els) => els.length > 0).catch(() => false)
+  if (hasV2) {
+    logger.info("[Questions] v2 layout detected — using fillQuestionsV2")
+    return await fillQuestionsV2(ctx, input)
   }
 
   // ── Probe the current state BEFORE clicking ALL NO. If there are
