@@ -948,6 +948,286 @@ const SUB_TO_PARENT: Record<string, number> = {
   revenueServiceMatters: 19,
 }
 
+/**
+ * Map SureLC's rendered question text → our questionnaire slug.
+ * Used by the v2 layout driver to know which DB answer applies to
+ * which on-screen question. Keyword-based so a tweaked sentence
+ * still matches; ordered most-specific first.
+ */
+const QUESTION_KEYWORD_MAP: Array<{ slug: string; match: (t: string) => boolean }> = [
+  { slug: "chargedFelony", match: (t) => /charged with any felony/i.test(t) },
+  { slug: "chargedMisdemeanor", match: (t) => /charged with any misdemeanor/i.test(t) },
+  { slug: "probation", match: (t) => /been on probation/i.test(t) },
+  { slug: "felony", match: (t) => /convicted.*felony|plead.*felony/i.test(t) && !/charged/i.test(t) },
+  { slug: "misdemeanor", match: (t) => /convicted.*misdemeanor|plead.*misdemeanor/i.test(t) && !/charged/i.test(t) },
+  { slug: "securitiesRegulations", match: (t) => /federal or state securities|investment.*regulation/i.test(t) },
+  { slug: "securitiesRegulationsState", match: (t) => /state insurance department/i.test(t) },
+  { slug: "foreignRegulations", match: (t) => /foreign government|foreign.*regulatory/i.test(t) },
+  { slug: "beingInvestigated", match: (t) => /currently under investigation/i.test(t) },
+  { slug: "wereInvestigated", match: (t) => /under investigation by any insurance/i.test(t) },
+  { slug: "inLawSuit", match: (t) => /pending indictments|civil judgments/i.test(t) },
+  { slug: "lawSuitInsurance", match: (t) => /named as a defendant|sued or been sued/i.test(t) },
+  { slug: "allegedOfFraud", match: (t) => /alleged to have engaged in any fraud/i.test(t) },
+  { slug: "provenFraud", match: (t) => /been found to have engaged in any fraud/i.test(t) },
+  { slug: "wasFiredRegulations", match: (t) => /terminated.*accused.*violating insurance/i.test(t) },
+  { slug: "wasFiredOfFraud", match: (t) => /terminated.*accused of fraud|wrongful taking/i.test(t) },
+  { slug: "wasFiredStatutes", match: (t) => /failure to supervise/i.test(t) },
+  { slug: "deniedAppointment", match: (t) => /appointment.*terminated for cause|denied an appointment/i.test(t) },
+  { slug: "oweToInsurance", match: (t) => /commission chargeback|indebtedness/i.test(t) },
+  { slug: "suretyRefused", match: (t) => /bonding or surety|denied.*bond/i.test(t) },
+  { slug: "eoRefused", match: (t) => /errors\s*&\s*omissions|e&o.*denied|e&o.*claims/i.test(t) },
+  { slug: "secLicense", match: (t) => /insurance or securities license.*denied/i.test(t) },
+  { slug: "firmSecLicense", match: (t) => /state or federal regulatory body.*found/i.test(t) },
+  { slug: "wasBankrupt", match: (t) => /bankrupt|bankruptcy/i.test(t) && !/firm/i.test(t) && !/pending/i.test(t) },
+  { slug: "hasLiens", match: (t) => /liens|unsatisfied judgments/i.test(t) },
+  { slug: "alias", match: (t) => /used any other name|alias/i.test(t) },
+]
+
+const matchQuestionSlug = (text: string): string | null => {
+  for (const { slug, match } of QUESTION_KEYWORD_MAP) {
+    if (match(text)) return slug
+  }
+  return null
+}
+
+/**
+ * Drive SureLC's "ADD EXPLANATION" modal for one Yes-answer.
+ *
+ * Layout (verified 2026-05-29 on Jimenez/Gurira):
+ *   - Click ADD EXPLANATION (already located by caller)
+ *   - Modal renders with:
+ *       - Occurrence Date combobox + Open calendar button
+ *       - 3 category accordions: "Written statement…", "Notice of
+ *         Hearing…", "official document…demonstrates the resolution…"
+ *       - Each accordion opens to show UPLOAD NEW DOCUMENT +
+ *         CREATE EXPLANATION DOCUMENT buttons
+ *       - CANCEL / CREATE buttons at the bottom (CREATE disabled
+ *         until ≥1 doc + Occurrence Date are set)
+ *
+ * We upload whatever slots we have data for (slot 1 = statement is
+ * required; slot 2 = notice and slot 3 = resolution are optional —
+ * see the onboarding form's Q1A_DOC_SLOTS for matching keys).
+ */
+async function driveAddExplanationModal(
+  page: import("playwright").Page,
+  addExplBtn: any,
+  occurrenceDate: string | undefined,
+  documents: Array<{ url: string; fileName?: string; slot?: string }>,
+  logger: import("pino").Logger,
+  parentNumLog: string,
+): Promise<{ ok: boolean; reason?: string; uploadedSlots: number }> {
+  try {
+    await addExplBtn.click()
+    await page.waitForTimeout(1200)
+    if (occurrenceDate) {
+      const isoMatch = occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+      const mmddyyyy = isoMatch
+        ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+        : occurrenceDate
+      const dateField = await page.$(
+        'mat-dialog-container input[placeholder*="MM/DD" i], ' +
+          '.cdk-overlay-pane input[placeholder*="MM/DD" i], ' +
+          'mat-dialog-container input[matinput], ' +
+          '.cdk-overlay-pane input[matinput]',
+      )
+      if (dateField) {
+        await (dateField as any).fill(mmddyyyy)
+        await (dateField as any).dispatchEvent("change").catch(() => undefined)
+        await (dateField as any).dispatchEvent("blur").catch(() => undefined)
+        logger.info({ parentNumLog, mmddyyyy }, "[Questions/v2] occurrence date set")
+      }
+    }
+    const SLOT_KEYWORD: Record<string, RegExp> = {
+      statement: /written statement/i,
+      notice: /Notice of Hearing/i,
+      resolution: /official document|resolution/i,
+    }
+    const path = await import("node:path")
+    const fs = await import("node:fs/promises")
+    const os = await import("node:os")
+    let uploadedSlots = 0
+    for (const doc of documents) {
+      const slotKey = doc.slot || "statement"
+      const re = SLOT_KEYWORD[slotKey] || SLOT_KEYWORD.statement
+      // The category buttons live inside the modal. Find by partial
+      // text match.
+      const allCatBtns = await page.$$(
+        'mat-dialog-container button, .cdk-overlay-pane button',
+      )
+      let catBtn: any = null
+      for (const b of allCatBtns) {
+        const t = await (b as any).innerText().catch(() => "")
+        if (re.test(t)) {
+          catBtn = b
+          break
+        }
+      }
+      if (!catBtn) {
+        logger.warn({ parentNumLog, slotKey }, "[Questions/v2] category button not found")
+        continue
+      }
+      try {
+        await (catBtn as any).click()
+        await page.waitForTimeout(500)
+        const res = await fetch(doc.url)
+        if (!res.ok) continue
+        const buf = Buffer.from(await res.arrayBuffer())
+        const localPath = path.join(
+          os.tmpdir(),
+          `surelc-v2-${slotKey}-${Date.now()}-${doc.fileName || "doc"}`,
+        )
+        await fs.writeFile(localPath, buf)
+        const uploadBtn = await page.$(
+          'mat-dialog-container button:has-text("UPLOAD NEW DOCUMENT"), ' +
+            '.cdk-overlay-pane button:has-text("UPLOAD NEW DOCUMENT")',
+        )
+        if (!uploadBtn) {
+          logger.warn({ parentNumLog, slotKey }, "[Questions/v2] UPLOAD button not visible")
+          continue
+        }
+        const [fc] = await Promise.all([
+          page.waitForEvent("filechooser", { timeout: 8_000 }),
+          (uploadBtn as any).click(),
+        ])
+        await fc.setFiles(localPath)
+        await page.waitForTimeout(2000)
+        uploadedSlots++
+        logger.info({ parentNumLog, slotKey }, "[Questions/v2] slot uploaded")
+      } catch (err: any) {
+        logger.warn(
+          { parentNumLog, slotKey, err: err.message },
+          "[Questions/v2] slot upload threw",
+        )
+      }
+    }
+    if (uploadedSlots === 0) {
+      // Nothing uploaded — bail out cleanly so the modal can be retried
+      const cancelBtn = await page.$(
+        'mat-dialog-container button:has-text("CANCEL"), ' +
+          '.cdk-overlay-pane button:has-text("CANCEL")',
+      )
+      if (cancelBtn) await (cancelBtn as any).click()
+      return { ok: false, reason: "no slots uploaded", uploadedSlots }
+    }
+    const createBtn = await page.$(
+      'mat-dialog-container button:has-text("CREATE"), ' +
+        '.cdk-overlay-pane button:has-text("CREATE")',
+    )
+    if (!createBtn) {
+      return { ok: false, reason: "CREATE button not found", uploadedSlots }
+    }
+    const disabled = await (createBtn as any).getAttribute("disabled")
+    if (disabled !== null && disabled !== "false") {
+      logger.warn(
+        { parentNumLog, uploadedSlots },
+        "[Questions/v2] CREATE still disabled — closing modal",
+      )
+      const cancelBtn = await page.$(
+        'mat-dialog-container button:has-text("CANCEL"), ' +
+          '.cdk-overlay-pane button:has-text("CANCEL")',
+      )
+      if (cancelBtn) await (cancelBtn as any).click()
+      return { ok: false, reason: "CREATE stayed disabled", uploadedSlots }
+    }
+    await (createBtn as any).click()
+    await page.waitForTimeout(2500)
+    logger.info({ parentNumLog, uploadedSlots }, "[Questions/v2] CREATE clicked")
+    return { ok: true, uploadedSlots }
+  } catch (err: any) {
+    logger.warn({ parentNumLog, err: err.message }, "[Questions/v2] modal flow threw")
+    return { ok: false, reason: `modal threw: ${err.message}`, uploadedSlots: 0 }
+  }
+}
+
+/**
+ * Layout-agnostic Questions tab driver for SureLC's late-May 2026
+ * redesign (sb-question + div-card + ADD EXPLANATION modal). Reads
+ * each on-screen question by text, matches to our DB slug via
+ * QUESTION_KEYWORD_MAP, sets Yes radio where we have a Yes answer,
+ * and drives the ADD EXPLANATION modal for each Yes-answer with
+ * documents.
+ *
+ * Idempotent: if Yes radios are already set + ADD EXPLANATION buttons
+ * have been replaced by "EDIT EXPLANATION" (or similar), the driver
+ * recognizes existing state and skips re-uploading.
+ */
+async function fillQuestionsV2(
+  ctx: TabContext,
+  input: ProfileFillInput["questions"],
+): Promise<TabResult> {
+  const { page, logger } = ctx
+  if (!input?.surelcAnswers) {
+    logger.info("[Questions/v2] no surelcAnswers provided — nothing to fill")
+    return { ok: true, alreadyDone: true }
+  }
+  const slugToAnswer = input.surelcAnswers
+  const sbQuestions = await page.$$("sb-question")
+  let processed = 0
+  let yesSet = 0
+  let modalsCreated = 0
+  let modalsSkipped = 0
+  for (const sbQ of sbQuestions) {
+    const text = await (sbQ as any)
+      .innerText()
+      .catch(() => "")
+      .then((t: string) => (t || "").replace(/\s+/g, " ").trim())
+    if (!text) continue
+    const slug = matchQuestionSlug(text)
+    if (!slug) continue
+    processed++
+    const ans = (slugToAnswer as Record<string, any>)[slug]
+    if (!ans) continue
+    // Click Yes or No based on our DB
+    const yesRadio = await (sbQ as any).$('input[type="radio"][value="true"]')
+    const noRadio = await (sbQ as any).$('input[type="radio"][value="false"]')
+    const targetRadio = ans.answer === "yes" ? yesRadio : noRadio
+    if (targetRadio) {
+      const wasChecked = await (targetRadio as any).isChecked().catch(() => false)
+      if (!wasChecked) {
+        await (targetRadio as any).check({ force: true }).catch(() => undefined)
+        await page.waitForTimeout(400)
+      }
+    }
+    if (ans.answer !== "yes") continue
+    yesSet++
+    if (!ans.documents || ans.documents.length === 0) continue
+    // Look for ADD EXPLANATION button in THIS question
+    let addExplBtn = await (sbQ as any).$('button:has-text("ADD EXPLANATION")')
+    if (!addExplBtn) {
+      // Existing explanation already present (button replaced with
+      // EDIT EXPLANATION or hidden). Treat as done.
+      modalsSkipped++
+      logger.info(
+        { slug },
+        "[Questions/v2] no ADD EXPLANATION button (explanation already linked); skipping",
+      )
+      continue
+    }
+    // Drive the modal
+    const result = await driveAddExplanationModal(
+      page,
+      addExplBtn,
+      ans.occurrenceDate,
+      ans.documents,
+      logger,
+      slug,
+    )
+    if (result.ok) modalsCreated++
+    else
+      logger.warn(
+        { slug, reason: result.reason },
+        "[Questions/v2] modal flow did not CREATE",
+      )
+    await page.waitForTimeout(800)
+  }
+  logger.info(
+    { processed, yesSet, modalsCreated, modalsSkipped },
+    "[Questions/v2] driver finished",
+  )
+  await snapshot(ctx, "tab-questions-after-v2")
+  return { ok: true, details: { processed, yesSet, modalsCreated, modalsSkipped } as any }
+}
+
 async function fillQuestions(
   ctx: TabContext,
   producerId: string,
@@ -959,6 +1239,19 @@ async function fillQuestions(
 
   if (await isTabGreen(page, "Questions")) {
     return { ok: true, alreadyDone: true }
+  }
+
+  // ── v2 layout detection ──────────────────────────────────────────
+  // SureLC migrated the Questions tab from tr-row layout to a
+  // div-card + ADD EXPLANATION modal flow in late May 2026. Detect
+  // by presence of <sb-question> elements (the new question wrapper
+  // tag). When present, use the layout-agnostic v2 driver below; the
+  // legacy tr-based code further down is kept for any pre-migration
+  // instance and as a fallback.
+  const sbQuestions = await page.$$("sb-question").catch(() => [] as any[])
+  if (sbQuestions.length > 0) {
+    logger.info({ qCount: sbQuestions.length }, "[Questions/v2] new layout detected — using v2 driver")
+    return await fillQuestionsV2(ctx, input)
   }
 
   // ── Probe the current state BEFORE clicking ALL NO. If there are
