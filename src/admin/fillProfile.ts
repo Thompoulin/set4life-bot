@@ -1203,74 +1203,15 @@ async function fillQuestionsV2(
         .catch(() => undefined)
       await page.waitForTimeout(500)
     }
-    // Try to SELECT an existing uploaded doc first — this is safer
-    // because it doesn't create new attachments (which can become
-    // orphans if CREATE later fails). If no existing docs are
-    // available, fall back to UPLOAD NEW DOCUMENT.
+    // Strategy: UPLOAD first if we have a doc URL in our DB
+    // (covers the normal case). Fall back to SELECT FROM UPLOADED
+    // DOCUMENTS only if UPLOAD didn't work — the SELECT picker can
+    // leave the modal in a stale state on its CANCEL path, so we
+    // avoid opening it when we don't need to.
     const doc = ans.documents[0]
     let uploadOk = false
-    // ── Path A: SELECT FROM UPLOADED DOCUMENTS (preferred) ────────
-    try {
-      const selectBtn = await page.$(
-        'button:has-text("SELECT FROM UPLOADED DOCUMENTS")',
-      )
-      if (selectBtn) {
-        await (selectBtn as any).click().catch(() => undefined)
-        await page.waitForTimeout(1200)
-        // Inside the SELECT dialog, click the first SELECT button.
-        // SureLC lists existing Explanation attachments here. If the
-        // list is non-empty the first item is fine — they're all from
-        // the same producer's prior uploads.
-        const picked = await page.evaluate(() => {
-          const selects = Array.from(document.querySelectorAll("button"))
-            .filter(
-              (b) =>
-                b.textContent?.trim() === "SELECT" &&
-                (b as HTMLElement).offsetWidth > 0,
-            )
-          if (selects.length === 0) return false
-          ;(selects[0] as HTMLElement).click()
-          return true
-        })
-        await page.waitForTimeout(600)
-        if (picked) {
-          // Click DONE on the picker dialog
-          await page
-            .evaluate(() => {
-              const done = Array.from(document.querySelectorAll("button")).find(
-                (b) =>
-                  b.textContent?.trim() === "DONE" &&
-                  (b as HTMLElement).offsetWidth > 0 &&
-                  !(b as HTMLButtonElement).disabled,
-              )
-              if (done) (done as HTMLElement).click()
-            })
-            .catch(() => undefined)
-          await page.waitForTimeout(1200)
-          uploadOk = true
-          logger.info({ slug }, "[Questions/v2] selected existing upload")
-        } else {
-          // Picker was empty — close it
-          await page
-            .evaluate(() => {
-              const cancel = Array.from(
-                document.querySelectorAll("button"),
-              ).find(
-                (b) =>
-                  b.textContent?.trim() === "CANCEL" &&
-                  (b as HTMLElement).offsetWidth > 0,
-              )
-              if (cancel) (cancel as HTMLElement).click()
-            })
-            .catch(() => undefined)
-          await page.waitForTimeout(800)
-        }
-      }
-    } catch (err: any) {
-      logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw")
-    }
-    // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
-    if (!uploadOk) {
+    // ── Path A: UPLOAD NEW DOCUMENT (preferred when we have doc) ──
+    if (doc?.url) {
       try {
         const path = await import("node:path")
         const fs = await import("node:fs/promises")
@@ -1295,10 +1236,58 @@ async function fillQuestionsV2(
             await page.waitForTimeout(2000)
             uploadOk = true
             logger.info({ slug }, "[Questions/v2] uploaded fresh doc")
+          } else {
+            logger.warn({ slug }, "[Questions/v2] UPLOAD button not found")
+          }
+        } else {
+          logger.warn({ slug, status: res.status }, "[Questions/v2] doc fetch failed")
+        }
+      } catch (err: any) {
+        logger.warn({ slug, err: err.message }, "[Questions/v2] UPLOAD path threw")
+      }
+    }
+    // ── Path B: SELECT FROM UPLOADED DOCUMENTS (fallback) ─────────
+    if (!uploadOk) {
+      try {
+        const selectBtn = await page.$(
+          'button:has-text("SELECT FROM UPLOADED DOCUMENTS")',
+        )
+        if (selectBtn) {
+          await (selectBtn as any).click().catch(() => undefined)
+          await page.waitForTimeout(1200)
+          const picked = await page.evaluate(() => {
+            const selects = Array.from(document.querySelectorAll("button"))
+              .filter(
+                (b) =>
+                  b.textContent?.trim() === "SELECT" &&
+                  (b as HTMLElement).offsetWidth > 0,
+              )
+            if (selects.length === 0) return false
+            ;(selects[0] as HTMLElement).click()
+            return true
+          })
+          await page.waitForTimeout(600)
+          if (picked) {
+            await page
+              .evaluate(() => {
+                const done = Array.from(
+                  document.querySelectorAll("button"),
+                ).find(
+                  (b) =>
+                    b.textContent?.trim() === "DONE" &&
+                    (b as HTMLElement).offsetWidth > 0 &&
+                    !(b as HTMLButtonElement).disabled,
+                )
+                if (done) (done as HTMLElement).click()
+              })
+              .catch(() => undefined)
+            await page.waitForTimeout(1200)
+            uploadOk = true
+            logger.info({ slug }, "[Questions/v2] selected existing upload")
           }
         }
       } catch (err: any) {
-        logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw")
+        logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw")
       }
     }
     if (!uploadOk) {
