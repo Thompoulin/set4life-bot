@@ -1203,43 +1203,144 @@ async function fillQuestionsV2(
         .catch(() => undefined)
       await page.waitForTimeout(500)
     }
-    // Upload the first doc directly via UPLOAD NEW DOCUMENT.
-    // This populates the producer's explanation library; the modal
-    // auto-selects the just-uploaded file (REMOVE button appears).
+    // Try to SELECT an existing uploaded doc first — this is safer
+    // because it doesn't create new attachments (which can become
+    // orphans if CREATE later fails). If no existing docs are
+    // available, fall back to UPLOAD NEW DOCUMENT.
     const doc = ans.documents[0]
     let uploadOk = false
+    // ── Path A: SELECT FROM UPLOADED DOCUMENTS (preferred) ────────
     try {
-      const path = await import("node:path")
-      const fs = await import("node:fs/promises")
-      const os = await import("node:os")
-      const res = await fetch(doc.url)
-      if (res.ok) {
-        const buf = Buffer.from(await res.arrayBuffer())
-        const localPath = path.join(
-          os.tmpdir(),
-          `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`,
-        )
-        await fs.writeFile(localPath, buf)
-        const uploadBtn = await page.$('button:has-text("UPLOAD NEW DOCUMENT")')
-        if (uploadBtn) {
-          const [fc] = await Promise.all([
-            page.waitForEvent("filechooser", { timeout: 8_000 }),
-            (uploadBtn as any).click(),
-          ])
-          await fc.setFiles(localPath)
-          await page.waitForTimeout(2000)
+      const selectBtn = await page.$(
+        'button:has-text("SELECT FROM UPLOADED DOCUMENTS")',
+      )
+      if (selectBtn) {
+        await (selectBtn as any).click().catch(() => undefined)
+        await page.waitForTimeout(1200)
+        // Inside the SELECT dialog, click the first SELECT button.
+        // SureLC lists existing Explanation attachments here. If the
+        // list is non-empty the first item is fine — they're all from
+        // the same producer's prior uploads.
+        const picked = await page.evaluate(() => {
+          const selects = Array.from(document.querySelectorAll("button"))
+            .filter(
+              (b) =>
+                b.textContent?.trim() === "SELECT" &&
+                (b as HTMLElement).offsetWidth > 0,
+            )
+          if (selects.length === 0) return false
+          ;(selects[0] as HTMLElement).click()
+          return true
+        })
+        await page.waitForTimeout(600)
+        if (picked) {
+          // Click DONE on the picker dialog
+          await page
+            .evaluate(() => {
+              const done = Array.from(document.querySelectorAll("button")).find(
+                (b) =>
+                  b.textContent?.trim() === "DONE" &&
+                  (b as HTMLElement).offsetWidth > 0 &&
+                  !(b as HTMLButtonElement).disabled,
+              )
+              if (done) (done as HTMLElement).click()
+            })
+            .catch(() => undefined)
+          await page.waitForTimeout(1200)
           uploadOk = true
+          logger.info({ slug }, "[Questions/v2] selected existing upload")
+        } else {
+          // Picker was empty — close it
+          await page
+            .evaluate(() => {
+              const cancel = Array.from(
+                document.querySelectorAll("button"),
+              ).find(
+                (b) =>
+                  b.textContent?.trim() === "CANCEL" &&
+                  (b as HTMLElement).offsetWidth > 0,
+              )
+              if (cancel) (cancel as HTMLElement).click()
+            })
+            .catch(() => undefined)
+          await page.waitForTimeout(800)
         }
       }
     } catch (err: any) {
-      logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw")
+      logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw")
+    }
+    // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
+    if (!uploadOk) {
+      try {
+        const path = await import("node:path")
+        const fs = await import("node:fs/promises")
+        const os = await import("node:os")
+        const res = await fetch(doc.url)
+        if (res.ok) {
+          const buf = Buffer.from(await res.arrayBuffer())
+          const localPath = path.join(
+            os.tmpdir(),
+            `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`,
+          )
+          await fs.writeFile(localPath, buf)
+          const uploadBtn = await page.$(
+            'button:has-text("UPLOAD NEW DOCUMENT")',
+          )
+          if (uploadBtn) {
+            const [fc] = await Promise.all([
+              page.waitForEvent("filechooser", { timeout: 8_000 }),
+              (uploadBtn as any).click(),
+            ])
+            await fc.setFiles(localPath)
+            await page.waitForTimeout(2000)
+            uploadOk = true
+            logger.info({ slug }, "[Questions/v2] uploaded fresh doc")
+          }
+        }
+      } catch (err: any) {
+        logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw")
+      }
     }
     if (!uploadOk) {
-      logger.warn({ slug }, "[Questions/v2] upload failed; cancelling modal")
-      // Bail out cleanly so we don't leave an orphan half-state
+      logger.warn({ slug }, "[Questions/v2] no doc attached; cancelling modal")
       const cancelBtn = await page.$('button:has-text("CANCEL")')
-      if (cancelBtn) await (cancelBtn as any).click()
-      await page.waitForTimeout(800)
+      if (cancelBtn) {
+        // Pointer-sequence on CANCEL too (Angular button)
+        await page
+          .evaluate(() => {
+            const cb = Array.from(document.querySelectorAll("button")).find(
+              (b) =>
+                b.textContent?.trim() === "CANCEL" &&
+                (b as HTMLElement).offsetWidth > 0,
+            )
+            if (!cb) return
+            ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
+              (t) =>
+                cb.dispatchEvent(
+                  new MouseEvent(t, {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    button: 0,
+                  }),
+                ),
+            )
+          })
+          .catch(() => undefined)
+        await page.waitForTimeout(800)
+        // Handle "Unsaved information" dialog — confirm discard
+        await page
+          .evaluate(() => {
+            const yes = Array.from(document.querySelectorAll("button")).find(
+              (b) =>
+                b.textContent?.trim() === "YES" &&
+                (b as HTMLElement).offsetWidth > 0,
+            )
+            if (yes) (yes as HTMLElement).click()
+          })
+          .catch(() => undefined)
+        await page.waitForTimeout(800)
+      }
       continue
     }
     // Click CREATE via pointer event sequence. A plain .click() does

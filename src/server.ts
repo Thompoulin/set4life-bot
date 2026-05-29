@@ -1065,21 +1065,22 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
         formType?: string
         entityId?: string | number
       }>
+      // CAUTION: entityId="0" alone is NOT enough to identify orphans.
+      // Verified Gurira 2026-05-29 — legit linked explanations also
+      // show entityId="0" because the actual question→explanation
+      // linkage lives in a separate SureLC relation, NOT on the
+      // attachment record. Deleting all Explanation+entityId=0
+      // attachments wiped his linked explanations too, putting his
+      // validation back to 3 issues. Now require explicit filename
+      // pattern match — only files our bot uploaded match the
+      // surelc-v2-* / surelc-modal-* / surelc-upload-* prefixes.
       const candidates = attachments.filter((a) => {
-        const unlinked = String(a.entityId ?? "") === "0"
-        if (!unlinked) return false
-        // Primary path: any unlinked Explanation attachment is an
-        // orphan from a failed CREATE flow. We never UPLOAD an
-        // Explanation that's already linked, so unlinked = orphan.
-        if (
-          treatAllExplanationsUnlinkedAsOrphans &&
-          a.formType === "Explanation"
-        ) {
-          return true
-        }
-        // Fallback path: filename pattern match (kept for callers
-        // that want stricter filtering).
+        if (a.formType !== "Explanation") return false
         const fn = a.fileName || ""
+        // Only delete if the filename clearly matches our bot's
+        // temp-upload pattern. Anything else (including empty
+        // fileName) is presumed legit / linked.
+        if (!fn) return false
         return patterns.some((p) => p.test(fn))
       })
       const deleted: Array<{ id: number | string; fileName: string }> = []
