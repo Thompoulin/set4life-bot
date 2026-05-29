@@ -86,41 +86,20 @@ export async function fillMiscWizard(
   }
   page.on("response", onResponse)
 
-  // Warm up the SPA session by visiting the producer profile first.
-  // Cold sessions sometimes bounce the wizard URL straight to OAuth on
-  // the first /bga/* navigation after login — visiting the profile
-  // first gives the Angular SPA a chance to settle.
-  const profileUrl = `https://surelc.surancebay.com/bga/producers/${input.producerId}/profile`
-  logger.info({ profileUrl }, "[fillMiscWizard] warming up session via profile page")
-  try {
-    await page.goto(profileUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
-    })
-    await settle(page, 4000)
-  } catch (err: any) {
-    page.off("response", onResponse)
-    return { ok: false, reason: `profile warmup goto failed: ${err.message}` }
-  }
-  if (page.url().includes("accounts.surancebay.com") || page.url().includes("/bga/oauth")) {
-    page.off("response", onResponse)
-    return {
-      ok: false,
-      reason: `profile warmup bounced to OAuth (${page.url()}) — session not real after login`,
-    }
-  }
-
-  const wizardUrl = `https://surelc.surancebay.com/bga/producers/${input.producerId}/appointments/wizard/guard/${input.appointmentRequestId}`
-  logger.info({ wizardUrl }, "[fillMiscWizard] navigating to wizard")
-  try {
-    await page.goto(wizardUrl, {
-      waitUntil: "domcontentloaded",
-      timeout: 45_000,
-    })
-  } catch (err: any) {
-    page.off("response", onResponse)
-    return { ok: false, reason: `wizard goto failed: ${err.message}` }
-  }
+  // Navigate via the SPA's internal router (history.pushState +
+  // popstate). page.goto() triggers a full browser reload which
+  // revalidates the OAuth token against accounts.surancebay.com and
+  // can bounce cold sessions. SPA navigation keeps the in-memory
+  // Bearer token intact — verified pattern used by recover-orphan,
+  // diagnose-producer, etc.
+  const wizardPath = `/bga/producers/${input.producerId}/appointments/wizard/guard/${input.appointmentRequestId}`
+  logger.info({ wizardPath }, "[fillMiscWizard] navigating to wizard via SPA router")
+  await page
+    .evaluate((path: string) => {
+      history.pushState({}, "", path)
+      window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+    }, wizardPath)
+    .catch(() => undefined)
 
   // Wait for guard redirect into an actual step URL.
   const guardDeadline = Date.now() + 20_000
