@@ -140,10 +140,42 @@ export async function runFastlaneOneProducerManyCarriers(
   //
   // Producers with profile issues (red "N issues" badge) have NO
   // SELECT button — those cards are read-only and must be repaired
-  // before they can be picked. Match Sydney specifically by name.
-  const producerCard = await page.$(
+  // before they can be picked.
+  //
+  // 2026-05-28 Javier Castro: our DB has firstName="Javier"
+  // lastName="Castro" → producerDisplayName="CASTRO, JAVIER", but
+  // SureLC's card text is "CASTRO DIAZ, JAVIER ANTONIO" (paternal +
+  // maternal surname + middle name — common for Latin-American
+  // producers who register with their full legal name). The exact
+  // :has-text("CASTRO, JAVIER") substring is NOT in
+  // "CASTRO DIAZ, JAVIER ANTONIO" → producerCard = null → bot
+  // falsely reports "N issues" when the card actually has a SELECT
+  // button. The search step already narrows by lastName, so the
+  // post-search viewport is reliably the producer in question. We
+  // try exact match first (Sydney etc. work as before), then a
+  // fuzzy match (card text contains lastName AND firstName as
+  // separate substrings), then any single rendered card.
+  let producerCard = await page.$(
     `bga-producer-card:has-text("${input.producerDisplayName}")`,
   )
+  const dispParts = input.producerDisplayName.split(",")
+  const lastNameMatch = (dispParts[0] || "").trim()
+  const firstNameMatch = (dispParts[1] || "").trim()
+  if (!producerCard && lastNameMatch && firstNameMatch) {
+    // Fuzzy: card contains BOTH last AND first as substrings (handles
+    // "CASTRO DIAZ, JAVIER ANTONIO" matching last="CASTRO" + first="JAVIER").
+    producerCard = await page.$(
+      `bga-producer-card:has-text("${lastNameMatch}"):has-text("${firstNameMatch}")`,
+    )
+  }
+  if (!producerCard && lastNameMatch) {
+    // Last resort: search narrowed by lastName already; if exactly
+    // one card is visible after the search filter, it's our producer.
+    const allCards = await page.$$("bga-producer-card")
+    if (allCards.length === 1) {
+      producerCard = allCards[0]
+    }
+  }
   let selectBtn: any = null
   if (producerCard) {
     selectBtn = await producerCard.$('button:has-text("SELECT")')
@@ -153,6 +185,11 @@ export async function runFastlaneOneProducerManyCarriers(
     // containing the producer's name + a SELECT button.
     selectBtn = await page.$(
       `.viewport__item:has-text("${input.producerDisplayName}") button:has-text("SELECT")`,
+    )
+  }
+  if (!selectBtn && lastNameMatch && firstNameMatch) {
+    selectBtn = await page.$(
+      `.viewport__item:has-text("${lastNameMatch}"):has-text("${firstNameMatch}") button:has-text("SELECT")`,
     )
   }
   if (!selectBtn) {
