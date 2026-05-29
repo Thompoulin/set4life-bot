@@ -139,6 +139,19 @@ export async function fillMiscWizard(
     stepsWalked.push(stepName)
     logger.info({ step, stepName }, "[fillMiscWizard] step")
 
+    // Step 2 — States & Products. The AR_STATES requirement fails with
+    // STATES_NO_PRODUCTS_SELECTED when this step's product chip isn't
+    // actively selected (Gurira Americo 117992648 2026-05-29). Click
+    // the first available product chip on this step so the requirement
+    // clears. Idempotent — no-op if a chip is already aria-selected.
+    if (
+      stepName.includes("state") ||
+      stepName.includes("product") ||
+      stepName.includes("states & products")
+    ) {
+      await selectFirstProductChip(ctx)
+    }
+
     // Hard stop on Documents step — that's where Process button lives.
     // We must NEVER click it.
     if (
@@ -461,6 +474,31 @@ async function fillMiscTextInputs(
     }
   }
   return filled
+}
+
+/** Click the first selectable product chip on the States & Products
+ *  step. Required to clear AR_STATES STATES_NO_PRODUCTS_SELECTED.
+ *  Idempotent — skips if a chip is already aria-selected. */
+async function selectFirstProductChip(ctx: TabContext): Promise<void> {
+  const result = await ctx.page.evaluate(() => {
+    const chips = Array.from(
+      document.querySelectorAll("mat-chip-option, mat-chip"),
+    )
+    const fixed = chips.find((c) => /Fixed\s*Life/i.test(c.textContent || ""))
+    const target = fixed || chips[0]
+    if (!target) return { ok: false, reason: "no-chips" }
+    const btn = target.querySelector(
+      "button[matchipaction], button.mdc-evolution-chip__action",
+    ) as HTMLButtonElement | null
+    if (!btn) return { ok: false, reason: "no-chip-action-button" }
+    if (btn.getAttribute("aria-selected") === "true") {
+      return { ok: true, alreadySelected: true }
+    }
+    btn.click()
+    return { ok: true, clicked: true }
+  })
+  ctx.logger.info({ ...result }, "[fillMiscWizard] product chip select")
+  await ctx.page.waitForTimeout(1500)
 }
 
 /** Bottom-right Next button. Wait up to 15s for enable. */
