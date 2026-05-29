@@ -322,13 +322,19 @@ async function fillMiscRadios(
         const label = (labelEl?.textContent || "").trim()
 
         // Build the desired answer from the map (default N for unmatched).
+        // LONGEST match wins — if both "Misdemeanor" and "convicted of or
+        // plead guilty or no contest to any Misdemeanor" match, the more
+        // specific (longer) key wins. Prevents the wrong slug's answer
+        // applying when multiple labels share a generic substring.
         let answer: "Y" | "N" = "N"
         let mapHit = false
+        let bestKeyLen = 0
+        const lowerLabel = label.toLowerCase()
         for (const [key, ans] of Object.entries(args.map)) {
-          if (label.toLowerCase().includes(key.toLowerCase())) {
+          if (lowerLabel.includes(key.toLowerCase()) && key.length > bestKeyLen) {
             answer = ans.toLowerCase().startsWith("y") ? "Y" : "N"
             mapHit = true
-            break
+            bestKeyLen = key.length
           }
         }
         const targetVal = answer === "Y" ? posVal : negVal
