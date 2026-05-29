@@ -316,22 +316,39 @@ async function fillMiscRadios(
         const checked = g.querySelector(
           'input[type="radio"]:checked',
         ) as HTMLInputElement | null
-        if (checked && (checked.value === posVal || checked.value === negVal)) {
-          return { skip: true, reason: "already-checked", value: checked.value }
-        }
         const labelEl = g
           .closest("sb-question, .wrap, mat-form-field, .form-field")
           ?.querySelector(".question__text, label, .question-label")
         const label = (labelEl?.textContent || "").trim()
 
+        // Build the desired answer from the map (default N for unmatched).
         let answer: "Y" | "N" = "N"
+        let mapHit = false
         for (const [key, ans] of Object.entries(args.map)) {
           if (label.toLowerCase().includes(key.toLowerCase())) {
             answer = ans.toLowerCase().startsWith("y") ? "Y" : "N"
+            mapHit = true
             break
           }
         }
         const targetVal = answer === "Y" ? posVal : negVal
+
+        // If a radio is ALREADY at the desired value, skip — no-op.
+        if (checked && checked.value === targetVal) {
+          return { skip: true, reason: "already-correct", value: checked.value }
+        }
+        // If already checked at a DIFFERENT value AND we have no map
+        // entry for this question, leave it alone — don't blindly flip
+        // existing answers we don't have an authoritative source for.
+        // The flip happens only when the caller explicitly maps the
+        // question (mapHit=true), so we can correct wrongly-set TRUE
+        // values when our DB says the rep answered NO. Verified Gurira
+        // 2026-05-29 — her Banner questionnaire had chargedFelony=true
+        // despite her surelc_answers saying no; without this override
+        // the bot skipped and AR_QUESTIONNAIRE stayed FAILED.
+        if (checked && !mapHit) {
+          return { skip: true, reason: "checked-no-override", value: checked.value }
+        }
         const inp = g.querySelector(
           `input[type="radio"][value="${targetVal}"]`,
         ) as HTMLInputElement | null
