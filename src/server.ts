@@ -1619,6 +1619,7 @@ const fillMiscWizardSchema = z.object({
   appointmentRequestId: z.string(),
   adminCreds: adminCredsSchema,
   answers: z.record(z.enum(["Y", "N"])).optional(),
+  textValues: z.record(z.string()).optional(),
 })
 
 /**
@@ -1650,7 +1651,7 @@ app.post("/fill-misc-via-wizard", async (req, res) => {
       .status(400)
       .json({ error: "bad_request", issues: parsed.error.issues })
   }
-  const { producerId, appointmentRequestId, adminCreds, answers } = parsed.data
+  const { producerId, appointmentRequestId, adminCreds, answers, textValues } = parsed.data
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
@@ -1687,6 +1688,7 @@ app.post("/fill-misc-via-wizard", async (req, res) => {
         producerId,
         appointmentRequestId,
         answers,
+        textValues,
       })
       return res.json(result)
     } finally {

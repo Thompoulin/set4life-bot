@@ -41,6 +41,12 @@ export interface FillMiscWizardInput {
    *   { "1994 Crime Act": "N", "outstanding civil judgments": "N" }
    */
   answers?: Record<string, "Y" | "N">
+  /**
+   * Optional text-field values keyed by exact SureLC field name.
+   * Used to fill input[type=text] cells on the misc step. Example:
+   *   { "placeOfBirth": "Freeport, New York" }
+   */
+  textValues?: Record<string, string>
 }
 
 interface FillMiscWizardResult extends TabResult {
@@ -178,6 +184,14 @@ export async function fillMiscWizard(
       const filled = await fillMiscRadios(ctx, answers)
       fieldsFilled += filled
       logger.info({ filled }, "[fillMiscWizard] misc radios filled on this step")
+      // Also fill text inputs matched by formcontrolname against the
+      // textValues map. Many carriers ask for placeOfBirth, residentCounty,
+      // felony_county, felony_state etc. as plain text on the misc step.
+      const textFilled = await fillMiscTextInputs(ctx, input.textValues || {})
+      fieldsFilled += textFilled
+      if (textFilled > 0) {
+        logger.info({ textFilled }, "[fillMiscWizard] text fields filled on this step")
+      }
       await page.waitForTimeout(1500)
       await snapshot(ctx, `fillMisc-${input.appointmentRequestId}-step${step}-post`)
     }
@@ -331,8 +345,10 @@ async function fillMiscRadios(
     // Wait briefly for any scroll animation triggered by scrollIntoView
     // to settle before clicking.
     await page.waitForTimeout(250)
+    const cx = click.x as number
+    const cy = click.y as number
     try {
-      await page.mouse.click(click.x, click.y, { delay: 30 })
+      await page.mouse.click(cx, cy, { delay: 30 })
       ctx.logger.info(
         { idx, x: click.x, y: click.y, value: click.value, label: click.label },
         "[fillMiscWizard] radio clicked",
@@ -347,6 +363,64 @@ async function fillMiscRadios(
     }
   }
   return clicked
+}
+
+/**
+ * Fill text inputs on the current step that match a key in `textValues`.
+ * Match is by formcontrolname or name attribute. Uses Playwright's native
+ * fill so Angular's reactive form picks up the value via the input event.
+ *
+ * Skips fields already non-empty (idempotent). Returns count of fields
+ * actually filled.
+ */
+async function fillMiscTextInputs(
+  ctx: TabContext,
+  textValues: Record<string, string>,
+): Promise<number> {
+  const { page } = ctx
+  if (Object.keys(textValues).length === 0) return 0
+  // Discover which fields exist on the page and match our values.
+  const candidates = await page.evaluate((map: Record<string, string>) => {
+    const inputs = Array.from(
+      document.querySelectorAll(
+        'input[type="text"], input:not([type]), input[type="email"]',
+      ),
+    ) as HTMLInputElement[]
+    const out: Array<{ selector: string; name: string; value: string }> = []
+    for (const inp of inputs) {
+      const name = inp.getAttribute("formcontrolname") || inp.getAttribute("name") || ""
+      if (!name) continue
+      if (!(name in map)) continue
+      if (inp.value && inp.value.trim() !== "") continue
+      // Build a stable selector — formcontrolname is unique on the misc form.
+      const sel = `input[formcontrolname="${name}"], input[name="${name}"]`
+      out.push({ selector: sel, name, value: map[name] })
+    }
+    return out
+  }, textValues)
+
+  let filled = 0
+  for (const c of candidates) {
+    try {
+      const loc = page.locator(c.selector).first()
+      await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => undefined)
+      await loc.fill(c.value, { timeout: 5000 })
+      // Blur to trigger Angular's reactive form change detection.
+      await loc.evaluate((el: HTMLInputElement) => el.blur())
+      await page.waitForTimeout(150)
+      ctx.logger.info(
+        { name: c.name, value: c.value.slice(0, 40) },
+        "[fillMiscWizard] text field filled",
+      )
+      filled++
+    } catch (err: any) {
+      ctx.logger.warn(
+        { err: err?.message, name: c.name },
+        "[fillMiscWizard] text field fill failed",
+      )
+    }
+  }
+  return filled
 }
 
 /** Bottom-right Next button. Wait up to 15s for enable. */
