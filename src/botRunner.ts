@@ -114,6 +114,7 @@ export interface RunActivationResult {
       ok: boolean
       signed: number
       failed: Array<{ reason: string }>
+      skipped: Array<{ reason: string }>
     }
     admin_process?: {
       ok: boolean
@@ -606,11 +607,12 @@ export async function runActivation(
         result.phases.rep_review = r
         result.stage = r.ok ? "rep_review_complete" : "rep_review_failed"
         if (!r.ok) result.success = false
+        const skippedCount = r.skipped?.length ?? 0
         await finishRep({
           ok: r.ok,
           msg: r.ok
-            ? `Signed ${r.signed} carrier(s)`
-            : `Signed ${r.signed}, ${r.failed.length} failed`,
+            ? `Signed ${r.signed} carrier(s)${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`
+            : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`,
           meta: r as any,
         })
       } catch (err: any) {
@@ -618,6 +620,7 @@ export async function runActivation(
           ok: false,
           signed: 0,
           failed: [{ reason: err?.message || "exception" }],
+          skipped: [],
         }
         result.success = false
         result.stage = "rep_review_failed"

@@ -28,6 +28,18 @@ export interface TabResult {
   reason?: string
   /** True if the tab was already complete before we touched it. */
   alreadyDone?: boolean
+  /**
+   * True when this carrier was neither signed nor genuinely-failed, but
+   * SKIPPED for a structural reason that retrying can never fix — the
+   * appointment-request was withdrawn/discarded by the agency. Skips
+   * MUST NOT land in the rep-review `failed[]` array: a withdrawn
+   * carrier is not a bot failure, and counting it as one churns the
+   * daily sweep and falsely demotes the agent to needs_human even when
+   * every live carrier signed fine. See rep/review.ts loop.
+   */
+  skipped?: boolean
+  /** Why the carrier was skipped (e.g. "appointment_withdrawn"). */
+  skipReason?: string
   /** Anything tab-specific the orchestrator should log. */
   details?: Record<string, unknown>
 }

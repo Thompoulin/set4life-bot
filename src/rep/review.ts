@@ -228,7 +228,7 @@ export async function repReview(
   input: RepReviewInput,
   parentLogger: pino.Logger,
   jobId: string,
-): Promise<{ ok: boolean; signed: number; failed: Array<{ reason: string }> }> {
+): Promise<{ ok: boolean; signed: number; failed: Array<{ reason: string }>; skipped: Array<{ reason: string }> }> {
   const logger = parentLogger.child({ component: "rep-review" })
   const ctxBrowser = await browser.newContext({
     viewport: { width: 1280, height: 900 },
@@ -253,6 +253,11 @@ export async function repReview(
 
   let signed = 0
   const failed: Array<{ reason: string }> = []
+  // Carriers that were withdrawn/discarded by the agency — never a
+  // failure, never retryable. Kept separate from `failed[]` so a
+  // withdrawn dupe can't flip an otherwise-clean run to failed (which
+  // would churn the daily sweep and falsely demote the agent).
+  const skipped: Array<{ reason: string }> = []
 
   try {
     // ── Step 0 — Auth ──────────────────────────────────────────────
@@ -329,7 +334,7 @@ export async function repReview(
 
     const ssnHost = await page.$('auth-ssn-input')
     if (!ssnHost) {
-      return { ok: false, signed, failed: [{ reason: "SSN field not found at auth" }] }
+      return { ok: false, signed, failed: [{ reason: "SSN field not found at auth" }], skipped }
     }
     // Focus the inner masked input directly (the .hidden one is the
     // event-target; the .visible one is readonly and the outer host
@@ -366,7 +371,7 @@ export async function repReview(
       'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
     )
     if (!dobInput) {
-      return { ok: false, signed, failed: [{ reason: "DOB field not found at auth" }] }
+      return { ok: false, signed, failed: [{ reason: "DOB field not found at auth" }], skipped }
     }
     try {
       await (dobInput as any).fill(dobSlashed, { force: true, timeout: 10_000 })
@@ -403,7 +408,7 @@ export async function repReview(
       'button.mat-flat-button.mat-primary',
     ])
     if (!authBtn) {
-      return { ok: false, signed, failed: [{ reason: "LOGIN button not found at auth" }] }
+      return { ok: false, signed, failed: [{ reason: "LOGIN button not found at auth" }], skipped }
     }
     await Promise.all([
       page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {}),
@@ -431,7 +436,10 @@ export async function repReview(
     for (let i = 0; i < totalIterations; i++) {
       try {
         const result = await reviewOneCarrier(ctx, i, input)
-        if (result.ok) {
+        if (result.skipped) {
+          // Withdrawn / structurally-unsignable — not a failure.
+          skipped.push({ reason: result.skipReason || result.reason || "skipped" })
+        } else if (result.ok) {
           signed += 1
         } else {
           failed.push({ reason: result.reason || "unknown" })
@@ -478,7 +486,13 @@ export async function repReview(
       }
     }
 
-    return { ok: failed.length === 0 && signed > 0, signed, failed }
+    // A run is OK when there were no GENUINE failures and we either
+    // signed something or had only skips (all carriers withdrawn → a
+    // benign "nothing to sign", not a failure to retry/demote on).
+    // Genuine failures (browser crash, live-request PDF stall, carrier
+    // wizard red-notice) stay in `failed[]` and keep the run retryable.
+    const ok = failed.length === 0 && (signed > 0 || skipped.length > 0)
+    return { ok, signed, failed, skipped }
   } finally {
     await ctxBrowser.close().catch(() => {})
   }
@@ -497,6 +511,22 @@ async function reviewOneCarrier(
   // on selectors that won't appear.
   await page.waitForTimeout(2000)
   const url = page.url()
+  // Withdrawn fast-path: when the agency has discarded this
+  // appointment-request, SureLC redirects the review link to
+  // /ar-review/appointment/<id>/withdrawn-request. No PDF/wizard will
+  // ever load. Detect the redirect up front and SKIP (not fail) before
+  // entering the 4-minute PDF budget — this is the dominant Phase-B
+  // churn source (stale follow-up emails point at discarded dupes).
+  if (/\/appointment\/[^/]+\/withdrawn-request/.test(url)) {
+    logger.info({ url }, "[Rep step6] appointment withdrawn by agency (URL redirect) — skipping")
+    await snapshot(ctx, `rep-carrier${idx}-withdrawn`)
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: "appointment_withdrawn",
+      reason: `appointment_withdrawn (URL redirect to /withdrawn-request): ${url}`,
+    }
+  }
   if (/\/appointment\/[^/]+\/reviewed/.test(url)) {
     // prefillOnly mode wants to walk EVERY carrier's wizard fresh —
     // SureLC sometimes redirects to /reviewed for in-progress
@@ -676,11 +706,14 @@ async function reviewOneCarrier(
     // server-side orchestrator can skip-and-move-on instead of
     // patching state / retrying.
     const isWithdrawn =
+      (diag as any)?.withdrawn === true ||
       /agency has withdrawn this request/i.test(bodyExcerpt) ||
       /contact your agency for details/i.test(bodyExcerpt)
     if (isWithdrawn) {
       return {
         ok: false,
+        skipped: true,
+        skipReason: "appointment_withdrawn",
         reason: `appointment_withdrawn: the appointment-request was discarded by the agency before signing. The follow-up email the bot followed points at the withdrawn record; SureLC will issue a fresh email for the new appointment-request created by the most recent Phase A run. URL: ${url}`,
       }
     }
