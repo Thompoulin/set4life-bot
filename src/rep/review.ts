@@ -527,6 +527,27 @@ async function reviewOneCarrier(
       reason: `appointment_withdrawn (URL redirect to /withdrawn-request): ${url}`,
     }
   }
+  // No-states fast-path: when the appointment-request was created with
+  // NO licensing states attached (Fastlane state-checkbox sweep missed
+  // them for a sparse-license rep), SureLC redirects the review link to
+  // /ar-review/appointment/<id>/no-states and the welcome step shows a
+  // red "states required" notice the bot can't clear from rep data. The
+  // fix is the agency-admin PATCH that sets the appointment's states to
+  // the rep's resident state (/patch-appointments-to-resident-state),
+  // which the backoffice fires reactively. For that to work it needs an
+  // extractable appointment id and a distinct token to key on — emit
+  // both here, and bail before wasting the 4-minute PDF budget. This is
+  // a FAILURE (not a skip): the carrier can be signed once states are
+  // populated, so it should trigger the patch + targeted retry.
+  const noStatesMatch = url.match(/\/appointment\/([^/]+)\/no-states/)
+  if (noStatesMatch) {
+    logger.warn({ url, appointmentId: noStatesMatch[1] }, "[Rep step6] appointment has no licensing states (URL redirect to /no-states) — needs resident-state PATCH")
+    await snapshot(ctx, `rep-carrier${idx}-no-states`)
+    return {
+      ok: false,
+      reason: `appointment_no_states: the appointment-request has no licensing states attached, so the carrier wizard blocks on /no-states. Needs a resident-state PATCH. appointment/${noStatesMatch[1]} ${url}`,
+    }
+  }
   if (/\/appointment\/[^/]+\/reviewed/.test(url)) {
     // prefillOnly mode wants to walk EVERY carrier's wizard fresh —
     // SureLC sometimes redirects to /reviewed for in-progress
