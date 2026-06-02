@@ -339,163 +339,71 @@ async function fillCarrierQuestionExplanations(
       await page.waitForTimeout(1200)
       await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}`)
 
+      // All modal interactions are scoped to the visible
+      // mat-dialog-container so we never touch the underlying card's "ADD"
+      // button (clicking ADD just re-opens the modal — the prior
+      // filled:N/remaining:1 churn) or a textarea behind the overlay.
+      const dialog = page.locator("mat-dialog-container:visible").last()
+
       // 1) Occurrence date, if the modal exposes one.
       if (pick.occurrenceDate) {
         const m = pick.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
         const mmddyyyy = m ? `${m[2]}/${m[3]}/${m[1]}` : pick.occurrenceDate
-        await page
-          .evaluate((v) => {
-            const inp = document.querySelector(
-              'input[placeholder*="Occurrence" i], input[placeholder*="date" i]',
-            ) as HTMLInputElement | null
-            if (!inp) return
-            inp.value = v
-            inp.dispatchEvent(new Event("input", { bubbles: true }))
-            inp.dispatchEvent(new Event("change", { bubbles: true }))
-            inp.dispatchEvent(new Event("blur", { bubbles: true }))
-          }, mmddyyyy)
-          .catch(() => undefined)
+        try {
+          const dateInp = dialog
+            .locator('input[placeholder*="Occurrence" i], input[placeholder*="date" i]')
+            .first()
+          if (await dateInp.count()) await dateInp.fill(mmddyyyy)
+        } catch {
+          /* no date field on this modal — fine */
+        }
       }
 
-      // 2) Explanation text into the modal's textarea / description field.
-      const descFilled = await page
-        .evaluate((text) => {
-          const el = Array.from(
-            document.querySelectorAll<HTMLTextAreaElement | HTMLInputElement>(
-              "textarea, input[type=\"text\"]",
-            ),
-          ).find((e) => {
-            const ph = (e.getAttribute("placeholder") || "").toLowerCase()
-            const vis = (e as HTMLElement).offsetWidth > 0
-            return (
-              vis &&
-              (e.tagName === "TEXTAREA" ||
-                /descri|explan|comment|detail|reason/.test(ph))
-            )
-          })
-          if (!el) return false
-          ;(el as any).value = text
-          el.dispatchEvent(new Event("input", { bubbles: true }))
-          el.dispatchEvent(new Event("change", { bubbles: true }))
-          return true
-        }, pick.explanation)
-        .catch(() => false)
-
-      // 3) Attach a supporting doc. Prefer SELECT FROM UPLOADED (reuses an
-      //    existing attachment, no orphan); fall back to UPLOAD NEW.
-      let attached = false
+      // 2) Explanation text → the Description textarea. Playwright .fill()
+      //    drives Angular's form control properly; a raw value-set is
+      //    dropped by ngModel, so DONE would save an empty description and
+      //    the red card would persist (verified Jimenez 2026-06-02).
+      let descFilled = false
       try {
-        const selectBtn = await page.$(
-          'button:has-text("SELECT FROM UPLOADED")',
-        )
-        if (selectBtn) {
-          await (selectBtn as any).click().catch(() => undefined)
-          await page.waitForTimeout(1000)
-          const picked = await page
-            .evaluate(() => {
-              const sel = Array.from(document.querySelectorAll("button")).filter(
-                (b) =>
-                  b.textContent?.trim().toUpperCase() === "SELECT" &&
-                  (b as HTMLElement).offsetWidth > 0,
-              )
-              if (!sel.length) return false
-              ;(sel[0] as HTMLElement).click()
-              return true
-            })
-            .catch(() => false)
-          await page.waitForTimeout(600)
-          if (picked) {
-            await page
-              .evaluate(() => {
-                const done = Array.from(
-                  document.querySelectorAll("button"),
-                ).find(
-                  (b) =>
-                    b.textContent?.trim().toUpperCase() === "DONE" &&
-                    (b as HTMLElement).offsetWidth > 0 &&
-                    !(b as HTMLButtonElement).disabled,
-                )
-                if (done) (done as HTMLElement).click()
-              })
-              .catch(() => undefined)
-            await page.waitForTimeout(1000)
-            attached = true
-          } else {
-            await page
-              .evaluate(() => {
-                const c = Array.from(document.querySelectorAll("button")).find(
-                  (b) =>
-                    b.textContent?.trim().toUpperCase() === "CANCEL" &&
-                    (b as HTMLElement).offsetWidth > 0,
-                )
-                if (c) (c as HTMLElement).click()
-              })
-              .catch(() => undefined)
-            await page.waitForTimeout(600)
-          }
+        const ta = dialog.locator("textarea").first()
+        if (await ta.count()) {
+          await ta.fill(pick.explanation)
+          descFilled = true
         }
       } catch (err: any) {
-        logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT-uploaded path threw")
-      }
-      if (!attached && pick.docUrl) {
-        try {
-          const path = await import("node:path")
-          const fs = await import("node:fs/promises")
-          const os = await import("node:os")
-          const res = await fetch(pick.docUrl)
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer())
-            const localPath = path.join(
-              os.tmpdir(),
-              `rep-cq-${idx}-${Date.now()}-${pick.fileName || "doc.pdf"}`,
-            )
-            await fs.writeFile(localPath, buf)
-            const uploadBtn = await page.$(
-              'button:has-text("UPLOAD NEW DOCUMENT"), button:has-text("UPLOAD")',
-            )
-            if (uploadBtn) {
-              const [fc] = await Promise.all([
-                page.waitForEvent("filechooser", { timeout: 8000 }),
-                (uploadBtn as any).click(),
-              ])
-              await fc.setFiles(localPath)
-              await page.waitForTimeout(2000)
-              attached = true
-            }
-          }
-        } catch (err: any) {
-          logger.warn({ idx, err: err?.message }, "[Rep step4] UPLOAD-new path threw")
-        }
+        logger.warn({ idx, err: err?.message }, "[Rep step4] description fill threw")
       }
 
-      // 4) Commit the modal — CREATE/ADD/SAVE via the full pointer
-      //    sequence (plain .click() is dropped by Material's handler).
-      const saved = await page
-        .evaluate(() => {
-          const btn = Array.from(document.querySelectorAll("button")).find((b) => {
-            const t = (b.textContent || "").trim().toUpperCase()
-            return (
-              (t === "CREATE" || t === "ADD" || t === "SAVE" || t === "DONE") &&
-              !/ADD\s+EXPLANATION/.test(t) &&
-              (b as HTMLElement).offsetWidth > 0 &&
-              !(b as HTMLButtonElement).disabled
-            )
-          })
-          if (!btn) return false
-          ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
-            (type) =>
-              btn.dispatchEvent(
-                new MouseEvent(type, {
-                  bubbles: true,
-                  cancelable: true,
-                  view: window,
-                  button: 0,
-                }),
-              ),
-          )
-          return true
-        })
-        .catch(() => false)
+      // 3) Attach an existing uploaded doc via its inline SELECT button.
+      //    The modal lists the rep's already-uploaded explanation/DISCHARGE
+      //    docs under "Other documents available"; reusing one needs no
+      //    filechooser (the prior UPLOAD-new path timed out). The card is
+      //    "or/and" so the description alone can satisfy it — this is
+      //    belt-and-braces and harmless when the list is empty.
+      let attached = false
+      try {
+        const sel = dialog.locator('button:has-text("SELECT")').first()
+        if (await sel.count()) {
+          await sel.click({ timeout: 4000 }).catch(() => undefined)
+          await page.waitForTimeout(700)
+          attached = true
+        }
+      } catch (err: any) {
+        logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT existing-doc threw")
+      }
+
+      // 4) Commit via the modal's DONE button, scoped to the dialog so we
+      //    never hit the underlying card's ADD button (which re-opens the
+      //    modal). Playwright's click runs the full pointer sequence
+      //    Material's handler expects.
+      let saved = false
+      try {
+        const done = dialog.locator('button:has-text("DONE")').first()
+        await done.click({ timeout: 5000 })
+        saved = true
+      } catch (err: any) {
+        logger.warn({ idx, err: err?.message }, "[Rep step4] DONE click threw")
+      }
       await page.waitForTimeout(1500)
 
       if (saved && (descFilled || attached)) {
