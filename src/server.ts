@@ -223,6 +223,24 @@ const repReviewSchema = z.object({
       q19_irs_matters: z.boolean().optional(),
     })
     .optional(),
+  /**
+   * Per-disclosure explanation letters + supporting docs (from
+   * questionnaire_responses.surelc_answers). Used to fill the red
+   * "ADD" explanation modal on a carrier's Carrier-Questions step when
+   * a "Yes" answer demands a description/attachment. See
+   * rep/review.ts fillCarrierQuestionExplanations.
+   */
+  carrierQuestionExplanations: z
+    .array(
+      z.object({
+        questionText: z.string().optional(),
+        occurrenceDate: z.string().optional(),
+        explanation: z.string().optional(),
+        docUrl: z.string().optional(),
+        fileName: z.string().optional(),
+      }),
+    )
+    .optional(),
 })
 
 const processSchema = z.object({

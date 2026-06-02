@@ -114,6 +114,29 @@ export interface RepReviewInput {
     q18_other_names?: boolean
     q19_irs_matters?: boolean
   }
+  /**
+   * Per-disclosure explanation letters + supporting docs from the rep's
+   * onboarding (`questionnaire_responses.surelc_answers`). When a carrier's
+   * Carrier-Questions step (Step 4) answers "Yes", SureLC shows a red
+   * `sb-info-message[action="Add"]` card demanding "provide description
+   * or/and attach files" — without filling it the request can't reach
+   * Review & Sign (Americo/AmAm et al. stall at Producer; the whole
+   * red-flag backlog 2026-06-02). The bot drives that ADD modal with these.
+   *
+   * `questionText` is the rep's onboarding question wording, used to
+   * best-match a card; entries also serve as a fallback pool since the
+   * criminal-history explanations are usually one shared letter.
+   */
+  carrierQuestionExplanations?: Array<{
+    questionText?: string
+    /** ISO YYYY-MM-DD; rendered MM/DD/YYYY into the modal's date field. */
+    occurrenceDate?: string
+    /** The letter-of-explanation body text. */
+    explanation?: string
+    /** Fetchable URL of a supporting doc to attach (e.g. DISCHARGE.pdf). */
+    docUrl?: string
+    fileName?: string
+  }>
 }
 
 /**
@@ -216,11 +239,317 @@ function pickYnForLabel(
   // Product-line opt-in always YES — Set4Life agents sell the
   // standard life portfolio (FE, Term, Whole Life, Annuity, etc).
   if (PRODUCT_OPT_IN_PATTERN.test(label)) return "Y"
+  // "Did you FILE a 1033 form / 1033 waiver?" is a FACTUAL filing
+  // question, distinct from the felony background disclosure. The
+  // q1_felony regex below otherwise over-matches the literal "1033"
+  // (and "felony") in this prompt and wrongly answers Yes — which is a
+  // false statement of fact, not a conservative over-disclosure
+  // (Jimenez 2026-06-02 Americo: form1033Filed=no but bot answered Yes,
+  // creating a spurious red explanation-required flag). A 1033 waiver
+  // is filed by very few reps; default No. (Background "have you ever
+  // been convicted" felony questions don't contain file/filing/waiver
+  // and still match the disclosure pattern correctly.)
+  if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
+    return "N"
   if (!disclosures) return "N"
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
     if (pattern.test(label) && disclosures[key]) return "Y"
   }
   return "N"
+}
+
+/**
+ * Step-4 Carrier-Questions explanation-modal filler.
+ *
+ * A "Yes" carrier-question answer makes SureLC render a red
+ * `<sb-info-message type="error" action="Add">` card ("Please, provide
+ * description or/and attach files" + an ADD button). The request cannot
+ * advance to Review & Sign until every such card is satisfied — this is
+ * what strands disclosure-Yes reps at Producer across the whole red-flag
+ * backlog (Americo/AmAm et al., 2026-06-02). SureLC moved this to a modal
+ * the old fill logic never touched.
+ *
+ * Drives the ADD modal per card: set occurrence date, type the
+ * explanation text, attach a supporting doc (preferring an
+ * already-uploaded one to avoid orphans), then CREATE via the full
+ * pointer sequence Angular Material needs. Fully defensive: only acts
+ * when red cards exist, never throws, and closes a stuck modal so it
+ * can't block subsequent cards or the Next button. Captures the modal
+ * DOM/screenshot for validation.
+ */
+async function fillCarrierQuestionExplanations(
+  ctx: TabContext,
+  input: RepReviewInput,
+  idx: number,
+): Promise<{ cards: number; filled: number }> {
+  const { page, logger } = ctx
+  const pool = input.carrierQuestionExplanations || []
+
+  const ADD_SEL = 'sb-info-message[action="Add"] button.message__button'
+  const initialCards = await page.locator(ADD_SEL).count().catch(() => 0)
+  if (initialCards === 0) return { cards: 0, filled: 0 }
+
+  logger.info(
+    { idx, cards: initialCards, poolSize: pool.length },
+    "[Rep step4] explanation-required cards present; driving ADD modal(s)",
+  )
+  await snapshot(ctx, `rep-carrier${idx}-step4-add-cards`)
+
+  const norm = (s: string) =>
+    s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim()
+
+  let filled = 0
+  // Re-query each pass — satisfying a card mutates the DOM. Bound the
+  // loop so an unfillable card can never spin forever.
+  for (let pass = 0; pass < initialCards + 2; pass++) {
+    const addBtn = page.locator(ADD_SEL).first()
+    if ((await addBtn.count().catch(() => 0)) === 0) break
+
+    const questionText = await addBtn
+      .evaluate((btn) => {
+        const card =
+          btn.closest("sb-question, .question, .details_content, mat-card") ||
+          btn.closest("div")
+        const root =
+          (card?.parentElement &&
+            card.parentElement.closest("sb-question, .question, mat-card")) ||
+          card
+        return (root?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 240)
+      })
+      .catch(() => "")
+
+    const qn = norm(questionText)
+    const pick =
+      pool.find(
+        (e) => e.questionText && qn.includes(norm(e.questionText).slice(0, 28)),
+      ) ||
+      pool.find((e) => e.explanation) ||
+      pool[0]
+
+    if (!pick || !pick.explanation) {
+      logger.warn(
+        { idx, questionText },
+        "[Rep step4] no explanation in pool for card — cannot satisfy; stopping",
+      )
+      break
+    }
+
+    try {
+      await addBtn.click({ timeout: 5000, force: true })
+      await page.waitForTimeout(1200)
+      await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}`)
+
+      // 1) Occurrence date, if the modal exposes one.
+      if (pick.occurrenceDate) {
+        const m = pick.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+        const mmddyyyy = m ? `${m[2]}/${m[3]}/${m[1]}` : pick.occurrenceDate
+        await page
+          .evaluate((v) => {
+            const inp = document.querySelector(
+              'input[placeholder*="Occurrence" i], input[placeholder*="date" i]',
+            ) as HTMLInputElement | null
+            if (!inp) return
+            inp.value = v
+            inp.dispatchEvent(new Event("input", { bubbles: true }))
+            inp.dispatchEvent(new Event("change", { bubbles: true }))
+            inp.dispatchEvent(new Event("blur", { bubbles: true }))
+          }, mmddyyyy)
+          .catch(() => undefined)
+      }
+
+      // 2) Explanation text into the modal's textarea / description field.
+      const descFilled = await page
+        .evaluate((text) => {
+          const el = Array.from(
+            document.querySelectorAll<HTMLTextAreaElement | HTMLInputElement>(
+              "textarea, input[type=\"text\"]",
+            ),
+          ).find((e) => {
+            const ph = (e.getAttribute("placeholder") || "").toLowerCase()
+            const vis = (e as HTMLElement).offsetWidth > 0
+            return (
+              vis &&
+              (e.tagName === "TEXTAREA" ||
+                /descri|explan|comment|detail|reason/.test(ph))
+            )
+          })
+          if (!el) return false
+          ;(el as any).value = text
+          el.dispatchEvent(new Event("input", { bubbles: true }))
+          el.dispatchEvent(new Event("change", { bubbles: true }))
+          return true
+        }, pick.explanation)
+        .catch(() => false)
+
+      // 3) Attach a supporting doc. Prefer SELECT FROM UPLOADED (reuses an
+      //    existing attachment, no orphan); fall back to UPLOAD NEW.
+      let attached = false
+      try {
+        const selectBtn = await page.$(
+          'button:has-text("SELECT FROM UPLOADED")',
+        )
+        if (selectBtn) {
+          await (selectBtn as any).click().catch(() => undefined)
+          await page.waitForTimeout(1000)
+          const picked = await page
+            .evaluate(() => {
+              const sel = Array.from(document.querySelectorAll("button")).filter(
+                (b) =>
+                  b.textContent?.trim().toUpperCase() === "SELECT" &&
+                  (b as HTMLElement).offsetWidth > 0,
+              )
+              if (!sel.length) return false
+              ;(sel[0] as HTMLElement).click()
+              return true
+            })
+            .catch(() => false)
+          await page.waitForTimeout(600)
+          if (picked) {
+            await page
+              .evaluate(() => {
+                const done = Array.from(
+                  document.querySelectorAll("button"),
+                ).find(
+                  (b) =>
+                    b.textContent?.trim().toUpperCase() === "DONE" &&
+                    (b as HTMLElement).offsetWidth > 0 &&
+                    !(b as HTMLButtonElement).disabled,
+                )
+                if (done) (done as HTMLElement).click()
+              })
+              .catch(() => undefined)
+            await page.waitForTimeout(1000)
+            attached = true
+          } else {
+            await page
+              .evaluate(() => {
+                const c = Array.from(document.querySelectorAll("button")).find(
+                  (b) =>
+                    b.textContent?.trim().toUpperCase() === "CANCEL" &&
+                    (b as HTMLElement).offsetWidth > 0,
+                )
+                if (c) (c as HTMLElement).click()
+              })
+              .catch(() => undefined)
+            await page.waitForTimeout(600)
+          }
+        }
+      } catch (err: any) {
+        logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT-uploaded path threw")
+      }
+      if (!attached && pick.docUrl) {
+        try {
+          const path = await import("node:path")
+          const fs = await import("node:fs/promises")
+          const os = await import("node:os")
+          const res = await fetch(pick.docUrl)
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer())
+            const localPath = path.join(
+              os.tmpdir(),
+              `rep-cq-${idx}-${Date.now()}-${pick.fileName || "doc.pdf"}`,
+            )
+            await fs.writeFile(localPath, buf)
+            const uploadBtn = await page.$(
+              'button:has-text("UPLOAD NEW DOCUMENT"), button:has-text("UPLOAD")',
+            )
+            if (uploadBtn) {
+              const [fc] = await Promise.all([
+                page.waitForEvent("filechooser", { timeout: 8000 }),
+                (uploadBtn as any).click(),
+              ])
+              await fc.setFiles(localPath)
+              await page.waitForTimeout(2000)
+              attached = true
+            }
+          }
+        } catch (err: any) {
+          logger.warn({ idx, err: err?.message }, "[Rep step4] UPLOAD-new path threw")
+        }
+      }
+
+      // 4) Commit the modal — CREATE/ADD/SAVE via the full pointer
+      //    sequence (plain .click() is dropped by Material's handler).
+      const saved = await page
+        .evaluate(() => {
+          const btn = Array.from(document.querySelectorAll("button")).find((b) => {
+            const t = (b.textContent || "").trim().toUpperCase()
+            return (
+              (t === "CREATE" || t === "ADD" || t === "SAVE" || t === "DONE") &&
+              !/ADD\s+EXPLANATION/.test(t) &&
+              (b as HTMLElement).offsetWidth > 0 &&
+              !(b as HTMLButtonElement).disabled
+            )
+          })
+          if (!btn) return false
+          ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
+            (type) =>
+              btn.dispatchEvent(
+                new MouseEvent(type, {
+                  bubbles: true,
+                  cancelable: true,
+                  view: window,
+                  button: 0,
+                }),
+              ),
+          )
+          return true
+        })
+        .catch(() => false)
+      await page.waitForTimeout(1500)
+
+      if (saved && (descFilled || attached)) {
+        filled++
+        logger.info(
+          { idx, descFilled, attached, q: questionText.slice(0, 80) },
+          "[Rep step4] explanation modal submitted",
+        )
+      } else {
+        logger.warn(
+          { idx, saved, descFilled, attached, q: questionText.slice(0, 80) },
+          "[Rep step4] explanation modal not satisfied — capturing + closing",
+        )
+        await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}-unfilled`)
+        await page
+          .evaluate(() => {
+            const c = Array.from(document.querySelectorAll("button")).find(
+              (b) =>
+                /CANCEL|CLOSE/.test((b.textContent || "").trim().toUpperCase()) &&
+                (b as HTMLElement).offsetWidth > 0,
+            )
+            if (c) (c as HTMLElement).click()
+          })
+          .catch(() => undefined)
+        await page.waitForTimeout(800)
+        // Discard any "unsaved changes" confirm.
+        await page
+          .evaluate(() => {
+            const y = Array.from(document.querySelectorAll("button")).find(
+              (b) =>
+                b.textContent?.trim().toUpperCase() === "YES" &&
+                (b as HTMLElement).offsetWidth > 0,
+            )
+            if (y) (y as HTMLElement).click()
+          })
+          .catch(() => undefined)
+        await page.waitForTimeout(600)
+        break
+      }
+    } catch (err: any) {
+      logger.warn(
+        { idx, err: err?.message },
+        "[Rep step4] explanation-card handling threw",
+      )
+      break
+    }
+  }
+
+  const remaining = await page.locator(ADD_SEL).count().catch(() => 0)
+  logger.info(
+    { idx, filled, remaining },
+    "[Rep step4] explanation modal pass complete",
+  )
+  return { cards: initialCards, filled }
 }
 
 export async function repReview(
@@ -641,6 +970,20 @@ async function reviewOneCarrier(
   await fillCarrierProfileText(ctx, input.producerProfile)
   await page.waitForTimeout(800)
   await snapshot(ctx, `rep-carrier${idx}-step4-carrier-questions-answered`)
+  // Any "Yes" answer that demands a written description/attachment shows a
+  // red sb-info-message[action="Add"] card; SureLC blocks Review & Sign
+  // until each is filled via its ADD modal. This is the carrier-questions
+  // analog of the profile Questions explanation flow and the single
+  // biggest cause of disclosure-Yes reps stalling at Producer (2026-06-02).
+  try {
+    await fillCarrierQuestionExplanations(ctx, input, idx)
+    await page.waitForTimeout(600)
+  } catch (err: any) {
+    ctx.logger.warn(
+      { idx, err: err?.message },
+      "[Rep step4] fillCarrierQuestionExplanations threw (non-fatal)",
+    )
+  }
   await clickNextWhenEnabled(ctx)
   // Same wait pattern for step 5 — Questionnaire is another heavy
   // page transition; without networkidle the radios race the fill.
