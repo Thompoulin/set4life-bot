@@ -76,6 +76,10 @@ export interface RepReviewInput {
     homePhone?: string
     placeOfBirth?: string
     residentCounty?: string
+    /** Agent's email — fills required email inputs some carriers add to
+     *  the Carrier-Questions step (e.g. Americo "BENEFICIARY DESIGNATION:
+     *  Email Address"), which the N/A fallback can't satisfy. */
+    email?: string
     /** Free-form fallback for any other required text input. */
     fallback?: string
   }
@@ -1251,33 +1255,74 @@ async function fillCarrierProfileText(
   // profile doesn't carry — fill with "N/A" so the form validates.
   // Only touches invalid + empty fields — pre-filled inputs are not
   // overwritten.
-  const naFilled = await page.evaluate(() => {
-    const inputs = Array.from(
-      document.querySelectorAll<HTMLInputElement>(
-        'input[matinput], input.mat-mdc-input-element',
-      ),
-    )
-    let count = 0
-    for (const i of inputs) {
-      if (i.type === "checkbox" || i.type === "radio") continue
-      if (i.value && i.value.trim().length > 0) continue
-      if (i.offsetParent === null) continue
-      const formField = i.closest("mat-form-field") as HTMLElement | null
-      const isInvalid =
-        formField?.classList.contains("mat-form-field-invalid") ||
-        formField?.classList.contains("ng-invalid") ||
-        i.classList.contains("ng-invalid")
-      if (!isInvalid) continue
-      // Set + dispatch input event so Angular reactive form binds.
-      i.value = "N/A"
-      i.dispatchEvent(new Event("input", { bubbles: true }))
-      i.dispatchEvent(new Event("change", { bubbles: true }))
-      count++
-    }
-    return count
-  })
+  const naFilled = await page.evaluate(
+    ({ email, phone }: { email?: string; phone?: string }) => {
+      const setNative = (el: HTMLInputElement, val: string) => {
+        const setter = Object.getOwnPropertyDescriptor(
+          window.HTMLInputElement.prototype,
+          "value",
+        )?.set
+        if (setter) setter.call(el, val)
+        else el.value = val
+        el.dispatchEvent(new Event("input", { bubbles: true }))
+        el.dispatchEvent(new Event("change", { bubbles: true }))
+        el.dispatchEvent(new Event("blur", { bubbles: true }))
+      }
+      const inputs = Array.from(
+        document.querySelectorAll<HTMLInputElement>(
+          'input[matinput], input.mat-mdc-input-element',
+        ),
+      )
+      let count = 0
+      for (const i of inputs) {
+        if (i.type === "checkbox" || i.type === "radio") continue
+        if (i.value && i.value.trim().length > 0) continue
+        if (i.offsetParent === null) continue
+        const ff = i.closest("mat-form-field") as HTMLElement | null
+        // Target both already-invalid AND required-but-empty fields:
+        // validation often hasn't fired yet on a freshly-loaded step, so
+        // required-empty is the reliable signal (Americo's phone +
+        // BENEFICIARY-email block step 4 this way — S.Way 2026-06-02).
+        const required =
+          i.required ||
+          i.getAttribute("aria-required") === "true" ||
+          !!ff?.querySelector(
+            ".mat-mdc-form-field-required-marker, .mat-form-field-required-marker",
+          )
+        const invalid =
+          ff?.classList.contains("mat-form-field-invalid") ||
+          i.classList.contains("ng-invalid")
+        if (!required && !invalid) continue
+        const hay = (
+          (i.getAttribute("placeholder") || "") +
+          " " +
+          (i.getAttribute("name") || "") +
+          " " +
+          (i.getAttribute("formcontrolname") || "") +
+          " " +
+          (i.type || "") +
+          " " +
+          (ff?.textContent || "")
+        ).toLowerCase()
+        // Type-aware value: an email field needs a valid email (N/A fails
+        // validation), a phone field needs digits; everything else N/A.
+        let val = "N/A"
+        if (i.type === "email" || /e-?mail/.test(hay))
+          val = email || "agent@set4lifeagency.com"
+        else if (i.type === "tel" || /phone|cell|mobile|fax/.test(hay))
+          val = (phone || "0000000000").replace(/\D/g, "") || "0000000000"
+        setNative(i, val)
+        count++
+      }
+      return count
+    },
+    { email: profile.email, phone: profile.cellPhone },
+  )
   if (naFilled > 0) {
-    logger.info({ naFilled }, "[Rep step4] filled required text fields with N/A fallback")
+    logger.info(
+      { naFilled },
+      "[Rep step4] filled required text fields (type-aware email/phone/N-A)",
+    )
   }
 
   // Re-click any radio group still in `.question__select--invalid`

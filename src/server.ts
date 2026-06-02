@@ -192,6 +192,7 @@ const repReviewSchema = z.object({
       homePhone: z.string().optional(),
       placeOfBirth: z.string().optional(),
       residentCounty: z.string().optional(),
+      email: z.string().optional(),
       fallback: z.string().optional(),
     })
     .optional(),
