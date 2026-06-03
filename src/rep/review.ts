@@ -101,6 +101,16 @@ export interface RepReviewInput {
     q1_felony?: boolean
     q2_misdemeanor?: boolean
     q3_regulatory_action?: boolean
+    /**
+     * Securities/investment-regulation VIOLATION — split out from the
+     * coarse q3_regulatory_action (which also carries consumer-complaint
+     * and regulatory-discipline disclosures). Fed ONLY by the securities
+     * detailed slugs so a genuine consumer-complaint disclosure can't
+     * spuriously answer a securities-violation question Yes and strand the
+     * rep at Producer on an unsatisfiable explanation card (Estell
+     * 2026-06-03: hadComplaint=yes wrongly drove the securities Q Yes).
+     */
+    q3_securities_violation?: boolean
     q4_license_denied?: boolean
     q5_license_revoked?: boolean
     q6_insurer_terminated?: boolean
@@ -255,6 +265,17 @@ function pickYnForLabel(
   // and still match the disclosure pattern correctly.)
   if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
     return "N"
+  // Securities/investment-regulation VIOLATION question — answer ONLY
+  // from the dedicated securities flag. Its wording ("convicted ... no
+  // contest", "state securities") otherwise matches the felony (q1) and
+  // regulatory (q3) patterns below, so a genuine consumer-complaint
+  // disclosure (which sets q3_regulatory_action) — or the literal
+  // "convict" token — wrongly answers this Yes, creating an unsatisfiable
+  // explanation card that stalls the rep at Producer (Estell 2026-06-03:
+  // hadComplaint=yes → securities-violation Q answered Yes → stuck).
+  if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
+    return disclosures?.q3_securities_violation ? "Y" : "N"
+  }
   if (!disclosures) return "N"
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
     if (pattern.test(label) && disclosures[key]) return "Y"

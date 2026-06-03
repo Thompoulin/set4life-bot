@@ -207,6 +207,7 @@ const repReviewSchema = z.object({
       q1_felony: z.boolean().optional(),
       q2_misdemeanor: z.boolean().optional(),
       q3_regulatory_action: z.boolean().optional(),
+      q3_securities_violation: z.boolean().optional(),
       q4_license_denied: z.boolean().optional(),
       q5_license_revoked: z.boolean().optional(),
       q6_insurer_terminated: z.boolean().optional(),
