@@ -584,9 +584,34 @@ export async function repReview(
     // outer component to focus, then keyboard.type() the 6 digits.
     // For DOB, mat-input-0 is a plain text input; .fill works.
 
-    const ssnHost = await page.$('auth-ssn-input')
+    // RETRY for SureLC's intermittent email/password gate: the login.jsp
+    // bypass (and sometimes the emailed link) lands on the standard
+    // email/password login instead of the rep SSN/DOB gate — there's no
+    // auth-ssn-input then. Re-navigating the review URL re-triggers the
+    // OAuth flow and yields the SSN/DOB gate on a later attempt (verified
+    // manually 2026-06-03; the 2nd open reliably gave SSN/DOB). Without
+    // this the run no-ops on the email-skew/bypass path.
+    let ssnHost = await page.$('auth-ssn-input')
+    for (let gateAttempt = 1; gateAttempt <= 3 && !ssnHost; gateAttempt++) {
+      logger.warn(
+        { gateAttempt, url: page.url() },
+        "[Rep auth] SSN/DOB gate not present (email/password gate?) — re-navigating review URL",
+      )
+      await page.waitForTimeout(1500 * gateAttempt)
+      await page
+        .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+        .catch(() => undefined)
+      await page
+        .waitForSelector(
+          'auth-ssn-input, input[matinput], input.mat-mdc-input-element, input[type="password"]',
+          { timeout: 30_000 },
+        )
+        .catch(() => undefined)
+      await settle(page, 2500)
+      ssnHost = await page.$('auth-ssn-input')
+    }
     if (!ssnHost) {
-      return { ok: false, signed, failed: [{ reason: "SSN field not found at auth" }], skipped }
+      return { ok: false, signed, failed: [{ reason: "SSN field not found at auth (email/password gate persisted after retries)" }], skipped }
     }
     // Focus the inner masked input directly (the .hidden one is the
     // event-target; the .visible one is readonly and the outer host
