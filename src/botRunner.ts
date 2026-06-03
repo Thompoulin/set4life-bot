@@ -44,6 +44,7 @@ import {
 } from "./admin/createRequest.js"
 import type { AdminReviewInput } from "./admin/processReview.js"
 import { repReview, type RepReviewInput } from "./rep/review.js"
+import { CHROMIUM_ARGS } from "./browserArgs.js"
 import { makeTabContext, type TabResult } from "./tabs/helpers.js"
 import { makeProgressReporter } from "./progressReporter.js"
 
@@ -148,11 +149,7 @@ export async function runActivation(
     // confirmed 2026-05-06 same credentials work fine in a real
     // Chrome browser; only the bot bounces — strongest remaining
     // suspect after UA cleanup is webdriver fingerprinting.
-    args: [
-      "--no-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-blink-features=AutomationControlled",
-    ],
+    args: CHROMIUM_ARGS,
   })
 
   const result: RunActivationResult = {
