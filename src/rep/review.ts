@@ -1564,7 +1564,7 @@ async function fillRadiosByLabelLookup(
 
   // Collect (label, group-name) pairs from the live DOM.
   const groups = await page.evaluate(() => {
-    const out: Array<{ name: string; label: string }> = []
+    const out: Array<{ name: string; label: string; values: string[] }> = []
     const seen = new Set<string>()
     const radioGroups = Array.from(document.querySelectorAll("mat-radio-group"))
     for (const g of radioGroups) {
@@ -1586,16 +1586,32 @@ async function fillRadiosByLabelLookup(
           ".question__text, label.question__text, mat-label, label",
         )
       const label = (labelEl?.textContent || "").trim().slice(0, 300)
-      out.push({ name, label })
+      const values = Array.from(
+        g.querySelectorAll('input[type="radio"]'),
+      ).map((i) => (i as HTMLInputElement).value)
+      out.push({ name, label, values })
     }
     return out
   })
 
   let yes = 0
   let no = 0
-  for (const { name, label } of groups) {
+  for (const { name, label, values } of groups) {
     const ans = pickYnForLabel(label, disclosures)
-    const targetValue = ans === "Y" ? yesValue : noValue
+    // Per-group value detection: a single wizard step can MIX schemes —
+    // carrier Y/N questions alongside background-disclosure questions
+    // rendered with value="true"/"false" on the SAME step (American
+    // Amicable & others put the felony/securities/sanction questions on
+    // step 4 with true/false radios, not Y/N). The page-level `scheme`
+    // is only a fallback hint; pick THIS group's actual yes/no value so a
+    // true/false disclosure question on a "yn" step still gets answered.
+    // Otherwise the click selector ([value="N"]) matches nothing, the
+    // question keeps its pre-set Yes, and its unsatisfiable explanation
+    // card strands the rep at Producer (Estell/Bates 2026-06-03 — 10
+    // disclosure groups on step 4 went unanswered, 8 stayed Yes).
+    const noVal = values.find((v) => /^(n|no|false|0)$/i.test(v)) ?? noValue
+    const yesVal = values.find((v) => /^(y|yes|true|1)$/i.test(v)) ?? yesValue
+    const targetValue = ans === "Y" ? yesVal : noVal
     // Click the radio with matching value within this group. We do
     // this via Playwright's locator.click() — the previous host.click()
     // from page.evaluate fired a synthetic DOM event that Angular
