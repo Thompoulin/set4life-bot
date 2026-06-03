@@ -289,7 +289,10 @@ async function fillCarrierQuestionExplanations(
   const { page, logger } = ctx
   const pool = input.carrierQuestionExplanations || []
 
-  const ADD_SEL = 'sb-info-message[action="Add"] button.message__button'
+  // Matches the explanation-required card on BOTH the Carrier-Questions
+  // step (action="Add") and the Questionnaire step (action="ADD
+  // EXPLANATION") — same sb-info-message component, both type="error".
+  const ADD_SEL = 'sb-info-message[type="error"] button.message__button'
   const initialCards = await page.locator(ADD_SEL).count().catch(() => 0)
   if (initialCards === 0) return { cards: 0, filled: 0 }
 
@@ -918,6 +921,19 @@ async function reviewOneCarrier(
   )
   await page.waitForTimeout(800)
   await snapshot(ctx, `rep-carrier${idx}-step5-questionnaire-answered`)
+  // The Questionnaire step also shows red "ADD EXPLANATION" cards for any
+  // legitimately-Yes answer (e.g. the felony question, q1) — same
+  // sb-info-message component as step 4. Without filling them SureLC blocks
+  // Review & Sign (Jimenez Transamerica 2026-06-03). Reuse the same handler.
+  try {
+    await fillCarrierQuestionExplanations(ctx, input, idx)
+    await page.waitForTimeout(600)
+  } catch (err: any) {
+    ctx.logger.warn(
+      { idx, err: err?.message },
+      "[Rep step5] fillCarrierQuestionExplanations threw (non-fatal)",
+    )
+  }
   await clickNextWhenEnabled(ctx)
 
   // Pre-fill mode bails here. Steps 1-5 are auto-saved by SureLC on
