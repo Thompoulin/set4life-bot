@@ -37,6 +37,22 @@ run can't take down lead dispatch.
     fallback. PUTs each given `appointmentRequestId.states = resident
     state` only. Strips state-specific wizard steps (FL Counties etc.)
     so the bot's blind-Next can advance.
+  - `POST /fill-misc-via-wizard` — drives the BGA admin review wizard
+    headlessly up to and including the Carrier Questions step, fills
+    every mat-radio-group (default `N`, per-question overrides via
+    `answers`) + text/date/mat-select inputs (`textValues`), then clicks
+    Next on Carrier Questions so SureLC's SPA fires its own
+    `PUT /surecrm/appointments-requests/{id}/miscellaneous` from inside
+    the live wizard session. Direct admin PUT to that endpoint silently
+    no-ops — the wizard is the only path that persists (verified Bates
+    Americo 117916924, 2026-05-29). Hard-stops before the Documents step;
+    never clicks Process. Backs the pre-Phase-B misc-clearing path in the
+    main backoffice's activation pipeline. Body:
+    `{producerId, appointmentRequestId, adminCreds:{email,password}, answers?, textValues?}`.
+    See `src/admin/fillMiscWizard.ts` for the full reverse-engineering
+    writeup (SPA pushState navigation > page.goto; native
+    `page.mouse.click()` > synthetic clicks; per-iter coord refresh
+    required because the first click scrolls the page).
 - **Browser**: Playwright headless Chromium from
   `mcr.microsoft.com/playwright:v1.45.0-jammy` (preinstalled, no download
   on deploy)

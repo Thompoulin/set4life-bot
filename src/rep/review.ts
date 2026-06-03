@@ -405,11 +405,19 @@ async function fillCarrierQuestionExplanations(
       //    Material's handler expects.
       let saved = false
       try {
-        const done = dialog.locator('button:has-text("DONE")').first()
-        await done.click({ timeout: 5000 })
+        // Step-4 carrier-questions modal commits via DONE; the
+        // Questionnaire (step-5) modal commits via CREATE. Click
+        // whichever ENABLED primary button this modal exposes (a
+        // disabled one means required fields are still missing).
+        const commit = dialog
+          .locator(
+            'button:has-text("DONE"):not([disabled]), button:has-text("CREATE"):not([disabled])',
+          )
+          .first()
+        await commit.click({ timeout: 5000 })
         saved = true
       } catch (err: any) {
-        logger.warn({ idx, err: err?.message }, "[Rep step4] DONE click threw")
+        logger.warn({ idx, err: err?.message }, "[Rep step4] commit (DONE/CREATE) click threw")
       }
       await page.waitForTimeout(1500)
 
@@ -1561,43 +1569,41 @@ async function fillRadiosByLabelLookup(
     } catch {
       /* fall back to JS click below */
     }
-    // Verify the model bound — Angular Material flips ng-pristine →
-    // ng-dirty when the value commits. If the group is still pristine
-    // OR still .question__select--invalid, retry once via JS click.
-    const stillInvalid = await page
-      .evaluate(({ groupName }) => {
-        const inputs = Array.from(
-          document.querySelectorAll<HTMLInputElement>(
-            `input[type="radio"][name="${groupName}"]`,
-          ),
-        )
-        if (inputs.length === 0) return true
-        const group = inputs[0]?.closest("mat-radio-group") as HTMLElement | null
-        if (!group) return false
-        return (
-          group.classList.contains("ng-pristine") ||
-          group.classList.contains("ng-invalid") ||
-          group.classList.contains("question__select--invalid")
-        )
-      }, { groupName: name })
-      .catch(() => false)
-    if (stillInvalid) {
-      const fallbackOk = await page
-        .evaluate(
-          ({ groupName, value }) => {
-            const r = document.querySelector(
-              `input[type="radio"][name="${groupName}"][value="${value}"]`,
-            ) as HTMLInputElement | null
-            if (!r) return false
-            const host = r.closest("mat-radio-button") as HTMLElement | null
-            if (host) host.click()
-            else r.click()
-            return true
-          },
-          { groupName: name, value: targetValue },
-        )
+    // Verify the TARGET value actually committed — not just that the
+    // group left ng-pristine. Angular Material commits a radio only on
+    // a <label> click; a Playwright pointer-click on the host or the
+    // hidden <input> can leave a question that was PRE-answered Yes
+    // (stored from an earlier run / carrier default) unchanged. That
+    // stranded the whole red-flag backlog: the regulatory "violation"
+    // questions stayed Yes, kept their red explanation card, and the
+    // carrier never reached Review & Sign (2026-06-02; verified by hand
+    // that input.click/host.click did NOT flip a stored Yes but
+    // label.click did). Re-click the matching radio's <label> until its
+    // native input reports checked.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const committed = await page
+        .evaluate(({ groupName, value }) => {
+          const r = document.querySelector(
+            `input[type="radio"][name="${groupName}"][value="${value}"]`,
+          ) as HTMLInputElement | null
+          return !!r && r.checked
+        }, { groupName: name, value: targetValue })
         .catch(() => false)
-      clicked = clicked || fallbackOk
+      if (committed) {
+        clicked = true
+        break
+      }
+      await page
+        .evaluate(({ groupName, value }) => {
+          const r = document.querySelector(
+            `input[type="radio"][name="${groupName}"][value="${value}"]`,
+          ) as HTMLInputElement | null
+          const host = r?.closest("mat-radio-button") as HTMLElement | null
+          const label = host?.querySelector("label") as HTMLElement | null
+          ;(label || host || r)?.click()
+        }, { groupName: name, value: targetValue })
+        .catch(() => undefined)
+      await page.waitForTimeout(300)
     }
     if (clicked) {
       if (ans === "Y") yes++
