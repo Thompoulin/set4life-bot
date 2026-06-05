@@ -467,12 +467,45 @@ export async function runActivation(
                   })
                   preDedupSkipsFastlane = true
                 }
+                // else dedup.uniqueCarriers === 0 → confirmed zero active
+                // requests → genuine first-time contracting; Fastlane
+                // runs normally below.
+              } else {
+                // dedup === null: could not read existing-request state.
+                // FAIL-SAFE: skip Fastlane rather than risk duplicates.
+                logger.warn(
+                  { producerId },
+                  "[Fastlane] pre-dedup returned null — SKIPPING Fastlane (fail-safe; cannot verify existing requests)",
+                )
+                adminPhase.contracting = {
+                  submitted: ["deferred-dedup-null"],
+                  failed: [],
+                }
+                await finishContracting({
+                  ok: true,
+                  msg: "Skipped Fastlane — could not verify existing appointment-requests; deferring to manual carrier add to avoid duplicates",
+                })
+                preDedupSkipsFastlane = true
               }
             } catch (err: any) {
+              // FAIL-SAFE (2026-06-05 incident): a transient dedup error
+              // must NOT fall through to Fastlane — that path duplicated
+              // ~17 agents' carrier requests in one day. If we can't
+              // verify existing state, skip Fastlane and defer to a
+              // manual carrier add.
               logger.warn(
                 { err: err?.message },
-                "[Fastlane] pre-dedup threw — continuing into Fastlane",
+                "[Fastlane] pre-dedup threw — SKIPPING Fastlane (fail-safe; no duplicate submissions)",
               )
+              adminPhase.contracting = {
+                submitted: ["deferred-dedup-threw"],
+                failed: [],
+              }
+              await finishContracting({
+                ok: true,
+                msg: `Skipped Fastlane — pre-dedup check failed (${err?.message ?? "error"}); deferring to manual carrier add to avoid duplicates`,
+              })
+              preDedupSkipsFastlane = true
             }
           }
           if (!preDedupSkipsFastlane) {
