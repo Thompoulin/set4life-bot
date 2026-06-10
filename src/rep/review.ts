@@ -306,16 +306,24 @@ async function fillCarrierQuestionExplanations(
   ctx: TabContext,
   input: RepReviewInput,
   idx: number,
-): Promise<{ cards: number; filled: number }> {
+): Promise<{ cards: number; filled: number; unsatisfied: string[] }> {
   const { page, logger } = ctx
   const pool = input.carrierQuestionExplanations || []
+
+  // Names of explanation-required cards we could NOT satisfy this run.
+  // Stashed on the page so the Step-6 wizard-block classifier can name
+  // the exact blocking card in its reason (instead of the generic
+  // "stuck on /wizard/welcome"). Reset each call; the classifier reads
+  // (page as any)._lastUnsatisfiedCards.
+  const unsatisfied: string[] = []
+  ;(page as any)._lastUnsatisfiedCards = unsatisfied
 
   // Matches the explanation-required card on BOTH the Carrier-Questions
   // step (action="Add") and the Questionnaire step (action="ADD
   // EXPLANATION") — same sb-info-message component, both type="error".
   const ADD_SEL = 'sb-info-message[type="error"] button.message__button'
   const initialCards = await page.locator(ADD_SEL).count().catch(() => 0)
-  if (initialCards === 0) return { cards: 0, filled: 0 }
+  if (initialCards === 0) return { cards: 0, filled: 0, unsatisfied }
 
   logger.info(
     { idx, cards: initialCards, poolSize: pool.length },
@@ -355,8 +363,9 @@ async function fillCarrierQuestionExplanations(
       pool[0]
 
     if (!pick || !pick.explanation) {
+      unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)")
       logger.warn(
-        { idx, questionText },
+        { idx, questionText, poolSize: pool.length },
         "[Rep step4] no explanation in pool for card — cannot satisfy; stopping",
       )
       break
@@ -449,6 +458,7 @@ async function fillCarrierQuestionExplanations(
           "[Rep step4] explanation modal submitted",
         )
       } else {
+        unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)")
         logger.warn(
           { idx, saved, descFilled, attached, q: questionText.slice(0, 80) },
           "[Rep step4] explanation modal not satisfied — capturing + closing",
@@ -490,10 +500,10 @@ async function fillCarrierQuestionExplanations(
 
   const remaining = await page.locator(ADD_SEL).count().catch(() => 0)
   logger.info(
-    { idx, filled, remaining },
+    { idx, filled, remaining, unsatisfied },
     "[Rep step4] explanation modal pass complete",
   )
-  return { cards: initialCards, filled }
+  return { cards: initialCards, filled, unsatisfied }
 }
 
 export async function repReview(
@@ -1068,9 +1078,26 @@ async function reviewOneCarrier(
       url.includes("/wizard/profile") ||
       /red\s*notice|required.*continue|invalid.*profile/i.test(errorsBlob)
     if (isWizardBlock) {
+      // Name the exact blocker instead of the generic "stuck on welcome".
+      // Two sources: (1) explanation cards fillCarrierQuestionExplanations
+      // couldn't satisfy (no pool entry / modal failed), (2) red required
+      // fields per wizard step from the PDF-viewer diag. This converts the
+      // reason into an actionable inventory for the admin / needs-human tab.
+      const unsatisfiedCards = ((page as any)._lastUnsatisfiedCards || []) as string[]
+      const redByStep = (Array.isArray(diag?.stepContents) ? diag.stepContents : [])
+        .filter((s: any) => Array.isArray(s?.redFields) && s.redFields.length)
+        .map((s: any) => `${s.stepLabel}: ${s.redFields.join("; ")}`)
+      const blockedOn = [
+        unsatisfiedCards.length
+          ? `unsatisfiable carrier-question card(s): ${unsatisfiedCards.join(" || ")}`
+          : "",
+        redByStep.length ? `red required fields → ${redByStep.join(" || ")}` : "",
+      ]
+        .filter(Boolean)
+        .join(". ")
       return {
         ok: false,
-        reason: `Carrier wizard rejected the rep's profile (validation errors on ${url.split("/").pop() || "wizard step"}) — not a PDF issue. Diag: ${diagSummary}`,
+        reason: `Carrier wizard rejected the rep's profile on ${url.split("/").pop() || "wizard step"} — not a PDF issue.${blockedOn ? ` BLOCKED ON — ${blockedOn}.` : ""} Diag: ${diagSummary}`,
       }
     }
     return {
