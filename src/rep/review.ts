@@ -284,6 +284,45 @@ function pickYnForLabel(
 }
 
 /**
+ * Which background-disclosure key (if any) this visible question label
+ * maps to AND the rep flagged true — i.e. the key that makes
+ * pickYnForLabel answer "Y" *because of a disclosure* (NOT the always-Yes
+ * carrier/product opt-ins, which aren't disclosures). Returns null for an
+ * opt-in, an unrecognized question, or a disclosure whose flag is false.
+ *
+ * This exists to AUDIT coverage. pickYnForLabel silently returns "N" for
+ * any label it doesn't recognize — so when a carrier phrases a background
+ * question outside DISCLOSURE_LABEL_PATTERNS (e.g. Foresters' "protection
+ * from creditors" vs /bankrupt/), a rep's TRUE disclosure is answered
+ * "No" with no signal: a false compliance statement. By recording which
+ * true keys actually landed on a label, the caller can detect a true
+ * disclosure that matched NOTHING and route to a human instead of signing
+ * a wrong "No" (Tamara Chinchilla / Foresters 2026-06-10 — and note the
+ * earlier "verified against Foresters" pass was an all-No rep, where the
+ * silent-No default hid the gap).
+ *
+ * Kept in lockstep with pickYnForLabel's disclosure branches above; any
+ * change there must change here too.
+ */
+function disclosureKeyForLabel(
+  label: string,
+  disclosures: RepReviewInput["disclosures"] | undefined,
+): string | null {
+  if (!disclosures) return null
+  if (ISSUING_COMPANY_PATTERN.test(label)) return null
+  if (PRODUCT_OPT_IN_PATTERN.test(label)) return null
+  if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
+    return null
+  if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
+    return disclosures.q3_securities_violation ? "q3_securities_violation" : null
+  }
+  for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
+    if (pattern.test(label) && disclosures[key]) return key
+  }
+  return null
+}
+
+/**
  * Step-4 Carrier-Questions explanation-modal filler.
  *
  * A "Yes" carrier-question answer makes SureLC render a red
@@ -983,6 +1022,41 @@ async function reviewOneCarrier(
     { ...step5Filled },
     "[Rep step5] questionnaire answered from disclosures",
   )
+
+  // Compliance guard — every TRUE disclosure must have landed on a
+  // recognized question across Step 4 + Step 5. A true flag that matched
+  // NO label means this carrier words that question outside our patterns,
+  // so pickYnForLabel silently answered "No" — a false statement we must
+  // never sign. Route the carrier to a human instead (Foresters dropped
+  // Tamara Chinchilla's Yes answers this way, 2026-06-10). Clean reps (no
+  // true disclosures) are unaffected — automation proceeds exactly as
+  // before.
+  if (input.disclosures) {
+    const trueKeys = Object.entries(input.disclosures)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k)
+    const placed = new Set<string>([
+      ...step4Filled.placedKeys,
+      ...step5Filled.placedKeys,
+    ])
+    const unplaced = trueKeys.filter((k) => !placed.has(k))
+    if (unplaced.length > 0) {
+      await snapshot(ctx, `rep-carrier${idx}-disclosure-unplaced`)
+      logger.warn(
+        { idx, unplaced, placed: [...placed] },
+        "[Rep] true disclosure(s) matched no carrier question — routing to human, not signing",
+      )
+      return {
+        ok: false,
+        reason:
+          `Questionnaire disclosure(s) [${unplaced.join(", ")}] were flagged true at onboarding ` +
+          `but matched NO question on this carrier's Step 4/5 wizard — the carrier likely phrases ` +
+          `them outside the bot's label patterns, so they would be silently answered "No" (a false ` +
+          `compliance statement). A human must answer this carrier's questionnaire by hand. Do NOT auto-sign.`,
+      }
+    }
+  }
+
   await page.waitForTimeout(800)
   await snapshot(ctx, `rep-carrier${idx}-step5-questionnaire-answered`)
   // The Questionnaire step also shows red "ADD EXPLANATION" cards for any
@@ -1573,7 +1647,7 @@ async function fillRadiosByLabelLookup(
   page: Page,
   scheme: "yn" | "tf",
   disclosures: RepReviewInput["disclosures"] | undefined,
-): Promise<{ answered: number; yes: number; no: number }> {
+): Promise<{ answered: number; yes: number; no: number; placedKeys: string[] }> {
   const yesValue = scheme === "yn" ? "Y" : "true"
   const noValue = scheme === "yn" ? "N" : "false"
 
@@ -1623,8 +1697,13 @@ async function fillRadiosByLabelLookup(
 
   let yes = 0
   let no = 0
+  // Disclosure keys we actually placed a "Yes" on (label recognized +
+  // committed). The caller diffs this against the rep's true flags to
+  // catch a disclosure that matched no on-screen question.
+  const placed = new Set<string>()
   for (const { name, label, values } of groups) {
     const ans = pickYnForLabel(label, disclosures)
+    const placedKey = ans === "Y" ? disclosureKeyForLabel(label, disclosures) : null
     // Per-group value detection: a single wizard step can MIX schemes —
     // carrier Y/N questions alongside background-disclosure questions
     // rendered with value="true"/"false" on the SAME step (American
@@ -1695,11 +1774,13 @@ async function fillRadiosByLabelLookup(
       await page.waitForTimeout(300)
     }
     if (clicked) {
-      if (ans === "Y") yes++
-      else no++
+      if (ans === "Y") {
+        yes++
+        if (placedKey) placed.add(placedKey)
+      } else no++
     }
   }
-  return { answered: yes + no, yes, no }
+  return { answered: yes + no, yes, no, placedKeys: [...placed] }
 }
 
 /**
