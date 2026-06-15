@@ -538,6 +538,45 @@ export async function runActivation(
                 : r.reason || `Fastlane failed`,
             })
 
+            // Post-Fastlane self-clean. Fastlane creates a fresh
+            // Producer-stage appointment-request for every configured
+            // carrier — including carriers that already had an active
+            // request at Producer/BGA stage — so a run can leave TWO
+            // requests per carrier until the NEXT bot run's pre-dedup
+            // collapses them. That gap is what Ana sees as "both
+            // contracts triggering" (2026-06-15). Run the same dedup
+            // right here so a Fastlane run never leaves duplicates
+            // behind. Reuses the proven keep-most-advanced/delete-rest
+            // logic; best-effort (never fails the contracting step).
+            if (r.ok && producerId) {
+              try {
+                const { dedupAppointmentRequests } = await import(
+                  "./admin/dedupAppointmentRequests.js"
+                )
+                const postDedup = await dedupAppointmentRequests(
+                  tabCtx.page,
+                  producerId,
+                  "1322",
+                  logger,
+                )
+                if (postDedup) {
+                  logger.info(
+                    {
+                      producerId,
+                      deleted: postDedup.deleted,
+                      byCarrierStage: postDedup.byCarrierStage,
+                    },
+                    "[Fastlane] post-dedup cleaned duplicates",
+                  )
+                }
+              } catch (err: any) {
+                logger.warn(
+                  { err: err?.message },
+                  "[Fastlane] post-dedup threw — non-blocking",
+                )
+              }
+            }
+
             // Post-Fastlane: for any carrier the agent declared a
             // prior contracting with during onboarding, flip the
             // appointment-request type from Contract → Transfer via
