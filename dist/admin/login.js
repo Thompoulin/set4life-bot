@@ -13,7 +13,60 @@
  */
 import { firstVisible } from "../tabs/helpers.js";
 export const BGA_LOGIN_URL = "https://surelc.surancebay.com/bga/";
+/**
+ * Log in to the BGA admin portal, retrying transient failures.
+ *
+ * Why a retry wrapper exists (2026-05-30): the login PAGE and our
+ * selectors are verified-good — a manual login with these exact creds
+ * lands on /bga/producers instantly, and `input[data-cy="email-input"]`
+ * is present and visible. Yet the bot's headless container on the Vultr
+ * datacenter IP intermittently lands on a blank / bounced OAuth page
+ * ("email input not found", "did not land on /bga/*") — SureLC's auth
+ * guard does bot detection (see the navigator.webdriver patch in
+ * botRunner) and intermittently refuses the headless session, especially
+ * under the bot's fresh-login-per-operation volume. The old code reloaded
+ * exactly once and then failed the whole job, so a single transient block
+ * stranded a producer for the day. We now re-navigate fresh up to
+ * MAX_LOGIN_ATTEMPTS times with growing backoff. Genuine bad-creds / MFA
+ * failures short-circuit (fatal) so we don't hammer a truly-broken login.
+ */
 export async function loginAdmin(page, creds, logger) {
+    const MAX_LOGIN_ATTEMPTS = 4;
+    // Backoff before attempt N (index = attempt number). Attempt 1 is
+    // immediate; later attempts wait longer to ride out a throttle window
+    // without turning into a hammer.
+    const BACKOFF_MS = [0, 0, 4_000, 10_000, 20_000];
+    let lastReason;
+    for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
+        if (attempt > 1) {
+            const backoff = BACKOFF_MS[attempt] ?? 20_000;
+            logger.warn({ attempt, of: MAX_LOGIN_ATTEMPTS, backoffMs: backoff, lastReason }, "admin login: retrying after transient failure");
+            await page.waitForTimeout(backoff);
+        }
+        const res = await attemptLogin(page, creds, logger, attempt);
+        if (res.ok) {
+            if (attempt > 1) {
+                logger.info({ attempt }, "admin login: succeeded on retry");
+            }
+            return res;
+        }
+        lastReason = res.reason;
+        if (res.fatal) {
+            // Wrong password / MFA — retrying won't help and risks locking the
+            // service account. Fail immediately with the explicit reason.
+            logger.warn({ attempt, reason: res.reason }, "admin login: fatal failure — not retrying");
+            return res;
+        }
+    }
+    return {
+        ok: false,
+        reason: `admin login failed after ${MAX_LOGIN_ATTEMPTS} attempts — last: ${lastReason ?? "unknown"}`,
+    };
+}
+/** One login attempt: navigate fresh, fill the OAuth form, confirm we
+ *  landed inside /bga/* with a real token. Returns fatal=true only for
+ *  unambiguous credential / MFA failures so the wrapper knows to stop. */
+async function attemptLogin(page, creds, logger, attempt) {
     await page.goto(BGA_LOGIN_URL, {
         waitUntil: "domcontentloaded",
         timeout: 45_000,
@@ -46,7 +99,7 @@ export async function loginAdmin(page, creds, logger) {
     // isVisible() can race the form's slide-in animation and return false
     // for an input that's already in the DOM.
     await page.waitForTimeout(1_500);
-    const emailField = await firstVisible(page, [
+    const emailSelectors = [
         'input[data-cy="email-input"]',
         'input[formcontrolname="username"]',
         'input[type="email"]',
@@ -58,9 +111,20 @@ export async function loginAdmin(page, creds, logger) {
         'input[autocomplete="email"]',
         'input[aria-label*="email" i]',
         'input[placeholder*="email" i]',
-    ]);
+    ];
+    let emailField = await firstVisible(page, emailSelectors);
     if (!emailField) {
-        logger.warn({ url: page.url() }, "admin login: email input not found");
+        // Transient: form rendered (the formReady selector above matched in
+        // the DOM) but firstVisible() couldn't pin a visible field — often a
+        // mid-animation race or an off-screen Material wrapper. Reload once
+        // and retry. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
+        logger.warn({ url: page.url(), attempt }, "admin login: email input invisible after wait — reloading and retrying once");
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
+        await page.waitForTimeout(3_000);
+        emailField = await firstVisible(page, emailSelectors);
+    }
+    if (!emailField) {
+        logger.warn({ url: page.url(), attempt }, "admin login: email input not found");
         return { ok: false, reason: `Email input not found at ${page.url()}` };
     }
     await emailField.fill(creds.email);
@@ -106,13 +170,17 @@ export async function loginAdmin(page, creds, logger) {
         // SureLC is actually complaining about.
         const errors = await collectVisibleErrors(page);
         const finalUrl = page.url();
-        logger.warn({ url: finalUrl, errors }, "admin login: did not land on /bga/* — likely wrong credentials or MFA prompt");
+        logger.warn({ url: finalUrl, errors, attempt }, "admin login: did not land on /bga/* — likely wrong credentials or MFA prompt");
         const reason = errors.length
             ? `SureLC: ${errors.join(" / ")}`
             : looksLikeStillOnOauthForm(finalUrl)
                 ? `Login bounced — still on OAuth page (${finalUrl}). Likely wrong email/password or MFA was enabled on the bot service account.`
                 : `Login did not land on /bga/* (final URL: ${finalUrl}).`;
-        return { ok: false, reason };
+        // Only an EXPLICIT credential / MFA error from SureLC is fatal. A
+        // bounce with no error text is the transient bot-detection block we
+        // want the wrapper to retry — not a dead-end.
+        const fatal = errors.some((e) => /invalid|incorrect|wrong|locked|disabled|mfa|verification|verify|two[-\s]?factor|authenticator/i.test(e));
+        return { ok: false, reason, fatal };
     }
     // URL transitioned to /bga/* — but that's not a guarantee the SPA
     // actually stored OAuth tokens. The previous failure mode (owner-
@@ -139,7 +207,7 @@ export async function loginAdmin(page, creds, logger) {
             return keys;
         })
             .catch(() => []);
-        logger.warn({ url: page.url(), storageKeys }, "admin login: URL on /bga/* but no OAuth token in storage — SPA did not finish auth");
+        logger.warn({ url: page.url(), storageKeys, attempt }, "admin login: URL on /bga/* but no OAuth token in storage — SPA did not finish auth");
         return {
             ok: false,
             reason: `Logged-in URL but no OAuth token in storage (keys: ${storageKeys.join(", ") || "none"}). ` +

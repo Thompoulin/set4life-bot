@@ -686,6 +686,417 @@ const SUB_TO_PARENT = {
     relatedToFinance: 17,
     revenueServiceMatters: 19,
 };
+/**
+ * Question text matcher → our slug. Keyword-based, ordered
+ * most-specific first so "charged felony" wins over "felony".
+ */
+const QUESTION_KEYWORD_MAP = [
+    { slug: "chargedFelony", match: (t) => /charged with any felony/i.test(t) },
+    { slug: "chargedMisdemeanor", match: (t) => /charged with any misdemeanor/i.test(t) },
+    { slug: "probation", match: (t) => /been on probation/i.test(t) },
+    { slug: "felony", match: (t) => /convicted.*felony/i.test(t) && !/charged/i.test(t) },
+    { slug: "misdemeanor", match: (t) => /convicted.*misdemeanor/i.test(t) && !/charged/i.test(t) },
+    { slug: "securitiesRegulations", match: (t) => /federal or state securities|investment.*regulation/i.test(t) },
+    { slug: "securitiesRegulationsState", match: (t) => /state insurance department/i.test(t) },
+    { slug: "foreignRegulations", match: (t) => /foreign government|foreign.*regulatory/i.test(t) },
+    { slug: "beingInvestigated", match: (t) => /currently under investigation/i.test(t) },
+    { slug: "wereInvestigated", match: (t) => /under investigation by any insurance/i.test(t) },
+    { slug: "inLawSuit", match: (t) => /pending indictments|civil judgments/i.test(t) },
+    { slug: "lawSuitInsurance", match: (t) => /named as a defendant|sued or been sued/i.test(t) },
+    { slug: "allegedOfFraud", match: (t) => /alleged to have engaged in any fraud/i.test(t) },
+    { slug: "provenFraud", match: (t) => /been found to have engaged in any fraud/i.test(t) },
+    { slug: "wasFiredRegulations", match: (t) => /terminated.*accused.*violating insurance/i.test(t) },
+    { slug: "wasFiredOfFraud", match: (t) => /terminated.*accused of fraud|wrongful taking/i.test(t) },
+    { slug: "wasFiredStatutes", match: (t) => /failure to supervise/i.test(t) },
+    { slug: "deniedAppointment", match: (t) => /appointment.*terminated for cause|denied an appointment/i.test(t) },
+    { slug: "oweToInsurance", match: (t) => /commission chargeback|indebtedness/i.test(t) },
+    { slug: "suretyRefused", match: (t) => /bonding or surety|denied.*bond/i.test(t) },
+    { slug: "eoRefused", match: (t) => /errors\s*&\s*omissions|e&o.*denied|e&o.*claims/i.test(t) },
+    { slug: "secLicense", match: (t) => /insurance or securities license.*denied/i.test(t) },
+    { slug: "firmSecLicense", match: (t) => /state or federal regulatory body.*found/i.test(t) },
+    { slug: "wasBankrupt", match: (t) => /personally filed a bankruptcy|wasbankrupt/i.test(t) },
+    { slug: "firmBankrupt", match: (t) => /brokerage firm.*bankrupt/i.test(t) },
+    { slug: "bankruptcyPending", match: (t) => /bankruptcy pending/i.test(t) },
+    { slug: "hasLiens", match: (t) => /liens|unsatisfied judgments/i.test(t) },
+    { slug: "alias", match: (t) => /used any other name|alias/i.test(t) },
+];
+const matchQuestionSlug = (text) => {
+    for (const { slug, match } of QUESTION_KEYWORD_MAP) {
+        if (match(text))
+            return slug;
+    }
+    return null;
+};
+/**
+ * Returns the regex pattern (as a string for cross-context use) that
+ * a question's text must match for the given slug. Used by
+ * page.evaluate calls so the matcher works inside the browser.
+ */
+const getSlugQuestionPattern = (slug) => {
+    const map = {
+        chargedFelony: "charged with any felony",
+        chargedMisdemeanor: "charged with any misdemeanor",
+        probation: "been on probation",
+        felony: "(?<!charged.{0,40})convicted.*felony",
+        misdemeanor: "(?<!charged.{0,40})convicted.*misdemeanor",
+        securitiesRegulations: "federal or state securities|investment.*regulation",
+        securitiesRegulationsState: "state insurance department",
+        foreignRegulations: "foreign government|foreign.*regulatory",
+        beingInvestigated: "currently under investigation",
+        wereInvestigated: "under investigation by any insurance",
+        inLawSuit: "pending indictments|civil judgments",
+        lawSuitInsurance: "named as a defendant|sued or been sued",
+        allegedOfFraud: "alleged to have engaged in any fraud",
+        provenFraud: "been found to have engaged in any fraud",
+        wasFiredRegulations: "terminated.*accused.*violating insurance",
+        wasFiredOfFraud: "terminated.*accused of fraud|wrongful taking",
+        wasFiredStatutes: "failure to supervise",
+        deniedAppointment: "appointment.*terminated for cause|denied an appointment",
+        oweToInsurance: "commission chargeback|indebtedness",
+        suretyRefused: "bonding or surety|denied.*bond",
+        eoRefused: "errors\\s*&\\s*omissions|e&o.*denied|e&o.*claims",
+        secLicense: "insurance or securities license.*denied",
+        firmSecLicense: "state or federal regulatory body.*found",
+        wasBankrupt: "personally filed a bankruptcy",
+        firmBankrupt: "brokerage firm.*bankrupt",
+        bankruptcyPending: "bankruptcy pending",
+        hasLiens: "liens|unsatisfied judgments",
+        alias: "used any other name|alias",
+    };
+    return map[slug] || slug;
+};
+/**
+ * v2 driver for SureLC's late-May 2026 Questions tab redesign.
+ *
+ * Layout: each question is a <sb-question> element. Per Yes-answer
+ * SureLC renders an ADD EXPLANATION button that navigates to a
+ * dedicated route /questions/question/{slug}. That route has:
+ *   - Occurrence Date input (placeholder="Occurrence Date")
+ *   - UPLOAD NEW DOCUMENT / CREATE EXPLANATION DOCUMENT /
+ *     SELECT FROM UPLOADED DOCUMENTS buttons
+ *   - CANCEL / CREATE buttons (CREATE enables when date + ≥1 doc set)
+ *
+ * Critical gotcha: CREATE button must be triggered with a full
+ * pointer-event sequence (pointerdown/mousedown/pointerup/mouseup/
+ * click). A plain element.click() doesn't fire Angular's MatButton
+ * handler, leaving the form in an unsaved state — the user (or bot)
+ * thinks CREATE worked but SureLC silently discards the data on
+ * navigation. Verified Gurira wasBankrupt 2026-05-29: simple click
+ * → no network call, no save; pointer sequence → save persists +
+ * validation drops to 0 issues.
+ */
+async function fillQuestionsV2(ctx, input) {
+    const { page, logger } = ctx;
+    if (!input?.surelcAnswers) {
+        logger.info("[Questions/v2] no surelcAnswers — nothing to fill");
+        return { ok: true, alreadyDone: true };
+    }
+    // Wait for the new layout to render fully
+    await page
+        .waitForSelector("sb-question", { timeout: 10_000 })
+        .catch(() => undefined);
+    // Inventory which slugs are on-screen (text → slug map). We don't
+    // keep ElementHandles because each ADD EXPLANATION click navigates
+    // to a new route, invalidating prior handles → "Target page, context
+    // or browser has been closed". Re-query DOM for each iteration.
+    const initialSlugs = await page.evaluate(() => {
+        return Array.from(document.querySelectorAll("sb-question"))
+            .map((q) => (q.textContent || "").replace(/\s+/g, " ").trim());
+    });
+    const presentSlugs = new Set();
+    for (const txt of initialSlugs) {
+        const slug = matchQuestionSlug(txt);
+        if (slug)
+            presentSlugs.add(slug);
+    }
+    logger.info({ matchedSlugs: presentSlugs.size }, "[Questions/v2] question inventory");
+    let yesSet = 0;
+    let saved = 0;
+    let skipped = 0;
+    for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
+        if (!ans || ans.answer !== "yes")
+            continue;
+        if (!presentSlugs.has(slug)) {
+            logger.warn({ slug }, "[Questions/v2] no on-screen question matched our slug");
+            continue;
+        }
+        // Make sure we're on the questions list (not stuck on a previous
+        // question's route). Each iteration starts fresh.
+        if (!page.url().match(/\/questions(?:[?#]|$)/)) {
+            await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined);
+            await page.waitForTimeout(800);
+        }
+        await page
+            .waitForSelector("sb-question", { timeout: 8_000 })
+            .catch(() => undefined);
+        // Set Yes radio + check if ADD EXPLANATION is present. Use
+        // page.evaluate to find the question by text match — handles are
+        // not reusable across navigations.
+        const probeResult = await page.evaluate((slugRegexMap) => {
+            const sbQs = Array.from(document.querySelectorAll("sb-question"));
+            let target = null;
+            for (const q of sbQs) {
+                const txt = (q.textContent || "").replace(/\s+/g, " ").trim();
+                const wanted = slugRegexMap.some((re) => new RegExp(re.pattern, re.flags).test(txt));
+                if (wanted) {
+                    target = q;
+                    break;
+                }
+            }
+            if (!target)
+                return { matched: false };
+            const yes = target.querySelector('input[type="radio"][value="true"]');
+            const yesChecked = !!yes?.checked;
+            const addBtn = Array.from(target.querySelectorAll("button")).find((b) => /ADD EXPLANATION/i.test(b.textContent || ""));
+            return { matched: true, yesChecked, hasAddBtn: !!addBtn };
+        }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }]);
+        if (!probeResult.matched) {
+            logger.warn({ slug }, "[Questions/v2] question disappeared from DOM");
+            continue;
+        }
+        if (!probeResult.yesChecked) {
+            // Click Yes
+            await page
+                .evaluate((slugMap) => {
+                const sbQs = Array.from(document.querySelectorAll("sb-question"));
+                for (const q of sbQs) {
+                    const txt = (q.textContent || "").replace(/\s+/g, " ").trim();
+                    const wanted = slugMap.some((re) => new RegExp(re.pattern, re.flags).test(txt));
+                    if (!wanted)
+                        continue;
+                    const yes = q.querySelector('input[type="radio"][value="true"]');
+                    if (yes)
+                        yes.click();
+                    return true;
+                }
+                return false;
+            }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+                .catch(() => undefined);
+            await page.waitForTimeout(800);
+            yesSet++;
+        }
+        if (!probeResult.hasAddBtn) {
+            skipped++;
+            logger.info({ slug }, "[Questions/v2] explanation already linked; skipping");
+            continue;
+        }
+        // Slug-share fallback: when our DB has no doc for this slug but
+        // the rep has yes-answered a RELATED slug whose doc covers the same
+        // disclosure, the SureLC producer-level Explanations bucket may
+        // already hold a usable attachment (one OCR-able file frequently
+        // covers felony+chargedFelony, misdemeanor+chargedMisdemeanor,
+        // wasBankrupt+bankruptcyPending). Continue to ADD EXPLANATION ->
+        // SELECT FROM UPLOADED — SureLC's picker lists ALL explanation-type
+        // attachments at producer level, so a SELECT click on the first
+        // available item creates the missing linkage without uploading
+        // a new file (and orphaning later if CREATE fails).
+        //
+        // If our DB has a doc, we still prefer SELECT FROM UPLOADED so the
+        // attachment gets reused instead of duplicated. The fallback to
+        // UPLOAD NEW DOCUMENT below covers the case where SureLC's picker
+        // is genuinely empty.
+        const hasDbDoc = !!(ans.documents && ans.documents.length > 0);
+        logger.info({ slug, hasDbDoc }, "[Questions/v2] linking explanation (uses existing producer-level attachments if our DB has none)");
+        // Click ADD EXPLANATION → navigates to /questions/question/{slug}
+        // Use a fresh element lookup since the inventory loop's handles
+        // (if any) are stale. Playwright's elementHandle.click() fires
+        // proper events.
+        let navOk = false;
+        const addBtnFresh = await page.evaluateHandle((slugMap) => {
+            const sbQs = Array.from(document.querySelectorAll("sb-question"));
+            for (const q of sbQs) {
+                const txt = (q.textContent || "").replace(/\s+/g, " ").trim();
+                const wanted = slugMap.some((re) => new RegExp(re.pattern, re.flags).test(txt));
+                if (!wanted)
+                    continue;
+                return Array.from(q.querySelectorAll("button")).find((b) => /ADD EXPLANATION/i.test(b.textContent || ""));
+            }
+            return undefined;
+        }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }]);
+        const addBtnEl = addBtnFresh.asElement();
+        if (addBtnEl) {
+            await addBtnEl.click().catch(() => undefined);
+            navOk = true;
+        }
+        if (!navOk) {
+            logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found");
+            continue;
+        }
+        // Wait for the explanation page route to load
+        await page.waitForTimeout(1500);
+        // Set Occurrence Date via direct value + events
+        if (ans.occurrenceDate) {
+            const isoMatch = ans.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            const mmddyyyy = isoMatch
+                ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
+                : ans.occurrenceDate;
+            await page
+                .evaluate((v) => {
+                const inp = document.querySelector('input[placeholder="Occurrence Date"]');
+                if (!inp)
+                    return false;
+                inp.value = v;
+                inp.dispatchEvent(new Event("input", { bubbles: true }));
+                inp.dispatchEvent(new Event("change", { bubbles: true }));
+                inp.dispatchEvent(new Event("blur", { bubbles: true }));
+                return true;
+            }, mmddyyyy)
+                .catch(() => undefined);
+            await page.waitForTimeout(500);
+        }
+        // Try to SELECT an existing uploaded doc first — this is safer
+        // because it doesn't create new attachments (which can become
+        // orphans if CREATE later fails). If no existing docs are
+        // available, fall back to UPLOAD NEW DOCUMENT.
+        const doc = ans.documents && ans.documents.length > 0 ? ans.documents[0] : null;
+        let uploadOk = false;
+        // ── Path A: SELECT FROM UPLOADED DOCUMENTS (preferred) ────────
+        try {
+            const selectBtn = await page.$('button:has-text("SELECT FROM UPLOADED DOCUMENTS")');
+            if (selectBtn) {
+                await selectBtn.click().catch(() => undefined);
+                await page.waitForTimeout(1200);
+                // Inside the SELECT dialog, click the first SELECT button.
+                // SureLC lists existing Explanation attachments here. If the
+                // list is non-empty the first item is fine — they're all from
+                // the same producer's prior uploads.
+                const picked = await page.evaluate(() => {
+                    const selects = Array.from(document.querySelectorAll("button"))
+                        .filter((b) => b.textContent?.trim() === "SELECT" &&
+                        b.offsetWidth > 0);
+                    if (selects.length === 0)
+                        return false;
+                    selects[0].click();
+                    return true;
+                });
+                await page.waitForTimeout(600);
+                if (picked) {
+                    // Click DONE on the picker dialog
+                    await page
+                        .evaluate(() => {
+                        const done = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "DONE" &&
+                            b.offsetWidth > 0 &&
+                            !b.disabled);
+                        if (done)
+                            done.click();
+                    })
+                        .catch(() => undefined);
+                    await page.waitForTimeout(1200);
+                    uploadOk = true;
+                    logger.info({ slug }, "[Questions/v2] selected existing upload");
+                }
+                else {
+                    // Picker was empty — close it
+                    await page
+                        .evaluate(() => {
+                        const cancel = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "CANCEL" &&
+                            b.offsetWidth > 0);
+                        if (cancel)
+                            cancel.click();
+                    })
+                        .catch(() => undefined);
+                    await page.waitForTimeout(800);
+                }
+            }
+        }
+        catch (err) {
+            logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw");
+        }
+        // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
+        if (!uploadOk && doc) {
+            try {
+                const path = await import("node:path");
+                const fs = await import("node:fs/promises");
+                const os = await import("node:os");
+                const res = await fetch(doc.url);
+                if (res.ok) {
+                    const buf = Buffer.from(await res.arrayBuffer());
+                    const localPath = path.join(os.tmpdir(), `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`);
+                    await fs.writeFile(localPath, buf);
+                    const uploadBtn = await page.$('button:has-text("UPLOAD NEW DOCUMENT")');
+                    if (uploadBtn) {
+                        const [fc] = await Promise.all([
+                            page.waitForEvent("filechooser", { timeout: 8_000 }),
+                            uploadBtn.click(),
+                        ]);
+                        await fc.setFiles(localPath);
+                        await page.waitForTimeout(2000);
+                        uploadOk = true;
+                        logger.info({ slug }, "[Questions/v2] uploaded fresh doc");
+                    }
+                }
+            }
+            catch (err) {
+                logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw");
+            }
+        }
+        if (!uploadOk) {
+            logger.warn({ slug }, "[Questions/v2] no doc attached; cancelling modal");
+            const cancelBtn = await page.$('button:has-text("CANCEL")');
+            if (cancelBtn) {
+                // Pointer-sequence on CANCEL too (Angular button)
+                await page
+                    .evaluate(() => {
+                    const cb = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "CANCEL" &&
+                        b.offsetWidth > 0);
+                    if (!cb)
+                        return;
+                    ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => cb.dispatchEvent(new MouseEvent(t, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window,
+                        button: 0,
+                    })));
+                })
+                    .catch(() => undefined);
+                await page.waitForTimeout(800);
+                // Handle "Unsaved information" dialog — confirm discard
+                await page
+                    .evaluate(() => {
+                    const yes = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "YES" &&
+                        b.offsetWidth > 0);
+                    if (yes)
+                        yes.click();
+                })
+                    .catch(() => undefined);
+                await page.waitForTimeout(800);
+            }
+            continue;
+        }
+        // Click CREATE via pointer event sequence. A plain .click() does
+        // NOT trigger Angular's MatButton click handler — the form stays
+        // in unsaved state and SureLC discards the upload on navigation.
+        // Verified Gurira wasBankrupt 2026-05-29: only the full pointer
+        // sequence persists server-side (validation drops to 0).
+        const createOk = await page
+            .evaluate(() => {
+            const cb = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim() === "CREATE" &&
+                b.offsetWidth > 0 &&
+                !/EXPLANATION/i.test(b.textContent || ""));
+            if (!cb)
+                return false;
+            ["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) => cb.dispatchEvent(new MouseEvent(t, {
+                bubbles: true,
+                cancelable: true,
+                view: window,
+                button: 0,
+            })));
+            return true;
+        })
+            .catch(() => false);
+        if (createOk) {
+            await page.waitForTimeout(2500);
+            saved++;
+            logger.info({ slug }, "[Questions/v2] CREATE pointer-sequence dispatched");
+        }
+        else {
+            logger.warn({ slug }, "[Questions/v2] CREATE button not found / not visible");
+        }
+    }
+    logger.info({ yesSet, saved, skipped }, "[Questions/v2] driver finished");
+    await snapshot(ctx, "tab-questions-after-v2");
+    return { ok: true, details: { yesSet, saved, skipped } };
+}
 async function fillQuestions(ctx, producerId, input) {
     const { page, logger } = ctx;
     await goToTab(page, producerId, "questions", ctx.logger);
@@ -693,20 +1104,76 @@ async function fillQuestions(ctx, producerId, input) {
     if (await isTabGreen(page, "Questions")) {
         return { ok: true, alreadyDone: true };
     }
-    // ── Click "ALL NO" first — saves us 19 individual clicks. SureLC
-    //    ships this button precisely for the clean-record case.
-    const allNoBtn = await firstVisible(page, [
-        'button:has-text("ALL NO")',
-        'button:has-text("All No")',
-    ]);
-    if (allNoBtn) {
-        try {
-            await allNoBtn.click();
-            await settle(page, 600);
-            logger.info("[Questions] clicked ALL NO");
+    // v2 detection: new layout uses <sb-question> elements
+    const hasV2 = await page.$$("sb-question").then((els) => els.length > 0).catch(() => false);
+    if (hasV2) {
+        logger.info("[Questions] v2 layout detected — using fillQuestionsV2");
+        return await fillQuestionsV2(ctx, input);
+    }
+    // ── Probe the current state BEFORE clicking ALL NO. If there are
+    //    ANY Yes radios already set, the tab has partial prior state —
+    //    likely linked explanation docs + When dates that ALL NO would
+    //    wipe.
+    //
+    //    Jimenez 2026-05-28 regression: bot's ALL NO click un-attached
+    //    his existing M1.pdf explanation, then the re-flip-Yes + new
+    //    upload created an unlinked dup. Validation went from 1 issue
+    //    (DOCS:UNLINKED) to 4 (QUESTIONS:EXPLANATION_REQUIRED +
+    //    QUESTIONS:WHEN_DATE_REQUIRED + QUESTIONS:ANSWERS_REQUIRED +
+    //    DOCS:UNLINKED).
+    //
+    //    Safer policy: when any Yes radios are pre-set, skip ALL NO and
+    //    surgically flip only the parents that differ from our intended
+    //    state. If we'd need to flip MORE than 3 parents back to No
+    //    (suggests a major mismatch), fail with a clear reason so the
+    //    orchestrator surfaces "Questions tab has unexpected prior
+    //    state" instead of corrupting it.
+    const existingYesParents = await page
+        .$$eval('tr input[type="radio"]:checked', (radios) => Array.from(new Set(radios
+        .filter((r) => /yes/i.test(r.value || ""))
+        .map((r) => {
+        const row = r.closest("tr");
+        const m = (row?.innerText || "").match(/^\s*(\d+)\b/);
+        return m ? Number(m[1]) : NaN;
+    })
+        .filter((n) => Number.isFinite(n)))))
+        .catch(() => []);
+    const safeMode = existingYesParents.length > 0;
+    if (safeMode) {
+        logger.info({ existingYesParents }, "[Questions] preserving prior state — skipping ALL NO (existing Yes radios detected)");
+        // Defensive: if existing Yes-questions all have explanations (no
+        // "ADD EXPLANATION" buttons visible), short-circuit the entire
+        // questions-tab fill. The bot's per-question upload code targets
+        // the old tr-based layout and silently fails on SureLC's new
+        // modal-based layout; running it on a producer whose questions
+        // were filled manually (Lopez/Gurira/Jimenez 2026-05-29) creates
+        // unlinked-explanation duplicates that Thomas then has to clean
+        // up. Mark the tab "already done" and let Phase A continue.
+        const addExplBtnCount = await page
+            .$$('button:has-text("ADD EXPLANATION")')
+            .then((els) => els.length)
+            .catch(() => -1);
+        if (addExplBtnCount === 0) {
+            logger.info("[Questions] all Yes-questions have explanations on file — skipping per-question fill");
+            return { ok: true, alreadyDone: true, details: { reason: "preserved-prior-state" } };
         }
-        catch {
-            /* ignore — fall through to per-question fill */
+        logger.info({ addExplBtnCount }, "[Questions] some explanations still missing — continuing to per-question fill");
+    }
+    else {
+        // No prior Yes state — safe to ALL NO + flip what we need.
+        const allNoBtn = await firstVisible(page, [
+            'button:has-text("ALL NO")',
+            'button:has-text("All No")',
+        ]);
+        if (allNoBtn) {
+            try {
+                await allNoBtn.click();
+                await settle(page, 600);
+                logger.info("[Questions] clicked ALL NO");
+            }
+            catch {
+                /* ignore — fall through to per-question fill */
+            }
         }
     }
     // Compute which parent questions need to flip back to Yes based on
@@ -1198,8 +1665,37 @@ async function fillTraining(ctx, producerId, input) {
     // "WebCE" is the dominant industry provider; it also happens to be
     // the option SureLC's autocomplete recognizes without complaint.
     const providerName = input.amlProvider || "WebCE";
-    await fillByLabel(page, "Provider Name", providerName).catch(() => false);
-    await fillByLabel(page, "Provider", providerName).catch(() => false);
+    // Provider Name is a Material autocomplete (sb-provider-autocomplete
+    // or sb-autocomplete depending on SureLC version). Plain fillByLabel
+    // types text but doesn't COMMIT — the form keeps the field empty
+    // until an mat-option is selected from the open panel. Same pattern
+    // as Course Name below.
+    //
+    // Verified pattern 2026-05-28 (Julissa Chacon producer 2157902 + 4
+    // other agents): every nightly Phase A failed with "Contracting
+    // BLOCKED — AML file attached, but Training Provider not selected"
+    // because the typed-but-not-selected value never saved. SureLC's
+    // server-side validation flags AML:PROVIDER_NONE on these rows.
+    let providerTyped = await fillByLabel(page, "Provider Name", providerName).catch(() => false);
+    if (!providerTyped)
+        providerTyped = await fillByLabel(page, "Provider", providerName).catch(() => false);
+    if (providerTyped) {
+        await page.waitForTimeout(800);
+        const providerOption = await firstVisible(page, [
+            `mat-option:has-text("${providerName}")`,
+            'mat-option:has-text("WebCE")',
+            'mat-option:has-text("LIMRA")',
+            '.cdk-overlay-pane mat-option',
+        ]);
+        if (providerOption) {
+            logger.info({ providerName }, "[Training] selecting Provider Name from autocomplete");
+            await providerOption.click().catch(() => undefined);
+            await settle(page, 600);
+        }
+        else {
+            logger.warn({ providerName }, "[Training] no provider mat-option visible after typing — typed value will not commit (SureLC AML:PROVIDER_NONE will remain)");
+        }
+    }
     const courseName = input.amlCourseName || "Anti-Money Laundering";
     await fillByLabel(page, "Course Name", courseName).catch(() => false);
     // Course Name is a Material autocomplete typeahead. After typing,
@@ -1779,21 +2275,41 @@ async function fillSignature(ctx, producerId, input) {
         return { ok: true, alreadyDone: true };
     }
     // Content-presence "already done" detector: when a signature is on
-    // file, SureLC renders a "Signature Authorization" header card with
-    // a date and **REMOVE / EDIT** buttons (no UPLOAD IT NOW button).
-    // The Signature Image preview also shows the rep's typed signature.
-    // Sydney 2026-05-07 03:33 — bot reported "file input not found" and
-    // bailed because the upload form isn't rendered when a signature is
-    // already present.
+    // file AND cropper-confirmed, SureLC renders a "Signature
+    // Authorization" header card with the confirmation date. Only treat
+    // the DATED line as definitive evidence of a complete signature.
+    //
+    // 2026-05-27: the looser `REMOVE + EDIT + Signature Image` clause
+    // matched signatures that had been uploaded via /uploadForm but
+    // never reached cropper-confirmed state (confirmImage failed or was
+    // skipped on a prior run). Bot reported alreadyDone, Fastlane saw
+    // the producer as unsignatured, refused to expose the SELECT button,
+    // and the activationPipeline fastlane_fallback_direct_post fired,
+    // creating orphan BGA-stage requests with producerEmailUsed=null
+    // (Javier Castro, Shingai Gurira, Doriz Lopez, Demetrius Early Jr).
+    // Forcing the API push (uploadForm + confirmImage) when only the
+    // loose pattern is present is safe — pushSignatureViaApi overwrites
+    // idempotently and the REMOVE-then-reupload fallback handles the
+    // rare case where overwrite fails.
     const sigText = await page
         .$$eval("body", (els) => (els[0]?.innerText || ""))
         .catch(() => "");
-    const hasUploaded = /Signature Authorization\s*\n?\s*\d{2}\/\d{2}\/\d{4}/i.test(sigText) ||
-        (/REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText));
+    const hasDatedAuthorization = /Signature Authorization\s*\n?\s*\d{2}\/\d{2}\/\d{4}/i.test(sigText);
+    const hasLooseRemoveEdit = /REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText);
+    const hasUploaded = hasDatedAuthorization;
+    if (!hasUploaded && hasLooseRemoveEdit) {
+        // Partial-upload state: signature exists in DOM (REMOVE+EDIT
+        // buttons visible) but never reached cropper-confirmed (no dated
+        // header). Don't skip — fall through to the API push at the end
+        // of this function which overwrites idempotently via uploadForm +
+        // confirmImage. This is the codepath the 2026-05-27 Javier/Shingai/
+        // Doriz/Demetrius cohort needed.
+        logger.warn({ excerpt: sigText.slice(0, 200) }, "[Signature] partial upload detected (REMOVE/EDIT visible, no dated Signature Authorization) — forcing API push to confirm");
+    }
     if (hasUploaded) {
         if (!input?.forceReupload) {
-            logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (REMOVE/EDIT visible) — skipping");
-            return { ok: true, alreadyDone: true, details: { detected: "removeEditButtons" } };
+            logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (dated Signature Authorization visible) — skipping");
+            return { ok: true, alreadyDone: true, details: { detected: "datedAuthorization" } };
         }
         // forceReupload=true: try the API push FIRST — it overwrites the
         // existing signature without any UI manipulation, so we never end
@@ -1819,10 +2335,28 @@ async function fillSignature(ctx, producerId, input) {
                         },
                     };
                 }
-                logger.warn({ reason: overwriteResult.reason }, "[Signature] API overwrite failed; falling back to REMOVE + UI re-upload");
+                logger.warn({ reason: overwriteResult.reason }, "[Signature] API overwrite failed; preserving existing signature (skipping REMOVE)");
+                // Maria Lugo 2026-05-28 regression: REMOVE succeeded then UI
+                // re-upload failed, leaving the producer with NO signature on
+                // SureLC ("Missing Signature Authorization" validation). The
+                // REMOVE-then-fail-to-reupload window is non-recoverable
+                // automatically and forces an admin to re-sign via the
+                // dashboard. Safer: keep the existing signature (which was
+                // valid enough that REMOVE+re-upload would have re-attached
+                // the same file) and return with a clear reason so the
+                // orchestrator can flag for retry / admin attention without
+                // having corrupted the producer's state.
+                return {
+                    ok: false,
+                    reason: `API push failed (${overwriteResult.reason}); kept existing signature to avoid REMOVE-without-reupload regression`,
+                };
             }
             catch (err) {
-                logger.warn({ err: err?.message }, "[Signature] API overwrite threw; falling back to REMOVE + UI re-upload");
+                logger.warn({ err: err?.message }, "[Signature] API overwrite threw; preserving existing signature (skipping REMOVE)");
+                return {
+                    ok: false,
+                    reason: `API push threw (${err?.message}); kept existing signature to avoid REMOVE-without-reupload regression`,
+                };
             }
         }
         logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature");
@@ -2000,17 +2534,58 @@ async function pushSignatureViaApi(page, producerId, pdfUrl, signatureImageUrl, 
         return { ok: false, reason: "uploadForm returned no formId" };
     // Step 2 — PUT /confirmImage
     const payload = `data:image/png;base64,${pngBuf.toString("base64")}`;
-    const confRes = await fetch(`https://surelc.surancebay.com/surecrm/signature/${producerId}/${formId}/confirmImage`, {
-        method: "PUT",
-        headers: {
-            Authorization: `Bearer ${bearer}`,
-            "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ payload, width, height }),
-    });
-    if (!confRes.ok) {
-        const t = await confRes.text().catch(() => "");
-        return { ok: false, reason: `confirmImage HTTP ${confRes.status}: ${t.slice(0, 200)}` };
+    const callConfirm = async (base64Payload) => {
+        const r = await fetch(`https://surelc.surancebay.com/surecrm/signature/${producerId}/${formId}/confirmImage`, {
+            method: "PUT",
+            headers: {
+                Authorization: `Bearer ${bearer}`,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ payload: base64Payload, width, height }),
+        });
+        const txt = await r.text().catch(() => "");
+        return { ok: r.ok, status: r.status, text: txt };
+    };
+    let conf = await callConfirm(payload);
+    if (!conf.ok && conf.status === 500 && /Failed to create transparent PNG/i.test(conf.text)) {
+        // SureLC's image processor occasionally rejects our drawn RGBA PNGs
+        // with HTTP 500 "Failed to create transparent PNG" — Beam 2026-05-29
+        // is the canonical case. The PNG is well-formed (verified with file +
+        // PNG header read); SureLC's alpha-handling pipeline just chokes on
+        // certain alpha patterns. Workaround: composite the PNG onto a white
+        // background in headless Chrome to strip transparency, then retry.
+        logger.warn({ producerId, formId }, "[Signature] confirmImage 500 'Failed to create transparent PNG' — flattening alpha and retrying");
+        const flattenedDataUrl = await page
+            .evaluate(async (b64) => new Promise((resolve, reject) => {
+            const img = new Image();
+            img.onload = () => {
+                const c = document.createElement("canvas");
+                c.width = img.width;
+                c.height = img.height;
+                const ctx = c.getContext("2d");
+                if (!ctx)
+                    return reject(new Error("no 2d ctx"));
+                ctx.fillStyle = "white";
+                ctx.fillRect(0, 0, c.width, c.height);
+                ctx.drawImage(img, 0, 0);
+                resolve(c.toDataURL("image/png"));
+            };
+            img.onerror = () => reject(new Error("img load failed"));
+            img.src = `data:image/png;base64,${b64}`;
+        }), pngBuf.toString("base64"))
+            .catch((e) => {
+            logger.warn({ err: String(e) }, "[Signature] PNG flatten in canvas failed");
+            return "";
+        });
+        if (flattenedDataUrl) {
+            conf = await callConfirm(flattenedDataUrl);
+            if (conf.ok) {
+                logger.info({ producerId, formId }, "[Signature] flattened PNG accepted on retry");
+            }
+        }
+    }
+    if (!conf.ok) {
+        return { ok: false, reason: `confirmImage HTTP ${conf.status}: ${conf.text.slice(0, 200)}` };
     }
     logger.info({ producerId, formId, width, height, pdfBytes: pdfBuf.length, pngBytes: pngBuf.length }, "[Signature] API push succeeded — signature persisted via uploadForm + confirmImage");
     return { ok: true, formId };
@@ -2022,13 +2597,70 @@ async function pushSignatureViaApi(page, producerId, pdfUrl, signatureImageUrl, 
  * Returns "" if no Authorization header has been seen.
  */
 async function harvestBgaBearer(page) {
+    // Strategy 1 (reliable) — read directly from browser storage. SureLC's
+    // BGA SPA persists its Bearer JWT under the localStorage key
+    // `sb:id_token` (verified bgaTokenCapture.ts:347 — same pattern used by
+    // /get-bga-tokens). This bypasses ALL network-listener race conditions
+    // (the previous approach failed 80%+ of Phase A runs 2026-05-28 because
+    // the SPA's interceptor sometimes fired the /surecrm/* request before
+    // our page.on("request") handler attached, or the JWT-shape check ran
+    // before resolve was invoked).
+    //
+    // Poll storage for up to 5s — the SPA might be mid-mount on first goto.
+    const isJwt = (s) => typeof s === "string" && s.split(".").length === 3;
+    const storageDeadline = Date.now() + 5_000;
+    while (Date.now() < storageDeadline) {
+        const fromStorage = await page
+            .evaluate(() => {
+            const buckets = {};
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k)
+                    buckets[`local:${k}`] = localStorage.getItem(k) || "";
+            }
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const k = sessionStorage.key(i);
+                if (k)
+                    buckets[`session:${k}`] = sessionStorage.getItem(k) || "";
+            }
+            return buckets;
+        })
+            .catch(() => ({}));
+        // Try the SureLC-specific keys first.
+        for (const [k, v] of Object.entries(fromStorage)) {
+            if (!v)
+                continue;
+            if (/(?:^|:)id_token$/i.test(k) && isJwt(v))
+                return v;
+            if (/access(?:_?token)?/i.test(k) && isJwt(v))
+                return v;
+            // JSON-wrapped formats (older SDK versions).
+            try {
+                const obj = JSON.parse(v);
+                if (obj && typeof obj === "object") {
+                    if (isJwt(obj.access_token))
+                        return obj.access_token;
+                    if (isJwt(obj.accessToken))
+                        return obj.accessToken;
+                }
+            }
+            catch {
+                /* not JSON */
+            }
+        }
+        await page.waitForTimeout(250);
+    }
+    // Strategy 2 (fallback) — original network-listener approach. If the
+    // SPA hasn't put the token in storage yet, force an outbound call and
+    // grab the Authorization header. Kept as belt-and-suspenders in case
+    // SureLC changes their storage key in a future SPA build.
     return new Promise((resolve) => {
         let bearer = "";
         const handler = (req) => {
             const a = req.headers()["authorization"];
             if (a?.startsWith("Bearer ") && req.url().includes("/surecrm/")) {
                 const token = a.replace("Bearer ", "");
-                if (token.split(".").length === 3) {
+                if (isJwt(token)) {
                     bearer = token;
                     page.off("request", handler);
                     resolve(bearer);
@@ -2036,12 +2668,7 @@ async function harvestBgaBearer(page) {
             }
         };
         page.on("request", handler);
-        // Force the SPA to make at least one /surecrm/* call by polling
-        // validation/list for an arbitrary producer (the current page's).
-        // The fetch goes through the SPA's HttpClient → bearer attached.
         page.evaluate(() => {
-            // The SPA is Angular; window.fetch is the same global. Make a
-            // harmless GET that the SPA's interceptor will sign.
             fetch("/surecrm/user/timezone", { method: "POST", body: "-240" }).catch(() => { });
         }).catch(() => { });
         setTimeout(() => {

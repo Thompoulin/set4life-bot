@@ -36,6 +36,7 @@ import { loginAdmin } from "./admin/login.js";
 import { addProducer, changeAffiliation } from "./admin/addProducer.js";
 import { fillFullProfile } from "./admin/fillProfile.js";
 import { repReview } from "./rep/review.js";
+import { CHROMIUM_ARGS } from "./browserArgs.js";
 import { makeTabContext } from "./tabs/helpers.js";
 import { makeProgressReporter } from "./progressReporter.js";
 export async function runActivation(input, logger) {
@@ -53,11 +54,7 @@ export async function runActivation(input, logger) {
         // confirmed 2026-05-06 same credentials work fine in a real
         // Chrome browser; only the bot bounces — strongest remaining
         // suspect after UA cleanup is webdriver fingerprinting.
-        args: [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
+        args: CHROMIUM_ARGS,
     });
     const result = {
         success: true,
@@ -340,10 +337,41 @@ export async function runActivation(input, logger) {
                                     });
                                     preDedupSkipsFastlane = true;
                                 }
+                                // else dedup.uniqueCarriers === 0 → confirmed zero active
+                                // requests → genuine first-time contracting; Fastlane
+                                // runs normally below.
+                            }
+                            else {
+                                // dedup === null: could not read existing-request state.
+                                // FAIL-SAFE: skip Fastlane rather than risk duplicates.
+                                logger.warn({ producerId }, "[Fastlane] pre-dedup returned null — SKIPPING Fastlane (fail-safe; cannot verify existing requests)");
+                                adminPhase.contracting = {
+                                    submitted: ["deferred-dedup-null"],
+                                    failed: [],
+                                };
+                                await finishContracting({
+                                    ok: true,
+                                    msg: "Skipped Fastlane — could not verify existing appointment-requests; deferring to manual carrier add to avoid duplicates",
+                                });
+                                preDedupSkipsFastlane = true;
                             }
                         }
                         catch (err) {
-                            logger.warn({ err: err?.message }, "[Fastlane] pre-dedup threw — continuing into Fastlane");
+                            // FAIL-SAFE (2026-06-05 incident): a transient dedup error
+                            // must NOT fall through to Fastlane — that path duplicated
+                            // ~17 agents' carrier requests in one day. If we can't
+                            // verify existing state, skip Fastlane and defer to a
+                            // manual carrier add.
+                            logger.warn({ err: err?.message }, "[Fastlane] pre-dedup threw — SKIPPING Fastlane (fail-safe; no duplicate submissions)");
+                            adminPhase.contracting = {
+                                submitted: ["deferred-dedup-threw"],
+                                failed: [],
+                            };
+                            await finishContracting({
+                                ok: true,
+                                msg: `Skipped Fastlane — pre-dedup check failed (${err?.message ?? "error"}); deferring to manual carrier add to avoid duplicates`,
+                            });
+                            preDedupSkipsFastlane = true;
                         }
                     }
                     if (!preDedupSkipsFastlane) {
@@ -374,6 +402,32 @@ export async function runActivation(input, logger) {
                                 ? `Fastlane submitted (one-producer/many-carriers)`
                                 : r.reason || `Fastlane failed`,
                         });
+                        // Post-Fastlane self-clean. Fastlane creates a fresh
+                        // Producer-stage appointment-request for every configured
+                        // carrier — including carriers that already had an active
+                        // request at Producer/BGA stage — so a run can leave TWO
+                        // requests per carrier until the NEXT bot run's pre-dedup
+                        // collapses them. That gap is what Ana sees as "both
+                        // contracts triggering" (2026-06-15). Run the same dedup
+                        // right here so a Fastlane run never leaves duplicates
+                        // behind. Reuses the proven keep-most-advanced/delete-rest
+                        // logic; best-effort (never fails the contracting step).
+                        if (r.ok && producerId) {
+                            try {
+                                const { dedupAppointmentRequests } = await import("./admin/dedupAppointmentRequests.js");
+                                const postDedup = await dedupAppointmentRequests(tabCtx.page, producerId, "1322", logger);
+                                if (postDedup) {
+                                    logger.info({
+                                        producerId,
+                                        deleted: postDedup.deleted,
+                                        byCarrierStage: postDedup.byCarrierStage,
+                                    }, "[Fastlane] post-dedup cleaned duplicates");
+                                }
+                            }
+                            catch (err) {
+                                logger.warn({ err: err?.message }, "[Fastlane] post-dedup threw — non-blocking");
+                            }
+                        }
                         // Post-Fastlane: for any carrier the agent declared a
                         // prior contracting with during onboarding, flip the
                         // appointment-request type from Contract → Transfer via
@@ -453,11 +507,12 @@ export async function runActivation(input, logger) {
                 result.stage = r.ok ? "rep_review_complete" : "rep_review_failed";
                 if (!r.ok)
                     result.success = false;
+                const skippedCount = r.skipped?.length ?? 0;
                 await finishRep({
                     ok: r.ok,
                     msg: r.ok
-                        ? `Signed ${r.signed} carrier(s)`
-                        : `Signed ${r.signed}, ${r.failed.length} failed`,
+                        ? `Signed ${r.signed} carrier(s)${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`
+                        : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`,
                     meta: r,
                 });
             }
@@ -466,6 +521,7 @@ export async function runActivation(input, logger) {
                     ok: false,
                     signed: 0,
                     failed: [{ reason: err?.message || "exception" }],
+                    skipped: [],
                 };
                 result.success = false;
                 result.stage = "rep_review_failed";

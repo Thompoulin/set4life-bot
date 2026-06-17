@@ -1032,8 +1032,22 @@ async function reviewOneCarrier(
   // true disclosures) are unaffected — automation proceeds exactly as
   // before.
   if (input.disclosures) {
+    // Biographical disclosures are NOT material adverse-event questions, so
+    // a carrier wizard that doesn't surface them must NOT hard-block the
+    // sign. "Have you ever used other names / aliases / DBAs" (q18) is
+    // biographical: the actual names are already captured on the producer
+    // profile + the SureLC questionnaire (priorFinancialNames), and many
+    // carriers don't ask it on their Step 4/5 wizard at all. Treating it
+    // like felony/fraud/bankruptcy needlessly stranded every alias-flagged
+    // rep at Producer (Julia Davis 2026-06-17 — 8 carriers blocked solely
+    // on q18_other_names). It is STILL answered "Yes" whenever a matching
+    // question appears (DISCLOSURE_LABEL_PATTERNS unchanged); it just no
+    // longer blocks when none does. All adverse disclosures (felony, fraud,
+    // bankruptcy, license/regulatory actions, judgments, E&O claims, etc.)
+    // remain strictly guarded exactly as before.
+    const NON_BLOCKING_BIOGRAPHICAL_KEYS = new Set(["q18_other_names"])
     const trueKeys = Object.entries(input.disclosures)
-      .filter(([, v]) => v === true)
+      .filter(([k, v]) => v === true && !NON_BLOCKING_BIOGRAPHICAL_KEYS.has(k))
       .map(([k]) => k)
     const placed = new Set<string>([
       ...step4Filled.placedKeys,

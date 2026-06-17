@@ -15,15 +15,12 @@
  * until it eventually rotates, then re-runs this capture.
  */
 import { chromium } from "playwright";
+import { CHROMIUM_ARGS } from "./browserArgs.js";
 const ENTRY_URL = "https://surelc.surancebay.com/bga/agency/carriers/selected?search=";
 export async function captureBgaTokens(input, logger) {
     const browser = await chromium.launch({
         headless: true,
-        args: [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ],
+        args: CHROMIUM_ARGS,
     });
     const urlHistory = [];
     try {

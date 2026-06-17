@@ -112,6 +112,29 @@ function pickYnForLabel(label, disclosures) {
     // standard life portfolio (FE, Term, Whole Life, Annuity, etc).
     if (PRODUCT_OPT_IN_PATTERN.test(label))
         return "Y";
+    // "Did you FILE a 1033 form / 1033 waiver?" is a FACTUAL filing
+    // question, distinct from the felony background disclosure. The
+    // q1_felony regex below otherwise over-matches the literal "1033"
+    // (and "felony") in this prompt and wrongly answers Yes — which is a
+    // false statement of fact, not a conservative over-disclosure
+    // (Jimenez 2026-06-02 Americo: form1033Filed=no but bot answered Yes,
+    // creating a spurious red explanation-required flag). A 1033 waiver
+    // is filed by very few reps; default No. (Background "have you ever
+    // been convicted" felony questions don't contain file/filing/waiver
+    // and still match the disclosure pattern correctly.)
+    if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
+        return "N";
+    // Securities/investment-regulation VIOLATION question — answer ONLY
+    // from the dedicated securities flag. Its wording ("convicted ... no
+    // contest", "state securities") otherwise matches the felony (q1) and
+    // regulatory (q3) patterns below, so a genuine consumer-complaint
+    // disclosure (which sets q3_regulatory_action) — or the literal
+    // "convict" token — wrongly answers this Yes, creating an unsatisfiable
+    // explanation card that stalls the rep at Producer (Estell 2026-06-03:
+    // hadComplaint=yes → securities-violation Q answered Yes → stuck).
+    if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
+        return disclosures?.q3_securities_violation ? "Y" : "N";
+    }
     if (!disclosures)
         return "N";
     for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
@@ -119,6 +142,226 @@ function pickYnForLabel(label, disclosures) {
             return "Y";
     }
     return "N";
+}
+/**
+ * Which background-disclosure key (if any) this visible question label
+ * maps to AND the rep flagged true — i.e. the key that makes
+ * pickYnForLabel answer "Y" *because of a disclosure* (NOT the always-Yes
+ * carrier/product opt-ins, which aren't disclosures). Returns null for an
+ * opt-in, an unrecognized question, or a disclosure whose flag is false.
+ *
+ * This exists to AUDIT coverage. pickYnForLabel silently returns "N" for
+ * any label it doesn't recognize — so when a carrier phrases a background
+ * question outside DISCLOSURE_LABEL_PATTERNS (e.g. Foresters' "protection
+ * from creditors" vs /bankrupt/), a rep's TRUE disclosure is answered
+ * "No" with no signal: a false compliance statement. By recording which
+ * true keys actually landed on a label, the caller can detect a true
+ * disclosure that matched NOTHING and route to a human instead of signing
+ * a wrong "No" (Tamara Chinchilla / Foresters 2026-06-10 — and note the
+ * earlier "verified against Foresters" pass was an all-No rep, where the
+ * silent-No default hid the gap).
+ *
+ * Kept in lockstep with pickYnForLabel's disclosure branches above; any
+ * change there must change here too.
+ */
+function disclosureKeyForLabel(label, disclosures) {
+    if (!disclosures)
+        return null;
+    if (ISSUING_COMPANY_PATTERN.test(label))
+        return null;
+    if (PRODUCT_OPT_IN_PATTERN.test(label))
+        return null;
+    if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
+        return null;
+    if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
+        return disclosures.q3_securities_violation ? "q3_securities_violation" : null;
+    }
+    for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
+        if (pattern.test(label) && disclosures[key])
+            return key;
+    }
+    return null;
+}
+/**
+ * Step-4 Carrier-Questions explanation-modal filler.
+ *
+ * A "Yes" carrier-question answer makes SureLC render a red
+ * `<sb-info-message type="error" action="Add">` card ("Please, provide
+ * description or/and attach files" + an ADD button). The request cannot
+ * advance to Review & Sign until every such card is satisfied — this is
+ * what strands disclosure-Yes reps at Producer across the whole red-flag
+ * backlog (Americo/AmAm et al., 2026-06-02). SureLC moved this to a modal
+ * the old fill logic never touched.
+ *
+ * Drives the ADD modal per card: set occurrence date, type the
+ * explanation text, attach a supporting doc (preferring an
+ * already-uploaded one to avoid orphans), then CREATE via the full
+ * pointer sequence Angular Material needs. Fully defensive: only acts
+ * when red cards exist, never throws, and closes a stuck modal so it
+ * can't block subsequent cards or the Next button. Captures the modal
+ * DOM/screenshot for validation.
+ */
+async function fillCarrierQuestionExplanations(ctx, input, idx) {
+    const { page, logger } = ctx;
+    const pool = input.carrierQuestionExplanations || [];
+    // Names of explanation-required cards we could NOT satisfy this run.
+    // Stashed on the page so the Step-6 wizard-block classifier can name
+    // the exact blocking card in its reason (instead of the generic
+    // "stuck on /wizard/welcome"). Reset each call; the classifier reads
+    // (page as any)._lastUnsatisfiedCards.
+    const unsatisfied = [];
+    page._lastUnsatisfiedCards = unsatisfied;
+    // Matches the explanation-required card on BOTH the Carrier-Questions
+    // step (action="Add") and the Questionnaire step (action="ADD
+    // EXPLANATION") — same sb-info-message component, both type="error".
+    const ADD_SEL = 'sb-info-message[type="error"] button.message__button';
+    const initialCards = await page.locator(ADD_SEL).count().catch(() => 0);
+    if (initialCards === 0)
+        return { cards: 0, filled: 0, unsatisfied };
+    logger.info({ idx, cards: initialCards, poolSize: pool.length }, "[Rep step4] explanation-required cards present; driving ADD modal(s)");
+    await snapshot(ctx, `rep-carrier${idx}-step4-add-cards`);
+    const norm = (s) => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    let filled = 0;
+    // Re-query each pass — satisfying a card mutates the DOM. Bound the
+    // loop so an unfillable card can never spin forever.
+    for (let pass = 0; pass < initialCards + 2; pass++) {
+        const addBtn = page.locator(ADD_SEL).first();
+        if ((await addBtn.count().catch(() => 0)) === 0)
+            break;
+        const questionText = await addBtn
+            .evaluate((btn) => {
+            const card = btn.closest("sb-question, .question, .details_content, mat-card") ||
+                btn.closest("div");
+            const root = (card?.parentElement &&
+                card.parentElement.closest("sb-question, .question, mat-card")) ||
+                card;
+            return (root?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 240);
+        })
+            .catch(() => "");
+        const qn = norm(questionText);
+        const pick = pool.find((e) => e.questionText && qn.includes(norm(e.questionText).slice(0, 28))) ||
+            pool.find((e) => e.explanation) ||
+            pool[0];
+        if (!pick || !pick.explanation) {
+            unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)");
+            logger.warn({ idx, questionText, poolSize: pool.length }, "[Rep step4] no explanation in pool for card — cannot satisfy; stopping");
+            break;
+        }
+        try {
+            await addBtn.click({ timeout: 5000, force: true });
+            await page.waitForTimeout(1200);
+            await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}`);
+            // All modal interactions are scoped to the visible
+            // mat-dialog-container so we never touch the underlying card's "ADD"
+            // button (clicking ADD just re-opens the modal — the prior
+            // filled:N/remaining:1 churn) or a textarea behind the overlay.
+            const dialog = page.locator("mat-dialog-container:visible").last();
+            // 1) Occurrence date, if the modal exposes one.
+            if (pick.occurrenceDate) {
+                const m = pick.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+                const mmddyyyy = m ? `${m[2]}/${m[3]}/${m[1]}` : pick.occurrenceDate;
+                try {
+                    const dateInp = dialog
+                        .locator('input[placeholder*="Occurrence" i], input[placeholder*="date" i]')
+                        .first();
+                    if (await dateInp.count())
+                        await dateInp.fill(mmddyyyy);
+                }
+                catch {
+                    /* no date field on this modal — fine */
+                }
+            }
+            // 2) Explanation text → the Description textarea. Playwright .fill()
+            //    drives Angular's form control properly; a raw value-set is
+            //    dropped by ngModel, so DONE would save an empty description and
+            //    the red card would persist (verified Jimenez 2026-06-02).
+            let descFilled = false;
+            try {
+                const ta = dialog.locator("textarea").first();
+                if (await ta.count()) {
+                    await ta.fill(pick.explanation);
+                    descFilled = true;
+                }
+            }
+            catch (err) {
+                logger.warn({ idx, err: err?.message }, "[Rep step4] description fill threw");
+            }
+            // 3) Attach an existing uploaded doc via its inline SELECT button.
+            //    The modal lists the rep's already-uploaded explanation/DISCHARGE
+            //    docs under "Other documents available"; reusing one needs no
+            //    filechooser (the prior UPLOAD-new path timed out). The card is
+            //    "or/and" so the description alone can satisfy it — this is
+            //    belt-and-braces and harmless when the list is empty.
+            let attached = false;
+            try {
+                const sel = dialog.locator('button:has-text("SELECT")').first();
+                if (await sel.count()) {
+                    await sel.click({ timeout: 4000 }).catch(() => undefined);
+                    await page.waitForTimeout(700);
+                    attached = true;
+                }
+            }
+            catch (err) {
+                logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT existing-doc threw");
+            }
+            // 4) Commit via the modal's DONE button, scoped to the dialog so we
+            //    never hit the underlying card's ADD button (which re-opens the
+            //    modal). Playwright's click runs the full pointer sequence
+            //    Material's handler expects.
+            let saved = false;
+            try {
+                // Step-4 carrier-questions modal commits via DONE; the
+                // Questionnaire (step-5) modal commits via CREATE. Click
+                // whichever ENABLED primary button this modal exposes (a
+                // disabled one means required fields are still missing).
+                const commit = dialog
+                    .locator('button:has-text("DONE"):not([disabled]), button:has-text("CREATE"):not([disabled])')
+                    .first();
+                await commit.click({ timeout: 5000 });
+                saved = true;
+            }
+            catch (err) {
+                logger.warn({ idx, err: err?.message }, "[Rep step4] commit (DONE/CREATE) click threw");
+            }
+            await page.waitForTimeout(1500);
+            if (saved && (descFilled || attached)) {
+                filled++;
+                logger.info({ idx, descFilled, attached, q: questionText.slice(0, 80) }, "[Rep step4] explanation modal submitted");
+            }
+            else {
+                unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)");
+                logger.warn({ idx, saved, descFilled, attached, q: questionText.slice(0, 80) }, "[Rep step4] explanation modal not satisfied — capturing + closing");
+                await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}-unfilled`);
+                await page
+                    .evaluate(() => {
+                    const c = Array.from(document.querySelectorAll("button")).find((b) => /CANCEL|CLOSE/.test((b.textContent || "").trim().toUpperCase()) &&
+                        b.offsetWidth > 0);
+                    if (c)
+                        c.click();
+                })
+                    .catch(() => undefined);
+                await page.waitForTimeout(800);
+                // Discard any "unsaved changes" confirm.
+                await page
+                    .evaluate(() => {
+                    const y = Array.from(document.querySelectorAll("button")).find((b) => b.textContent?.trim().toUpperCase() === "YES" &&
+                        b.offsetWidth > 0);
+                    if (y)
+                        y.click();
+                })
+                    .catch(() => undefined);
+                await page.waitForTimeout(600);
+                break;
+            }
+        }
+        catch (err) {
+            logger.warn({ idx, err: err?.message }, "[Rep step4] explanation-card handling threw");
+            break;
+        }
+    }
+    const remaining = await page.locator(ADD_SEL).count().catch(() => 0);
+    logger.info({ idx, filled, remaining, unsatisfied }, "[Rep step4] explanation modal pass complete");
+    return { cards: initialCards, filled, unsatisfied };
 }
 export async function repReview(browser, input, parentLogger, jobId) {
     const logger = parentLogger.child({ component: "rep-review" });
@@ -142,6 +385,11 @@ export async function repReview(browser, input, parentLogger, jobId) {
     };
     let signed = 0;
     const failed = [];
+    // Carriers that were withdrawn/discarded by the agency — never a
+    // failure, never retryable. Kept separate from `failed[]` so a
+    // withdrawn dupe can't flip an otherwise-clean run to failed (which
+    // would churn the daily sweep and falsely demote the agent).
+    const skipped = [];
     try {
         // ── Step 0 — Auth ──────────────────────────────────────────────
         // The /sbweb/login.jsp URL bootstraps an Angular SPA (ar-review
@@ -206,9 +454,28 @@ export async function repReview(browser, input, parentLogger, jobId) {
         // either inner input into the masked formcontrol. We click the
         // outer component to focus, then keyboard.type() the 6 digits.
         // For DOB, mat-input-0 is a plain text input; .fill works.
-        const ssnHost = await page.$('auth-ssn-input');
+        // RETRY for SureLC's intermittent email/password gate: the login.jsp
+        // bypass (and sometimes the emailed link) lands on the standard
+        // email/password login instead of the rep SSN/DOB gate — there's no
+        // auth-ssn-input then. Re-navigating the review URL re-triggers the
+        // OAuth flow and yields the SSN/DOB gate on a later attempt (verified
+        // manually 2026-06-03; the 2nd open reliably gave SSN/DOB). Without
+        // this the run no-ops on the email-skew/bypass path.
+        let ssnHost = await page.$('auth-ssn-input');
+        for (let gateAttempt = 1; gateAttempt <= 3 && !ssnHost; gateAttempt++) {
+            logger.warn({ gateAttempt, url: page.url() }, "[Rep auth] SSN/DOB gate not present (email/password gate?) — re-navigating review URL");
+            await page.waitForTimeout(1500 * gateAttempt);
+            await page
+                .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+                .catch(() => undefined);
+            await page
+                .waitForSelector('auth-ssn-input, input[matinput], input.mat-mdc-input-element, input[type="password"]', { timeout: 30_000 })
+                .catch(() => undefined);
+            await settle(page, 2500);
+            ssnHost = await page.$('auth-ssn-input');
+        }
         if (!ssnHost) {
-            return { ok: false, signed, failed: [{ reason: "SSN field not found at auth" }] };
+            return { ok: false, signed, failed: [{ reason: "SSN field not found at auth (email/password gate persisted after retries)" }], skipped };
         }
         // Focus the inner masked input directly (the .hidden one is the
         // event-target; the .visible one is readonly and the outer host
@@ -241,7 +508,7 @@ export async function repReview(browser, input, parentLogger, jobId) {
         const dobSlashed = input.dob.replace(/-/g, "/");
         const dobInput = await page.$('auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])');
         if (!dobInput) {
-            return { ok: false, signed, failed: [{ reason: "DOB field not found at auth" }] };
+            return { ok: false, signed, failed: [{ reason: "DOB field not found at auth" }], skipped };
         }
         try {
             await dobInput.fill(dobSlashed, { force: true, timeout: 10_000 });
@@ -277,7 +544,7 @@ export async function repReview(browser, input, parentLogger, jobId) {
             'button.mat-flat-button.mat-primary',
         ]);
         if (!authBtn) {
-            return { ok: false, signed, failed: [{ reason: "LOGIN button not found at auth" }] };
+            return { ok: false, signed, failed: [{ reason: "LOGIN button not found at auth" }], skipped };
         }
         await Promise.all([
             page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => { }),
@@ -303,7 +570,11 @@ export async function repReview(browser, input, parentLogger, jobId) {
         for (let i = 0; i < totalIterations; i++) {
             try {
                 const result = await reviewOneCarrier(ctx, i, input);
-                if (result.ok) {
+                if (result.skipped) {
+                    // Withdrawn / structurally-unsignable — not a failure.
+                    skipped.push({ reason: result.skipReason || result.reason || "skipped" });
+                }
+                else if (result.ok) {
                     signed += 1;
                 }
                 else {
@@ -349,7 +620,13 @@ export async function repReview(browser, input, parentLogger, jobId) {
                 break;
             }
         }
-        return { ok: failed.length === 0 && signed > 0, signed, failed };
+        // A run is OK when there were no GENUINE failures and we either
+        // signed something or had only skips (all carriers withdrawn → a
+        // benign "nothing to sign", not a failure to retry/demote on).
+        // Genuine failures (browser crash, live-request PDF stall, carrier
+        // wizard red-notice) stay in `failed[]` and keep the run retryable.
+        const ok = failed.length === 0 && (signed > 0 || skipped.length > 0);
+        return { ok, signed, failed, skipped };
     }
     finally {
         await ctxBrowser.close().catch(() => { });
@@ -364,6 +641,43 @@ async function reviewOneCarrier(ctx, idx, input) {
     // on selectors that won't appear.
     await page.waitForTimeout(2000);
     const url = page.url();
+    // Withdrawn fast-path: when the agency has discarded this
+    // appointment-request, SureLC redirects the review link to
+    // /ar-review/appointment/<id>/withdrawn-request. No PDF/wizard will
+    // ever load. Detect the redirect up front and SKIP (not fail) before
+    // entering the 4-minute PDF budget — this is the dominant Phase-B
+    // churn source (stale follow-up emails point at discarded dupes).
+    if (/\/appointment\/[^/]+\/withdrawn-request/.test(url)) {
+        logger.info({ url }, "[Rep step6] appointment withdrawn by agency (URL redirect) — skipping");
+        await snapshot(ctx, `rep-carrier${idx}-withdrawn`);
+        return {
+            ok: false,
+            skipped: true,
+            skipReason: "appointment_withdrawn",
+            reason: `appointment_withdrawn (URL redirect to /withdrawn-request): ${url}`,
+        };
+    }
+    // No-states fast-path: when the appointment-request was created with
+    // NO licensing states attached (Fastlane state-checkbox sweep missed
+    // them for a sparse-license rep), SureLC redirects the review link to
+    // /ar-review/appointment/<id>/no-states and the welcome step shows a
+    // red "states required" notice the bot can't clear from rep data. The
+    // fix is the agency-admin PATCH that sets the appointment's states to
+    // the rep's resident state (/patch-appointments-to-resident-state),
+    // which the backoffice fires reactively. For that to work it needs an
+    // extractable appointment id and a distinct token to key on — emit
+    // both here, and bail before wasting the 4-minute PDF budget. This is
+    // a FAILURE (not a skip): the carrier can be signed once states are
+    // populated, so it should trigger the patch + targeted retry.
+    const noStatesMatch = url.match(/\/appointment\/([^/]+)\/no-states/);
+    if (noStatesMatch) {
+        logger.warn({ url, appointmentId: noStatesMatch[1] }, "[Rep step6] appointment has no licensing states (URL redirect to /no-states) — needs resident-state PATCH");
+        await snapshot(ctx, `rep-carrier${idx}-no-states`);
+        return {
+            ok: false,
+            reason: `appointment_no_states: the appointment-request has no licensing states attached, so the carrier wizard blocks on /no-states. Needs a resident-state PATCH. appointment/${noStatesMatch[1]} ${url}`,
+        };
+    }
     if (/\/appointment\/[^/]+\/reviewed/.test(url)) {
         // prefillOnly mode wants to walk EVERY carrier's wizard fresh —
         // SureLC sometimes redirects to /reviewed for in-progress
@@ -443,6 +757,18 @@ async function reviewOneCarrier(ctx, idx, input) {
     await fillCarrierProfileText(ctx, input.producerProfile);
     await page.waitForTimeout(800);
     await snapshot(ctx, `rep-carrier${idx}-step4-carrier-questions-answered`);
+    // Any "Yes" answer that demands a written description/attachment shows a
+    // red sb-info-message[action="Add"] card; SureLC blocks Review & Sign
+    // until each is filled via its ADD modal. This is the carrier-questions
+    // analog of the profile Questions explanation flow and the single
+    // biggest cause of disclosure-Yes reps stalling at Producer (2026-06-02).
+    try {
+        await fillCarrierQuestionExplanations(ctx, input, idx);
+        await page.waitForTimeout(600);
+    }
+    catch (err) {
+        ctx.logger.warn({ idx, err: err?.message }, "[Rep step4] fillCarrierQuestionExplanations threw (non-fatal)");
+    }
     await clickNextWhenEnabled(ctx);
     // Same wait pattern for step 5 — Questionnaire is another heavy
     // page transition; without networkidle the radios race the fill.
@@ -455,8 +781,62 @@ async function reviewOneCarrier(ctx, idx, input) {
     // disclosure, false everywhere else.
     const step5Filled = await fillRadiosByLabelLookup(page, "tf", input.disclosures);
     logger.info({ ...step5Filled }, "[Rep step5] questionnaire answered from disclosures");
+    // Compliance guard — every TRUE disclosure must have landed on a
+    // recognized question across Step 4 + Step 5. A true flag that matched
+    // NO label means this carrier words that question outside our patterns,
+    // so pickYnForLabel silently answered "No" — a false statement we must
+    // never sign. Route the carrier to a human instead (Foresters dropped
+    // Tamara Chinchilla's Yes answers this way, 2026-06-10). Clean reps (no
+    // true disclosures) are unaffected — automation proceeds exactly as
+    // before.
+    if (input.disclosures) {
+        // Biographical disclosures are NOT material adverse-event questions, so
+        // a carrier wizard that doesn't surface them must NOT hard-block the
+        // sign. "Have you ever used other names / aliases / DBAs" (q18) is
+        // biographical: the actual names are already captured on the producer
+        // profile + the SureLC questionnaire (priorFinancialNames), and many
+        // carriers don't ask it on their Step 4/5 wizard at all. Treating it
+        // like felony/fraud/bankruptcy needlessly stranded every alias-flagged
+        // rep at Producer (Julia Davis 2026-06-17 — 8 carriers blocked solely
+        // on q18_other_names). It is STILL answered "Yes" whenever a matching
+        // question appears (DISCLOSURE_LABEL_PATTERNS unchanged); it just no
+        // longer blocks when none does. All adverse disclosures (felony, fraud,
+        // bankruptcy, license/regulatory actions, judgments, E&O claims, etc.)
+        // remain strictly guarded exactly as before.
+        const NON_BLOCKING_BIOGRAPHICAL_KEYS = new Set(["q18_other_names"]);
+        const trueKeys = Object.entries(input.disclosures)
+            .filter(([k, v]) => v === true && !NON_BLOCKING_BIOGRAPHICAL_KEYS.has(k))
+            .map(([k]) => k);
+        const placed = new Set([
+            ...step4Filled.placedKeys,
+            ...step5Filled.placedKeys,
+        ]);
+        const unplaced = trueKeys.filter((k) => !placed.has(k));
+        if (unplaced.length > 0) {
+            await snapshot(ctx, `rep-carrier${idx}-disclosure-unplaced`);
+            logger.warn({ idx, unplaced, placed: [...placed] }, "[Rep] true disclosure(s) matched no carrier question — routing to human, not signing");
+            return {
+                ok: false,
+                reason: `Questionnaire disclosure(s) [${unplaced.join(", ")}] were flagged true at onboarding ` +
+                    `but matched NO question on this carrier's Step 4/5 wizard — the carrier likely phrases ` +
+                    `them outside the bot's label patterns, so they would be silently answered "No" (a false ` +
+                    `compliance statement). A human must answer this carrier's questionnaire by hand. Do NOT auto-sign.`,
+            };
+        }
+    }
     await page.waitForTimeout(800);
     await snapshot(ctx, `rep-carrier${idx}-step5-questionnaire-answered`);
+    // The Questionnaire step also shows red "ADD EXPLANATION" cards for any
+    // legitimately-Yes answer (e.g. the felony question, q1) — same
+    // sb-info-message component as step 4. Without filling them SureLC blocks
+    // Review & Sign (Jimenez Transamerica 2026-06-03). Reuse the same handler.
+    try {
+        await fillCarrierQuestionExplanations(ctx, input, idx);
+        await page.waitForTimeout(600);
+    }
+    catch (err) {
+        ctx.logger.warn({ idx, err: err?.message }, "[Rep step5] fillCarrierQuestionExplanations threw (non-fatal)");
+    }
     await clickNextWhenEnabled(ctx);
     // Pre-fill mode bails here. Steps 1-5 are auto-saved by SureLC on
     // each Next click, so when the rep returns via their email link
@@ -513,11 +893,14 @@ async function reviewOneCarrier(ctx, idx, input) {
         // rendering bugs. Surface this as its own reason so the
         // server-side orchestrator can skip-and-move-on instead of
         // patching state / retrying.
-        const isWithdrawn = /agency has withdrawn this request/i.test(bodyExcerpt) ||
+        const isWithdrawn = diag?.withdrawn === true ||
+            /agency has withdrawn this request/i.test(bodyExcerpt) ||
             /contact your agency for details/i.test(bodyExcerpt);
         if (isWithdrawn) {
             return {
                 ok: false,
+                skipped: true,
+                skipReason: "appointment_withdrawn",
                 reason: `appointment_withdrawn: the appointment-request was discarded by the agency before signing. The follow-up email the bot followed points at the withdrawn record; SureLC will issue a fresh email for the new appointment-request created by the most recent Phase A run. URL: ${url}`,
             };
         }
@@ -525,9 +908,26 @@ async function reviewOneCarrier(ctx, idx, input) {
             url.includes("/wizard/profile") ||
             /red\s*notice|required.*continue|invalid.*profile/i.test(errorsBlob);
         if (isWizardBlock) {
+            // Name the exact blocker instead of the generic "stuck on welcome".
+            // Two sources: (1) explanation cards fillCarrierQuestionExplanations
+            // couldn't satisfy (no pool entry / modal failed), (2) red required
+            // fields per wizard step from the PDF-viewer diag. This converts the
+            // reason into an actionable inventory for the admin / needs-human tab.
+            const unsatisfiedCards = (page._lastUnsatisfiedCards || []);
+            const redByStep = (Array.isArray(diag?.stepContents) ? diag.stepContents : [])
+                .filter((s) => Array.isArray(s?.redFields) && s.redFields.length)
+                .map((s) => `${s.stepLabel}: ${s.redFields.join("; ")}`);
+            const blockedOn = [
+                unsatisfiedCards.length
+                    ? `unsatisfiable carrier-question card(s): ${unsatisfiedCards.join(" || ")}`
+                    : "",
+                redByStep.length ? `red required fields → ${redByStep.join(" || ")}` : "",
+            ]
+                .filter(Boolean)
+                .join(". ");
             return {
                 ok: false,
-                reason: `Carrier wizard rejected the rep's profile (validation errors on ${url.split("/").pop() || "wizard step"}) — not a PDF issue. Diag: ${diagSummary}`,
+                reason: `Carrier wizard rejected the rep's profile on ${url.split("/").pop() || "wizard step"} — not a PDF issue.${blockedOn ? ` BLOCKED ON — ${blockedOn}.` : ""} Diag: ${diagSummary}`,
             };
         }
         return {
@@ -747,7 +1147,17 @@ async function fillCarrierProfileText(ctx, profile) {
     // profile doesn't carry — fill with "N/A" so the form validates.
     // Only touches invalid + empty fields — pre-filled inputs are not
     // overwritten.
-    const naFilled = await page.evaluate(() => {
+    const naFilled = await page.evaluate(({ email, phone }) => {
+        const setNative = (el, val) => {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
+            if (setter)
+                setter.call(el, val);
+            else
+                el.value = val;
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            el.dispatchEvent(new Event("blur", { bubbles: true }));
+        };
         const inputs = Array.from(document.querySelectorAll('input[matinput], input.mat-mdc-input-element'));
         let count = 0;
         for (const i of inputs) {
@@ -757,22 +1167,41 @@ async function fillCarrierProfileText(ctx, profile) {
                 continue;
             if (i.offsetParent === null)
                 continue;
-            const formField = i.closest("mat-form-field");
-            const isInvalid = formField?.classList.contains("mat-form-field-invalid") ||
-                formField?.classList.contains("ng-invalid") ||
+            const ff = i.closest("mat-form-field");
+            // Target both already-invalid AND required-but-empty fields:
+            // validation often hasn't fired yet on a freshly-loaded step, so
+            // required-empty is the reliable signal (Americo's phone +
+            // BENEFICIARY-email block step 4 this way — S.Way 2026-06-02).
+            const required = i.required ||
+                i.getAttribute("aria-required") === "true" ||
+                !!ff?.querySelector(".mat-mdc-form-field-required-marker, .mat-form-field-required-marker");
+            const invalid = ff?.classList.contains("mat-form-field-invalid") ||
                 i.classList.contains("ng-invalid");
-            if (!isInvalid)
+            if (!required && !invalid)
                 continue;
-            // Set + dispatch input event so Angular reactive form binds.
-            i.value = "N/A";
-            i.dispatchEvent(new Event("input", { bubbles: true }));
-            i.dispatchEvent(new Event("change", { bubbles: true }));
+            const hay = ((i.getAttribute("placeholder") || "") +
+                " " +
+                (i.getAttribute("name") || "") +
+                " " +
+                (i.getAttribute("formcontrolname") || "") +
+                " " +
+                (i.type || "") +
+                " " +
+                (ff?.textContent || "")).toLowerCase();
+            // Type-aware value: an email field needs a valid email (N/A fails
+            // validation), a phone field needs digits; everything else N/A.
+            let val = "N/A";
+            if (i.type === "email" || /e-?mail/.test(hay))
+                val = email || "agent@set4lifeagency.com";
+            else if (i.type === "tel" || /phone|cell|mobile|fax/.test(hay))
+                val = (phone || "0000000000").replace(/\D/g, "") || "0000000000";
+            setNative(i, val);
             count++;
         }
         return count;
-    });
+    }, { email: profile.email, phone: profile.cellPhone });
     if (naFilled > 0) {
-        logger.info({ naFilled }, "[Rep step4] filled required text fields with N/A fallback");
+        logger.info({ naFilled }, "[Rep step4] filled required text fields (type-aware email/phone/N-A)");
     }
     // Re-click any radio group still in `.question__select--invalid`
     // OR `mat-radio-group.ng-pristine` state. The Playwright click in
@@ -930,15 +1359,34 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
             const container = g.closest("sb-question, .wrap, mat-form-field, mat-card") || g.parentElement;
             const labelEl = container?.querySelector(".question__text, label.question__text, mat-label, label");
             const label = (labelEl?.textContent || "").trim().slice(0, 300);
-            out.push({ name, label });
+            const values = Array.from(g.querySelectorAll('input[type="radio"]')).map((i) => i.value);
+            out.push({ name, label, values });
         }
         return out;
     });
     let yes = 0;
     let no = 0;
-    for (const { name, label } of groups) {
+    // Disclosure keys we actually placed a "Yes" on (label recognized +
+    // committed). The caller diffs this against the rep's true flags to
+    // catch a disclosure that matched no on-screen question.
+    const placed = new Set();
+    for (const { name, label, values } of groups) {
         const ans = pickYnForLabel(label, disclosures);
-        const targetValue = ans === "Y" ? yesValue : noValue;
+        const placedKey = ans === "Y" ? disclosureKeyForLabel(label, disclosures) : null;
+        // Per-group value detection: a single wizard step can MIX schemes —
+        // carrier Y/N questions alongside background-disclosure questions
+        // rendered with value="true"/"false" on the SAME step (American
+        // Amicable & others put the felony/securities/sanction questions on
+        // step 4 with true/false radios, not Y/N). The page-level `scheme`
+        // is only a fallback hint; pick THIS group's actual yes/no value so a
+        // true/false disclosure question on a "yn" step still gets answered.
+        // Otherwise the click selector ([value="N"]) matches nothing, the
+        // question keeps its pre-set Yes, and its unsatisfiable explanation
+        // card strands the rep at Producer (Estell/Bates 2026-06-03 — 10
+        // disclosure groups on step 4 went unanswered, 8 stayed Yes).
+        const noVal = values.find((v) => /^(n|no|false|0)$/i.test(v)) ?? noValue;
+        const yesVal = values.find((v) => /^(y|yes|true|1)$/i.test(v)) ?? yesValue;
+        const targetValue = ans === "Y" ? yesVal : noVal;
         // Click the radio with matching value within this group. We do
         // this via Playwright's locator.click() — the previous host.click()
         // from page.evaluate fired a synthetic DOM event that Angular
@@ -959,46 +1407,49 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
         catch {
             /* fall back to JS click below */
         }
-        // Verify the model bound — Angular Material flips ng-pristine →
-        // ng-dirty when the value commits. If the group is still pristine
-        // OR still .question__select--invalid, retry once via JS click.
-        const stillInvalid = await page
-            .evaluate(({ groupName }) => {
-            const inputs = Array.from(document.querySelectorAll(`input[type="radio"][name="${groupName}"]`));
-            if (inputs.length === 0)
-                return true;
-            const group = inputs[0]?.closest("mat-radio-group");
-            if (!group)
-                return false;
-            return (group.classList.contains("ng-pristine") ||
-                group.classList.contains("ng-invalid") ||
-                group.classList.contains("question__select--invalid"));
-        }, { groupName: name })
-            .catch(() => false);
-        if (stillInvalid) {
-            const fallbackOk = await page
+        // Verify the TARGET value actually committed — not just that the
+        // group left ng-pristine. Angular Material commits a radio only on
+        // a <label> click; a Playwright pointer-click on the host or the
+        // hidden <input> can leave a question that was PRE-answered Yes
+        // (stored from an earlier run / carrier default) unchanged. That
+        // stranded the whole red-flag backlog: the regulatory "violation"
+        // questions stayed Yes, kept their red explanation card, and the
+        // carrier never reached Review & Sign (2026-06-02; verified by hand
+        // that input.click/host.click did NOT flip a stored Yes but
+        // label.click did). Re-click the matching radio's <label> until its
+        // native input reports checked.
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const committed = await page
                 .evaluate(({ groupName, value }) => {
                 const r = document.querySelector(`input[type="radio"][name="${groupName}"][value="${value}"]`);
-                if (!r)
-                    return false;
-                const host = r.closest("mat-radio-button");
-                if (host)
-                    host.click();
-                else
-                    r.click();
-                return true;
+                return !!r && r.checked;
             }, { groupName: name, value: targetValue })
                 .catch(() => false);
-            clicked = clicked || fallbackOk;
+            if (committed) {
+                clicked = true;
+                break;
+            }
+            await page
+                .evaluate(({ groupName, value }) => {
+                const r = document.querySelector(`input[type="radio"][name="${groupName}"][value="${value}"]`);
+                const host = r?.closest("mat-radio-button");
+                const label = host?.querySelector("label");
+                (label || host || r)?.click();
+            }, { groupName: name, value: targetValue })
+                .catch(() => undefined);
+            await page.waitForTimeout(300);
         }
         if (clicked) {
-            if (ans === "Y")
+            if (ans === "Y") {
                 yes++;
+                if (placedKey)
+                    placed.add(placedKey);
+            }
             else
                 no++;
         }
     }
-    return { answered: yes + no, yes, no };
+    return { answered: yes + no, yes, no, placedKeys: [...placed] };
 }
 /**
  * Click every Material radio with the given native value attribute.
