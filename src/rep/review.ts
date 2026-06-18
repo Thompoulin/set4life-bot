@@ -114,7 +114,23 @@ export interface RepReviewInput {
     q4_license_denied?: boolean
     q5_license_revoked?: boolean
     q6_insurer_terminated?: boolean
+    /**
+     * Bankruptcy is THREE distinct SureLC questions, not one:
+     *   Q15/Q15a — did YOU personally file/declare bankruptcy  → q7_bankruptcy_personal
+     *   Q15b      — did a brokerage FIRM you were associated with go bankrupt → q7_firm_bankruptcy
+     *   Q15c      — is the bankruptcy currently PENDING         → q7_bankruptcy_pending
+     * The old coarse `q7_bankruptcy` + /bankrupt/i pattern answered ALL of
+     * them "Yes" off a single personal-bankruptcy disclosure — a false
+     * statement on the firm + pending questions for anyone with a personal,
+     * discharged bankruptcy (Johnson 2026-06-18). `q7_bankruptcy` is retained
+     * as the legacy/back-compat synonym for the personal answer so older app
+     * payloads (which only send it) still answer Q15/Q15a correctly while the
+     * firm/pending questions correctly default No.
+     */
     q7_bankruptcy?: boolean
+    q7_bankruptcy_personal?: boolean
+    q7_firm_bankruptcy?: boolean
+    q7_bankruptcy_pending?: boolean
     q8_bond_denied?: boolean
     q9_unpaid_premiums?: boolean
     q10_fiduciary_breach?: boolean
@@ -177,8 +193,11 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
   { key: "q5_license_revoked", pattern: /licen[sc]e\s+(?:suspend|cancel|revok)/i },
   // Insurance company canceled your contract / terminated.
   { key: "q6_insurer_terminated", pattern: /(?:insurance\s+company|insurer)\s+(?:cancel|terminat).*(?:contract|appointment)/i },
-  // Bankruptcy.
-  { key: "q7_bankruptcy", pattern: /bankrupt/i },
+  // Bankruptcy — PERSONAL "filed/declared bankruptcy" (Q15/Q15a). The
+  // firm (Q15b) and pending (Q15c) variants are peeled off by explicit
+  // early-return branches in pickYnForLabel/disclosureKeyForLabel BEFORE
+  // this generic pattern runs, so they don't inherit the personal answer.
+  { key: "q7_bankruptcy_personal", pattern: /bankrupt/i },
   // Bond denied / surety refused.
   { key: "q8_bond_denied", pattern: /(?:bond|surety).*(?:denied|refused)/i },
   // Unpaid premiums / indebted to insurance company.
@@ -244,7 +263,7 @@ const ISSUING_COMPANY_PATTERN =
 const PRODUCT_OPT_IN_PATTERN =
   /will\s+you\s+be\s+selling\s+(?:final\s+expense|life|annuity|medicare|whole\s+life|term)\s+products?/i
 
-function pickYnForLabel(
+export function pickYnForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): "Y" | "N" {
@@ -277,8 +296,33 @@ function pickYnForLabel(
     return disclosures?.q3_securities_violation ? "Y" : "N"
   }
   if (!disclosures) return "N"
+  // Back-fill personal-bankruptcy from the legacy coarse flag so older app
+  // payloads (which only send q7_bankruptcy) still answer Q15/Q15a "Yes".
+  const d = {
+    ...disclosures,
+    q7_bankruptcy_personal:
+      disclosures.q7_bankruptcy_personal ?? disclosures.q7_bankruptcy,
+  }
+  // Bankruptcy is three separate questions; peel the firm + pending variants
+  // off BEFORE the generic /bankrupt/i pattern so they answer from their own
+  // flags instead of inheriting the personal answer.
+  // Q15b — a brokerage/insurance FIRM you were associated with went bankrupt.
+  // Distinguished from the Q15 parent ("...personally OR any...firm...") and
+  // Q15a ("personally filed...") by the ABSENCE of "personal" in the label.
+  if (
+    /(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
+    !/personal/i.test(label)
+  ) {
+    return d.q7_firm_bankruptcy ? "Y" : "N"
+  }
+  // Q15c — is the bankruptcy currently PENDING (a discharged bankruptcy is
+  // NOT pending; answering Yes here is both false and triggers an
+  // unsatisfiable explanation card).
+  if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
+    return d.q7_bankruptcy_pending ? "Y" : "N"
+  }
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-    if (pattern.test(label) && disclosures[key]) return "Y"
+    if (pattern.test(label) && d[key]) return "Y"
   }
   return "N"
 }
@@ -304,7 +348,7 @@ function pickYnForLabel(
  * Kept in lockstep with pickYnForLabel's disclosure branches above; any
  * change there must change here too.
  */
-function disclosureKeyForLabel(
+export function disclosureKeyForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): string | null {
@@ -316,8 +360,25 @@ function disclosureKeyForLabel(
   if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
     return disclosures.q3_securities_violation ? "q3_securities_violation" : null
   }
+  // Lockstep with pickYnForLabel's bankruptcy split: back-fill personal from
+  // the legacy flag, then peel firm (Q15b) + pending (Q15c) off before the
+  // generic /bankrupt/i loop so the coverage-audit signal stays correct.
+  const d = {
+    ...disclosures,
+    q7_bankruptcy_personal:
+      disclosures.q7_bankruptcy_personal ?? disclosures.q7_bankruptcy,
+  }
+  if (
+    /(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
+    !/personal/i.test(label)
+  ) {
+    return d.q7_firm_bankruptcy ? "q7_firm_bankruptcy" : null
+  }
+  if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
+    return d.q7_bankruptcy_pending ? "q7_bankruptcy_pending" : null
+  }
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-    if (pattern.test(label) && disclosures[key]) return key
+    if (pattern.test(label) && d[key]) return key
   }
   return null
 }
