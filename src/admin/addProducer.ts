@@ -131,9 +131,38 @@ export async function changeAffiliation(
     return false
   }
   await settle(page)
-  // AG Grid renders rows lazily as you scroll. Wait for at least one
-  // row to appear before we try to find ours; on cold load the grid is
-  // still rendering when we land.
+
+  // AG Grid is VIRTUALIZED — only rows currently in the viewport render.
+  // On the full unsearched list a producer whose row isn't in the initial
+  // render window is invisible to the row-id selector below, so
+  // changeAffiliation used to time out and bail with a FALSE
+  // "could not set affiliation" → needs_human. Gabriel Fernandez
+  // (producer 8890402) failed this way 6 days straight even though his
+  // "S4L LOA" affiliation was ALREADY set. Filter the grid to just this
+  // producer via the SEARCH BOX so the row is guaranteed to render. The
+  // box supports id ("Search by name, SSN, email, phone, id"); use it,
+  // NOT a `?search=` deep URL — that bounces straight to OAuth.
+  try {
+    const searchBox = await firstVisible(page, [
+      'input[placeholder*="Search by name"]',
+      'input[placeholder*="Search"]',
+    ])
+    if (searchBox) {
+      await (searchBox as any).click()
+      await (searchBox as any).press("Control+A").catch(() => {})
+      await (searchBox as any).press("Delete").catch(() => {})
+      await (searchBox as any).type(String(producerId), { delay: 20 })
+      await (searchBox as any).press("Enter").catch(() => {})
+      await settle(page)
+      await page.waitForTimeout(800)
+    } else {
+      logger.warn({ producerId }, "changeAffiliation: search box not found — falling back to full-list scan")
+    }
+  } catch (err: any) {
+    logger.warn({ err: err?.message }, "changeAffiliation: producer search failed — falling back to full-list scan")
+  }
+
+  // Wait for our (now-filtered) row to render before reading it.
   await page
     .waitForSelector(`[role="row"][row-id="${producerId}"]`, { timeout: 15_000 })
     .catch(() => {
