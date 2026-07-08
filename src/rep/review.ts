@@ -249,16 +249,19 @@ const ISSUING_COMPANY_PATTERN =
 
 /**
  * Issuing companies S4L is NOT contracted with, even when they ride
- * along on a bundled request. American Amicable's request bundles
- * Pioneer American Ins Co and Pioneer Security Life Ins Co as
- * issuing-company opt-ins, but S4L does not carry the Pioneer entities
- * (confirmed Ana + owner 2026-07-08) — the default "include everything"
- * YES wrongly opted agents into them. Answer NO for these specific
- * issuers; all other issuing companies still default YES (we contract
- * with the whole group on every other bundled carrier). Scoped to the
- * issuing-company branch below so it can't affect any other question.
+ * along on a bundled request. American Amicable's request bundles four
+ * issuing-company opt-ins; per Ana's authoritative screenshot of the
+ * correct application answers (2026-07-08), only Occidental Life of NC
+ * should be YES — Pioneer American, Pioneer Security, AND IA American
+ * Life must all be NO (S4L doesn't carry them). The default "include
+ * everything" YES wrongly opted agents into them. Answer NO for these
+ * specific issuers; all other issuing companies still default YES (we
+ * contract with the whole group on every other bundled carrier). Scoped
+ * to the issuing-company branch below so it can't affect any other
+ * question.
  */
-const NON_CONTRACTED_ISSUER_PATTERN = /pioneer\s+(?:american|security)/i
+const NON_CONTRACTED_ISSUER_PATTERN =
+  /pioneer\s+(?:american|security)|\bia\s+american/i
 
 /**
  * Affirmative product-line questions ("Will you be selling Final
