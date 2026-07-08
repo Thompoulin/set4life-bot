@@ -1106,9 +1106,25 @@ async function reviewOneCarrier(
     // longer blocks when none does. All adverse disclosures (felony, fraud,
     // bankruptcy, license/regulatory actions, judgments, E&O claims, etc.)
     // remain strictly guarded exactly as before.
-    const NON_BLOCKING_BIOGRAPHICAL_KEYS = new Set(["q18_other_names"])
+    // q19_irs_matters added 2026-07-08 (owner-approved, Option A): several
+    // carriers' wizards have NO IRS-matters question at all — verified
+    // American Amicable's full Step-4/5 question list (its only tax item is
+    // the "judgments / tax liens / bad debts / collections" question, which
+    // maps to q16 and is answered separately). When a carrier simply doesn't
+    // ask about IRS matters, there is nothing to answer, so leaving it
+    // unplaced is not a false statement and must not hard-block the sign
+    // (was stranding Claudia Martinez on AmAm 2026-07-07). It is STILL
+    // answered "Yes" whenever a matching IRS/tax-matter question appears
+    // (DISCLOSURE_LABEL_PATTERNS unchanged); it just no longer blocks when
+    // none does — same treatment as q18_other_names. All truly-adverse
+    // disclosures (felony, fraud, bankruptcy, license/regulatory actions,
+    // judgments/tax liens q16, E&O claims, etc.) remain strictly guarded.
+    const NON_BLOCKING_UNPLACED_KEYS = new Set([
+      "q18_other_names",
+      "q19_irs_matters",
+    ])
     const trueKeys = Object.entries(input.disclosures)
-      .filter(([k, v]) => v === true && !NON_BLOCKING_BIOGRAPHICAL_KEYS.has(k))
+      .filter(([k, v]) => v === true && !NON_BLOCKING_UNPLACED_KEYS.has(k))
       .map(([k]) => k)
     const placed = new Set<string>([
       ...step4Filled.placedKeys,
