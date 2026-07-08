@@ -1117,8 +1117,13 @@ async function reviewOneCarrier(
     const unplaced = trueKeys.filter((k) => !placed.has(k))
     if (unplaced.length > 0) {
       await snapshot(ctx, `rep-carrier${idx}-disclosure-unplaced`)
+      // Log the ACTUAL question labels this carrier surfaced so we can see
+      // how it worded the unmatched disclosure (e.g. the IRS/tax question)
+      // and widen the DISCLOSURE_LABEL_PATTERNS regex precisely — instead
+      // of guessing at synonyms on a compliance-sensitive question.
+      const seenLabels = [...step4Filled.labels, ...step5Filled.labels].filter(Boolean)
       logger.warn(
-        { idx, unplaced, placed: [...placed] },
+        { idx, unplaced, placed: [...placed], seenLabels },
         "[Rep] true disclosure(s) matched no carrier question — routing to human, not signing",
       )
       return {
@@ -1722,7 +1727,7 @@ async function fillRadiosByLabelLookup(
   page: Page,
   scheme: "yn" | "tf",
   disclosures: RepReviewInput["disclosures"] | undefined,
-): Promise<{ answered: number; yes: number; no: number; placedKeys: string[] }> {
+): Promise<{ answered: number; yes: number; no: number; placedKeys: string[]; labels: string[] }> {
   const yesValue = scheme === "yn" ? "Y" : "true"
   const noValue = scheme === "yn" ? "N" : "false"
 
@@ -1855,7 +1860,18 @@ async function fillRadiosByLabelLookup(
       } else no++
     }
   }
-  return { answered: yes + no, yes, no, placedKeys: [...placed] }
+  return {
+    answered: yes + no,
+    yes,
+    no,
+    placedKeys: [...placed],
+    // Raw question labels seen on this step — surfaced so the caller can
+    // log exactly how a carrier worded a question that matched no
+    // disclosure pattern (e.g. an IRS/tax question phrased outside the
+    // q19_irs_matters regex), which is what we need to widen the pattern
+    // safely instead of guessing.
+    labels: groups.map((g) => g.label).filter(Boolean),
+  }
 }
 
 /**
