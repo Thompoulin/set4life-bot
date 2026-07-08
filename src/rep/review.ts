@@ -248,6 +248,19 @@ const ISSUING_COMPANY_PATTERN =
   /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request|company\s+appointment\s+request)/i
 
 /**
+ * Issuing companies S4L is NOT contracted with, even when they ride
+ * along on a bundled request. American Amicable's request bundles
+ * Pioneer American Ins Co and Pioneer Security Life Ins Co as
+ * issuing-company opt-ins, but S4L does not carry the Pioneer entities
+ * (confirmed Ana + owner 2026-07-08) — the default "include everything"
+ * YES wrongly opted agents into them. Answer NO for these specific
+ * issuers; all other issuing companies still default YES (we contract
+ * with the whole group on every other bundled carrier). Scoped to the
+ * issuing-company branch below so it can't affect any other question.
+ */
+const NON_CONTRACTED_ISSUER_PATTERN = /pioneer\s+(?:american|security)/i
+
+/**
  * Affirmative product-line questions ("Will you be selling Final
  * Expense products through this Marketing Organization relationship?",
  * carrier-asked variants of "Will you sell <product> with us?", etc).
@@ -267,8 +280,13 @@ export function pickYnForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): "Y" | "N" {
-  // Carrier sub-opt-in always YES — rep wants the appointment included.
-  if (ISSUING_COMPANY_PATTERN.test(label)) return "Y"
+  // Carrier sub-opt-in defaults YES (rep wants the appointment included) —
+  // EXCEPT issuers we're not contracted with (e.g. the Pioneer entities
+  // bundled under American Amicable), which must be NO so we stop opting
+  // agents into carriers S4L doesn't carry.
+  if (ISSUING_COMPANY_PATTERN.test(label)) {
+    return NON_CONTRACTED_ISSUER_PATTERN.test(label) ? "N" : "Y"
+  }
   // Product-line opt-in always YES — Set4Life agents sell the
   // standard life portfolio (FE, Term, Whole Life, Annuity, etc).
   if (PRODUCT_OPT_IN_PATTERN.test(label)) return "Y"
