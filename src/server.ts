@@ -3,7 +3,7 @@ import { z } from "zod"
 import pino from "pino"
 import { runActivation, type RunActivationInput } from "./botRunner.js"
 import { captureBgaTokens } from "./bgaTokenCapture.js"
-import { CHROMIUM_ARGS } from "./browserArgs.js"
+import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
 
 const logger = pino({ name: "s4l-surelc-bot" })
 
@@ -355,10 +355,7 @@ app.post("/producer-appointments", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -457,10 +454,7 @@ app.post("/resend-rep-emails", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -583,10 +577,7 @@ app.post("/create-appointment-requests", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -794,10 +785,7 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -939,10 +927,7 @@ app.post("/diagnose-producer", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1042,10 +1027,7 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1168,10 +1150,7 @@ app.post("/set-producer-fields", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1273,10 +1252,7 @@ app.post("/set-producer-email", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1437,10 +1413,7 @@ app.post("/patch-appointments-to-resident-state", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1536,10 +1509,7 @@ app.post("/patch-appointment-email", async (req, res) => {
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
       const page = await ctx.newPage()
@@ -1668,10 +1638,7 @@ app.post("/fill-misc-via-wizard", async (req, res) => {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
     const { fillMiscWizard } = await import("./admin/fillMiscWizard.js")
-    const browser = await chromium.launch({
-      headless: true,
-      args: CHROMIUM_ARGS,
-    })
+    const browser = await launchChromium(logger)
     try {
       const ctx = await browser.newContext({
         viewport: { width: 1440, height: 900 },

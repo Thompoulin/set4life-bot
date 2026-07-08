@@ -44,7 +44,7 @@ import {
 } from "./admin/createRequest.js"
 import type { AdminReviewInput } from "./admin/processReview.js"
 import { repReview, type RepReviewInput } from "./rep/review.js"
-import { CHROMIUM_ARGS } from "./browserArgs.js"
+import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
 import { makeTabContext, type TabResult } from "./tabs/helpers.js"
 import { makeProgressReporter } from "./progressReporter.js"
 
@@ -138,19 +138,17 @@ export async function runActivation(
     input.phases ?? ["admin_setup", "rep_review", "admin_process"],
   )
 
-  const browser: Browser = await chromium.launch({
-    headless: true,
-    // --disable-blink-features=AutomationControlled stops Chrome from
-    // exposing the "I am being controlled by automation" signal that
-    // bot-detection scripts read from navigator.webdriver and the
-    // CDP client_id. Combined with the addInitScript on each context
-    // (sets navigator.webdriver = undefined before any page JS runs),
-    // this hides the most common Playwright fingerprints. Owner
-    // confirmed 2026-05-06 same credentials work fine in a real
-    // Chrome browser; only the bot bounces — strongest remaining
-    // suspect after UA cleanup is webdriver fingerprinting.
-    args: CHROMIUM_ARGS,
-  })
+  // CHROMIUM_ARGS includes --disable-blink-features=AutomationControlled,
+  // which stops Chrome from exposing the "I am being controlled by
+  // automation" signal that bot-detection scripts read from
+  // navigator.webdriver and the CDP client_id. Combined with the
+  // addInitScript on each context (sets navigator.webdriver = undefined
+  // before any page JS runs), this hides the most common Playwright
+  // fingerprints. Owner confirmed 2026-05-06 same credentials work fine
+  // in a real Chrome browser; only the bot bounces — strongest remaining
+  // suspect after UA cleanup is webdriver fingerprinting.
+  // launchChromium retries the intermittent SwiftShader SIGSEGV-on-launch.
+  const browser: Browser = await launchChromium(logger)
 
   const result: RunActivationResult = {
     success: true,

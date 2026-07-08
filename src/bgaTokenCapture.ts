@@ -15,7 +15,7 @@
  * until it eventually rotates, then re-runs this capture.
  */
 import { chromium, type Browser, type Page } from "playwright"
-import { CHROMIUM_ARGS } from "./browserArgs.js"
+import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
 import pino from "pino"
 
 export interface CaptureBgaTokensInput {
@@ -44,10 +44,7 @@ export async function captureBgaTokens(
   input: CaptureBgaTokensInput,
   logger: pino.Logger,
 ): Promise<CaptureBgaTokensResult> {
-  const browser: Browser = await chromium.launch({
-    headless: true,
-    args: CHROMIUM_ARGS,
-  })
+  const browser: Browser = await launchChromium(logger)
   const urlHistory: string[] = []
   try {
     const ctx = await browser.newContext({
