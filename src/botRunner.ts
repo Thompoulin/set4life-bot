@@ -518,9 +518,20 @@ export async function runActivation(
             const producerDisplayName = lastName && firstName
               ? `${lastName}, ${firstName}`
               : input.producer.lastName || ""
+            // Pass ONLY the agent's selected carriers to Fastlane so it
+            // adds exactly those and never "ADD ALL" (owner directive).
+            // input.contracting.carriers is the agent's selection from
+            // agent_carrier_contracting (built by the backoffice pipeline).
+            const selectedCarriers = (input.contracting?.carriers || [])
+              .map((c) => ({
+                carrierName: (c.carrierName || "").trim(),
+                carrierNaic: c.carrierNaic,
+              }))
+              .filter((c) => c.carrierName.length > 0)
             const r = await runFastlaneOneProducerManyCarriers(tabCtx, {
               producerDisplayName,
               producerId,
+              selectedCarriers,
             })
             adminPhase.contracting = {
               submitted: r.ok ? ["all-via-fastlane"] : [],

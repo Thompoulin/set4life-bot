@@ -10,9 +10,12 @@
  *
  *   1. Click "ONE PRODUCER → MULTIPLE CARRIERS" tile
  *   2. Producer screen — search for the rep by name, click SELECT
- *   3. Carriers screen — click ADD ALL (or per-carrier ADD if a subset
- *      is desired) so every Set4Life-active carrier ends up in the
- *      Selected column
+ *   3. Carriers screen — add ONLY the carriers the agent actually
+ *      selected (passed in `input.carriers`). NEVER "ADD ALL" — owner
+ *      directive: contract exactly the agent's selection, nothing more.
+ *      If the selection list is empty/missing we add NOTHING (safer to
+ *      add none than every carrier — the ADD-ALL bug once gave Gabriel
+ *      Fernandez 4 carriers he never picked).
  *   4. States screen — for each carrier, click DESELECT ALL is wrong;
  *      we want EVERY state checked. Default = all checked, so this
  *      step is mostly a no-op verification.
@@ -37,6 +40,35 @@ export interface FastlaneInput {
    * tooltip can't be captured. The bot opens a side-page on the
    * producer's profile and scrapes inline validation errors. */
   producerId?: string
+  /**
+   * The carriers the agent actually SELECTED (from
+   * agent_carrier_contracting). On the Carriers step we add ONLY
+   * these — never every available carrier. Each entry carries the
+   * on-screen SureLC carrier name (e.g. "Foresters - Independent
+   * Order Of", "Fidelity & Guaranty Life Insurance Company") and,
+   * when known, the SureLC carrier id / NAIC. Match by name first,
+   * then id as a fallback.
+   *
+   * If empty/undefined the Carriers step adds NOTHING and logs a
+   * warning (safer than the old ADD-ALL fallback which contracted
+   * carriers the agent never picked).
+   */
+  selectedCarriers?: Array<{ carrierName: string; carrierNaic?: string }>
+}
+
+/**
+ * Normalize a carrier name for fuzzy comparison: lowercase, strip
+ * punctuation/whitespace so "Fidelity & Guaranty Life Insurance
+ * Company" and "Fidelity and Guaranty Life Ins Co" have a chance of
+ * lining up on a substring test. We only use this for a loose contains
+ * check, never for equality.
+ */
+function normalizeCarrier(s: string): string {
+  return (s || "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
 }
 
 const FASTLANE_URL = "https://surelc.surancebay.com/bga/fastlane"
@@ -326,22 +358,52 @@ export async function runFastlaneOneProducerManyCarriers(
   await settle(page, 1500)
   await snapshot(ctx, "fastlane-03-step2-carriers")
 
-  // ── Step 2 — Carriers: click ADD ALL (puts every available carrier
-  //    into the Selected column).
-  const addAllBtn = await firstVisible(page, [
-    'button:has-text("ADD ALL")',
-    'button:has-text("Add All")',
-  ])
-  if (addAllBtn) {
-    try {
-      await addAllBtn.click()
-      await settle(page, 800)
-      logger.info("[Fastlane] clicked ADD ALL on carriers")
-    } catch {
-      /* ignore */
+  // ── Step 2 — Carriers: add ONLY the carriers the agent selected.
+  //
+  // Owner directive (general rule): NEVER "ADD ALL". Contract exactly
+  // the carriers passed in `input.selectedCarriers` (the agent's own
+  // selection from agent_carrier_contracting) — nothing more. The old
+  // ADD-ALL behavior gave Gabriel Fernandez 4 carriers (Corebridge,
+  // Occidental, American Amicable, NLG) he never picked.
+  //
+  // Each Fastlane carrier is a row in the "available" column with the
+  // on-screen carrier name and an individual ADD button. We locate the
+  // row for each selected carrier and click ITS ADD. Unselected
+  // carriers stay in the available column and are never contracted.
+  const selected = input.selectedCarriers ?? []
+  if (selected.length === 0) {
+    // Fail-safe: never fall back to ADD ALL. Adding none is strictly
+    // safer than adding every carrier — a missing/empty selection is a
+    // data problem upstream, not a reason to contract everything.
+    logger.warn(
+      "[Fastlane] no carriers in agent selection — adding NOTHING (refusing ADD ALL). Check that the pipeline sent contracting.carriers.",
+    )
+    await snapshot(ctx, "fastlane-04-carriers-no-selection")
+  } else {
+    const wanted = selected
+      .map((c) => (c.carrierName || "").trim())
+      .filter((n) => n.length > 0)
+    logger.info(
+      { wanted },
+      `[Fastlane] adding ONLY ${wanted.length} selected carrier(s) (no ADD ALL)`,
+    )
+    const added: string[] = []
+    const notFound: string[] = []
+    for (const c of selected) {
+      const name = (c.carrierName || "").trim()
+      if (!name) continue
+      const ok = await addSingleCarrier(ctx, name, c.carrierNaic)
+      if (ok) added.push(name)
+      else notFound.push(name)
+      await settle(page, 500)
     }
+    logger.info(
+      { added, notFound },
+      `[Fastlane] carrier selection done — added ${added.length}/${wanted.length}` +
+        (notFound.length ? `, could not find: ${notFound.join(", ")}` : ""),
+    )
+    await snapshot(ctx, "fastlane-04-carriers-after-add-selected")
   }
-  await snapshot(ctx, "fastlane-04-carriers-after-add-all")
   await clickNextSafe(ctx)
 
   // ── Step 3 — States: ensure every state checkbox is on for every
@@ -473,6 +535,144 @@ export async function runFastlaneOneProducerManyCarriers(
     ok: true,
     reason: "Submitted but no explicit confirmation marker matched; check evidence screenshots",
   }
+}
+
+/**
+ * Add ONE carrier on the Fastlane Carriers step by locating its row in
+ * the available-carriers list and clicking that row's individual ADD
+ * button (moving it into the Selected column). Never touches other
+ * carriers.
+ *
+ * Matching strategy (robust to naming drift between our DB and the
+ * on-screen SureLC label):
+ *   1. Exact substring on the carrier name.
+ *   2. Fuzzy: normalized (punct/case-insensitive) contains, using a
+ *      distinctive prefix of the name.
+ *   3. NAIC/carrier-id substring, if provided.
+ *
+ * Returns true if an ADD was clicked, false if the carrier row/button
+ * couldn't be found (caller logs it as not-found — we do NOT fall back
+ * to adding anything else).
+ */
+async function addSingleCarrier(
+  ctx: TabContext,
+  carrierName: string,
+  carrierNaic?: string,
+): Promise<boolean> {
+  const { page, logger } = ctx
+
+  // A Fastlane available-carrier entry is a list row containing the
+  // carrier's name text and an ADD button/icon. We don't assume a
+  // specific tag (SureLC has used <tr>, mat-list-item, and custom
+  // <bga-*> cards across builds), so we search by "some container that
+  // has the carrier name AND an ADD control" across a few likely
+  // wrappers, then click the ADD control inside it.
+  const containerSelectors = [
+    "mat-row",
+    "tr",
+    "mat-list-item",
+    ".viewport__item",
+    '[class*="carrier"]',
+    '[class*="row"]',
+    "li",
+  ]
+  const addSelectors = [
+    'button:has-text("ADD")',
+    'button:has-text("Add")',
+    'button[aria-label*="add" i]',
+    'mat-icon:has-text("add")',
+    'button:has(mat-icon:has-text("add"))',
+  ]
+
+  // Try exact name match first, then a fuzzy prefix, then NAIC.
+  const nameCandidates = [carrierName]
+  // A distinctive prefix (first 3 significant words) helps when the
+  // on-screen name has extra suffixes ("Insurance Company", "- Independent
+  // Order Of", etc.) our DB may abbreviate or omit.
+  const words = carrierName.split(/\s+/).filter(Boolean)
+  if (words.length > 3) nameCandidates.push(words.slice(0, 3).join(" "))
+  const targetNorm = normalizeCarrier(carrierName)
+
+  for (const container of containerSelectors) {
+    for (const nameFrag of nameCandidates) {
+      const rowSel = `${container}:has-text("${nameFrag.replace(/"/g, '\\"')}")`
+      let rows: any[] = []
+      try {
+        rows = await page.$$(rowSel)
+      } catch {
+        rows = []
+      }
+      for (const row of rows) {
+        // Guard against matching the "Selected" column or a header:
+        // require a normalized-name overlap so we don't add the wrong
+        // carrier when a fragment is ambiguous.
+        const rowText = await row
+          .evaluate((el: Element) => (el.textContent || "").trim())
+          .catch(() => "")
+        const rowNorm = normalizeCarrier(rowText)
+        const overlaps =
+          rowNorm.includes(targetNorm) ||
+          targetNorm.includes(rowNorm) ||
+          (words[0] && rowNorm.includes(normalizeCarrier(words[0])))
+        if (!overlaps) continue
+        for (const addSel of addSelectors) {
+          const addBtn = await row.$(addSel).catch(() => null)
+          if (addBtn) {
+            const visible = await addBtn.isVisible().catch(() => false)
+            if (!visible) continue
+            try {
+              await addBtn.click({ timeout: 3000 })
+              logger.info(
+                { carrierName, via: `${container} / ${addSel}` },
+                "[Fastlane] clicked ADD for selected carrier",
+              )
+              return true
+            } catch {
+              /* try next selector */
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // NAIC/carrier-id fallback — some builds render the carrier id in the
+  // row; search rows whose text contains it.
+  if (carrierNaic) {
+    for (const container of containerSelectors) {
+      let rows: any[] = []
+      try {
+        rows = await page.$$(
+          `${container}:has-text("${carrierNaic.replace(/"/g, '\\"')}")`,
+        )
+      } catch {
+        rows = []
+      }
+      for (const row of rows) {
+        for (const addSel of addSelectors) {
+          const addBtn = await row.$(addSel).catch(() => null)
+          if (addBtn && (await addBtn.isVisible().catch(() => false))) {
+            try {
+              await addBtn.click({ timeout: 3000 })
+              logger.info(
+                { carrierName, carrierNaic },
+                "[Fastlane] clicked ADD for selected carrier (matched by NAIC)",
+              )
+              return true
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+    }
+  }
+
+  logger.warn(
+    { carrierName, carrierNaic },
+    "[Fastlane] could not find ADD control for selected carrier",
+  )
+  return false
 }
 
 async function clickNextSafe(ctx: TabContext): Promise<void> {
