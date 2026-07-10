@@ -119,16 +119,36 @@ export async function addProducer(
  * `col-id="actions"` and contains an `<sb-dots-menu>` wrapping
  * `<button class="mat-mdc-menu-trigger">` with a `more_vert` icon.
  */
+/**
+ * Result of a changeAffiliation attempt.
+ *   ok=true              → affiliation is confirmed on the target (set now, or already set).
+ *   ok=false, unverified → we could NOT reach/verify the affiliation (list nav
+ *                          bounced, or the producer row never rendered). For an
+ *                          existing producer the affiliation is almost always
+ *                          already "S4L LOA", so admin_setup should PROCEED with
+ *                          a flag rather than bail on a flaky nav.
+ *   ok=false (no flag)   → we reached the row, affiliation is NOT the target, and
+ *                          we could not set it. This is a genuine wrong/unset
+ *                          affiliation — admin_setup must still BAIL.
+ */
+export interface ChangeAffiliationResult {
+  ok: boolean
+  unverified?: boolean
+}
+
 export async function changeAffiliation(
   ctx: TabContext,
   producerId: string,
   affiliationName: string,
-): Promise<boolean> {
+): Promise<ChangeAffiliationResult> {
   const { page, logger } = ctx
   const nav = await gotoBga(page, PRODUCERS_LIST_URL, logger)
   if (!nav.ok) {
-    logger.warn({ finalUrl: nav.finalUrl }, "changeAffiliation: list nav bounced after retries")
-    return false
+    logger.warn(
+      { finalUrl: nav.finalUrl },
+      "changeAffiliation: list nav bounced after retries — cannot verify affiliation; proceeding (existing producer likely already affiliated)",
+    )
+    return { ok: false, unverified: true }
   }
   await settle(page)
 
@@ -181,12 +201,15 @@ export async function changeAffiliation(
     .catch(() => "")
 
   if (!rowText) {
-    logger.warn({ producerId }, "changeAffiliation: row not found in list (no AG Grid match)")
-    return false
+    logger.warn(
+      { producerId },
+      "changeAffiliation: row never rendered — cannot verify affiliation; proceeding (existing producer likely already affiliated)",
+    )
+    return { ok: false, unverified: true }
   }
   if (rowText.toLowerCase().includes(affiliationName.toLowerCase())) {
     logger.info({ producerId, affiliationName }, "affiliation already set; no-op")
-    return true
+    return { ok: true }
   }
 
   // The actions kebab lives in `[col-id="actions"]` of the right-pinned
@@ -198,7 +221,7 @@ export async function changeAffiliation(
     .catch(() => null)
   if (!actionsBtn) {
     logger.warn({ producerId }, "changeAffiliation: actions button not found in AG Grid actions cell")
-    return false
+    return { ok: false }
   }
   await actionsBtn.click()
   await page.waitForTimeout(500)
@@ -216,7 +239,7 @@ export async function changeAffiliation(
   ])
   if (!change) {
     logger.warn({ producerId }, "changeAffiliation: 'Change Affiliation' menu item not found")
-    return false
+    return { ok: false }
   }
   await (change as any).click()
   await page.waitForTimeout(500)
@@ -238,7 +261,7 @@ export async function changeAffiliation(
   ])
   if (!affInput) {
     logger.warn({ producerId }, "changeAffiliation: autocomplete input not found in modal")
-    return false
+    return { ok: false }
   }
   try {
     await (affInput as any).click()
@@ -274,13 +297,13 @@ export async function changeAffiliation(
         "changeAffiliation: no matching mat-option for affiliation name",
       )
       await snapshot(ctx, "admin-affiliation-options-no-match")
-      return false
+      return { ok: false }
     }
     await opt.click()
     await page.waitForTimeout(400)
   } catch (err: any) {
     logger.warn({ err: err?.message }, "changeAffiliation: typeahead select failed")
-    return false
+    return { ok: false }
   }
 
   const apply = await firstVisible(page, [
@@ -293,7 +316,7 @@ export async function changeAffiliation(
   ])
   if (!apply) {
     logger.warn({ producerId }, "changeAffiliation: Apply button not found")
-    return false
+    return { ok: false }
   }
   // Apply is disabled until the autocomplete actually picked an option.
   // Catch the disabled state explicitly so we don't silently treat a
@@ -301,7 +324,7 @@ export async function changeAffiliation(
   const disabled = await (apply as any).getAttribute("disabled").catch(() => null)
   if (disabled !== null) {
     logger.warn({ producerId }, "changeAffiliation: Apply still disabled — autocomplete didn't register selection")
-    return false
+    return { ok: false }
   }
   await (apply as any).click()
   await settle(page, 1500)
@@ -311,7 +334,7 @@ export async function changeAffiliation(
   const navVerify = await gotoBga(page, PRODUCERS_LIST_URL, logger)
   if (!navVerify.ok) {
     logger.warn({ finalUrl: navVerify.finalUrl }, "changeAffiliation: verify nav bounced after retries")
-    return true // affiliation was set; treat as success even if we can't verify
+    return { ok: true } // affiliation was set; treat as success even if we can't verify
   }
   await settle(page)
   await page
@@ -323,5 +346,5 @@ export async function changeAffiliation(
       (els) => els.map((el) => (el as HTMLElement).innerText).join(" "),
     )
     .catch(() => "")
-  return after.toLowerCase().includes(affiliationName.toLowerCase())
+  return { ok: after.toLowerCase().includes(affiliationName.toLowerCase()) }
 }

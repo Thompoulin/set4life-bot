@@ -297,18 +297,24 @@ export async function runActivation(
         // list. If we can't set the affiliation, profile + Fastlane
         // can't run either — bail with `needs_human` so the timeline
         // surfaces a clear reason instead of 5 cascading tab failures.
-        let affOk = false
+        let affResult: { ok: boolean; unverified?: boolean } = { ok: false }
         try {
-          affOk = await changeAffiliation(
+          affResult = await changeAffiliation(
             tabCtx,
             producerId,
             input.producer.affiliationName,
           )
         } catch (err: any) {
+          // An unexpected throw is treated as a hard failure (bail) — we
+          // only proceed-anyway for the explicit "unverified" nav-bounce
+          // case that changeAffiliation returns deliberately.
           logger.warn({ err: err?.message }, "changeAffiliation threw")
-          affOk = false
+          affResult = { ok: false }
         }
-        if (!affOk) {
+        if (!affResult.ok && !affResult.unverified) {
+          // Reached the row, affiliation is NOT the target, and we could
+          // not set it — a genuine wrong/unset affiliation. Profile tabs
+          // bounce without affiliation, so bail with needs_human.
           logger.warn(
             { producerId, affiliation: input.producer.affiliationName },
             "changeAffiliation failed — bailing admin_setup before profile/contracting",
@@ -320,6 +326,20 @@ export async function runActivation(
             `Could not set affiliation "${input.producer.affiliationName}" on producer ${producerId}. ` +
             `BGA profile tabs are inaccessible without affiliation; admin must set it manually in SureLC, then re-run the bot.`
           return result
+        }
+        if (affResult.unverified) {
+          // Could NOT reach/verify affiliation (BGA list nav bounced or the
+          // producer row never rendered) — a flaky-nav case, NOT a confirmed
+          // wrong affiliation. Existing producers are almost always already
+          // "S4L LOA", so PROCEED to profile/contracting rather than bail on
+          // one bad nav (Elizabeth Sanchez 2026-07-10 was blocked here). We
+          // do NOT flag needs_human — that would suppress the daily retest —
+          // just log loudly. If affiliation genuinely wasn't set, the
+          // downstream tabs/Fastlane will surface it.
+          logger.warn(
+            { producerId, affiliation: input.producer.affiliationName },
+            "changeAffiliation UNVERIFIED (nav bounce / row not rendered) — proceeding to profile + contracting assuming the existing producer is already affiliated; verify in SureLC if downstream steps bounce",
+          )
         }
       } else {
         adminPhase.ok = false
