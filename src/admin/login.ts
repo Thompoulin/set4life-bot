@@ -53,11 +53,16 @@ export async function loginAdmin(
   creds: { email: string; password: string },
   logger: pino.Logger,
 ): Promise<LoginAdminResult> {
-  const MAX_LOGIN_ATTEMPTS = 4
+  // Bumped 4 → 8 (2026-07-10). The datacenter-IP bot-detection block is
+  // intermittent and clears on its own within a few tries; giving up at 4
+  // was stranding producers for a full day on what is almost always a
+  // transient wobble. More attempts + longer tail backoff rides out the
+  // throttle window instead.
+  const MAX_LOGIN_ATTEMPTS = 8
   // Backoff before attempt N (index = attempt number). Attempt 1 is
   // immediate; later attempts wait longer to ride out a throttle window
-  // without turning into a hammer.
-  const BACKOFF_MS = [0, 0, 4_000, 10_000, 20_000]
+  // without turning into a hammer. Tail extended for the extra attempts.
+  const BACKOFF_MS = [0, 0, 4_000, 10_000, 20_000, 30_000, 45_000, 60_000, 60_000]
   let lastReason: string | undefined
   for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
     if (attempt > 1) {
@@ -129,8 +134,11 @@ async function attemptLogin(
   }
   // Extra beat for Material to finish wiring up the input. Without it
   // isVisible() can race the form's slide-in animation and return false
-  // for an input that's already in the DOM.
-  await page.waitForTimeout(1_500)
+  // for an input that's already in the DOM. Bumped 1.5s → 3s (2026-07-10):
+  // on the datacenter IP the OAuth form's slide-in is noticeably slower
+  // than in a local browser, and 1.5s was still occasionally racing it
+  // ("email input invisible after wait").
+  await page.waitForTimeout(3_000)
 
   const emailSelectors = [
     'input[data-cy="email-input"]',
@@ -146,14 +154,22 @@ async function attemptLogin(
     'input[placeholder*="email" i]',
   ]
   let emailField = await firstVisible(page, emailSelectors)
-  if (!emailField) {
-    // Transient: form rendered (the formReady selector above matched in
-    // the DOM) but firstVisible() couldn't pin a visible field — often a
-    // mid-animation race or an off-screen Material wrapper. Reload once
-    // and retry. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
-    logger.warn({ url: page.url(), attempt }, "admin login: email input invisible after wait — reloading and retrying once")
+  // Transient: form rendered (the formReady selector above matched in the
+  // DOM) but firstVisible() couldn't pin a visible field — often a
+  // mid-animation race or an off-screen Material wrapper. Reload and retry
+  // in-attempt. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
+  // Bumped to TWO in-attempt reloads (2026-07-10): a single reload still
+  // occasionally landed on a not-yet-slid-in form, so give it one more
+  // fresh reload with a longer settle before burning the whole attempt.
+  const IN_ATTEMPT_RELOADS = 2
+  for (let reload = 1; !emailField && reload <= IN_ATTEMPT_RELOADS; reload++) {
+    logger.warn(
+      { url: page.url(), attempt, reload, of: IN_ATTEMPT_RELOADS },
+      "admin login: email input invisible after wait — reloading and retrying in-attempt",
+    )
     await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined)
-    await page.waitForTimeout(3_000)
+    // Longer settle on each successive reload (4s, then 6s).
+    await page.waitForTimeout(2_000 + reload * 2_000)
     emailField = await firstVisible(page, emailSelectors)
   }
   if (!emailField) {
@@ -222,6 +238,17 @@ async function attemptLogin(
     const fatal = errors.some((e) =>
       /invalid|incorrect|wrong|locked|disabled|mfa|verification|verify|two[-\s]?factor|authenticator/i.test(e),
     )
+    // Transient bounce (bot-detection block, not a real cred/MFA error):
+    // the page is now parked on the bounced OAuth authorize form. Don't
+    // leave the next attempt to start from that stale, half-submitted
+    // page — re-navigate fresh to the BGA entry URL so the wrapper's next
+    // attempt begins from a clean OAuth handshake (2026-07-10). Fatal
+    // failures skip this since the wrapper won't retry them anyway.
+    if (!fatal) {
+      await page
+        .goto(BGA_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch(() => undefined)
+    }
     return { ok: false, reason, fatal }
   }
 
