@@ -16,7 +16,14 @@
  */
 import { chromium, type Browser, type Page } from "playwright"
 import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
+import { tryReuseContext } from "./admin/sessionCache.js"
 import pino from "pino"
+
+const CAPTURE_CONTEXT_OPTIONS = {
+  viewport: { width: 1280, height: 900 },
+  userAgent:
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+}
 
 export interface CaptureBgaTokensInput {
   email: string
@@ -47,22 +54,50 @@ export async function captureBgaTokens(
   const browser: Browser = await launchChromium(logger)
   const urlHistory: string[] = []
   try {
-    const ctx = await browser.newContext({
-      viewport: { width: 1280, height: 900 },
-      userAgent:
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    const attachNavLogger = (page: Page) => {
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) {
+          const u = frame.url()
+          if (u && u !== "about:blank" && urlHistory[urlHistory.length - 1] !== u) {
+            urlHistory.push(u)
+            logger.info({ url: u }, "[bga-tokens] navigation")
+          }
+        }
+      })
+    }
+
+    // Reuse the cached admin session when one is valid — the SPA only needs
+    // to be authed for us to read its tokens; no fresh OAuth login needed.
+    // Falls through to the full capture-login below on any miss/failure.
+    const reused = await tryReuseContext(browser, input.email, logger, {
+      contextOptions: CAPTURE_CONTEXT_OPTIONS,
     })
-    const page = await ctx.newPage()
-    page.setDefaultTimeout(30_000)
-    page.on("framenavigated", (frame) => {
-      if (frame === page.mainFrame()) {
-        const u = frame.url()
-        if (u && u !== "about:blank" && urlHistory[urlHistory.length - 1] !== u) {
-          urlHistory.push(u)
-          logger.info({ url: u }, "[bga-tokens] navigation")
+    if (reused) {
+      attachNavLogger(reused.page)
+      await reused.page
+        .goto(ENTRY_URL, { waitUntil: "domcontentloaded", timeout: 45_000 })
+        .catch(() => undefined)
+      const reusedTokens = await waitForTokens(reused.page, logger)
+      if (reusedTokens.accessToken) {
+        return {
+          ok: true,
+          accessToken: reusedTokens.accessToken,
+          refreshToken: reusedTokens.refreshToken,
+          expiresAt: readJwtExpiry(reusedTokens.accessToken),
+          storageKeys: reusedTokens.keys,
+          finalUrl: reused.page.url(),
+          urlHistory,
         }
       }
-    })
+      // Cached session didn't yield tokens — discard it and do a full login.
+      logger.warn("[bga-tokens] cached session yielded no tokens — full capture login")
+      await reused.context.close().catch(() => undefined)
+    }
+
+    const ctx = await browser.newContext(CAPTURE_CONTEXT_OPTIONS)
+    const page = await ctx.newPage()
+    page.setDefaultTimeout(30_000)
+    attachNavLogger(page)
 
     logger.info({ url: ENTRY_URL }, "[bga-tokens] navigating to entry URL")
     await page.goto(ENTRY_URL, { waitUntil: "domcontentloaded", timeout: 45_000 })

@@ -4,6 +4,7 @@ import pino from "pino"
 import { runActivation, type RunActivationInput } from "./botRunner.js"
 import { captureBgaTokens } from "./bgaTokenCapture.js"
 import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
+import { getAuthenticatedPage } from "./admin/sessionCache.js"
 
 const logger = pino({ name: "s4l-surelc-bot" })
 
@@ -357,11 +358,13 @@ app.post("/producer-appointments", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res
           .status(502)
           .json({ ok: false, error: loginResult.reason || "admin login failed" })
@@ -456,11 +459,13 @@ app.post("/resend-rep-emails", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
       }
       let bearer = ""
@@ -579,11 +584,13 @@ app.post("/create-appointment-requests", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
       }
       let bearer = ""
@@ -787,11 +794,13 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
       }
       let bearer = ""
@@ -929,11 +938,13 @@ app.post("/diagnose-producer", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const lr = await loginAdmin(page, adminCreds, logger)
-      if (!lr.ok) {
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok) {
         return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
       }
       let bearer = ""
@@ -1029,11 +1040,13 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const lr = await loginAdmin(page, adminCreds, logger)
-      if (!lr.ok) return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok) return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
       let bearer = ""
       page.on("request", (req) => {
         const a = req.headers()["authorization"]
@@ -1152,11 +1165,13 @@ app.post("/set-producer-fields", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const lr = await loginAdmin(page, adminCreds, logger)
-      if (!lr.ok) {
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok) {
         return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
       }
       let bearer = ""
@@ -1254,11 +1269,13 @@ app.post("/set-producer-email", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" })
       }
       let bearer = ""
@@ -1415,11 +1432,13 @@ app.post("/patch-appointments-to-resident-state", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const lr = await loginAdmin(page, adminCreds, logger)
-      if (!lr.ok) return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok) return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
       let bearer = ""
       const handler = (req: any) => {
         const a = req.headers()["authorization"]
@@ -1511,11 +1530,13 @@ app.post("/patch-appointment-email", async (req, res) => {
     const { loginAdmin } = await import("./admin/login.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const lr = await loginAdmin(page, adminCreds, logger)
-      if (!lr.ok)
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok)
         return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" })
       let bearer = ""
       const handler = (req: any) => {
@@ -1640,13 +1661,13 @@ app.post("/fill-misc-via-wizard", async (req, res) => {
     const { fillMiscWizard } = await import("./admin/fillMiscWizard.js")
     const browser = await launchChromium(logger)
     try {
-      const ctx = await browser.newContext({
-        viewport: { width: 1440, height: 900 },
-      })
-      const page = await ctx.newPage()
-      page.setDefaultTimeout(30_000)
-      const loginResult = await loginAdmin(page, adminCreds, logger)
-      if (!loginResult.ok) {
+      const { page, loginResult } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1440, height: 900 } } },
+      )
+      if (loginResult && !loginResult.ok) {
         return res
           .status(502)
           .json({ ok: false, error: loginResult.reason || "admin login failed" })

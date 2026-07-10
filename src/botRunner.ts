@@ -35,7 +35,7 @@ import { promises as fs } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 
-import { loginAdmin } from "./admin/login.js"
+import { getAuthenticatedPage } from "./admin/sessionCache.js"
 import { addProducer, changeAffiliation, type AddProducerInput } from "./admin/addProducer.js"
 import { fillFullProfile, type ProfileFillInput } from "./admin/fillProfile.js"
 import {
@@ -186,61 +186,75 @@ export async function runActivation(
         "phaseA_admin_login",
         "Logging into SureLC BGA admin",
       )
-      const ctxBrowser = await browser.newContext({
-        viewport: { width: 1280, height: 900 },
-        // Standard Chrome 124 / Linux UA. Previously we appended
-        // "Set4LifeBot" to make our outbound traffic identifiable in
-        // SureLC's logs, but that was a giant "I am a bot, please
-        // block me" flag — owner-confirmed 2026-05-06 the SureLC
-        // OAuth portal accepts the login (which is also the path
-        // most-likely to be UA-checked) but every admin page (like
-        // /bga/producers) bounces back to OAuth on the very first
-        // navigation. Account has no MFA and works flawlessly
-        // manually with the same credentials, so the only meaningful
-        // remaining difference between manual + bot is the bot
-        // identifier in the User-Agent. Drop it.
-        userAgent:
-          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      })
-      // Hide navigator.webdriver before any SureLC page JS reads it.
-      // I removed this 2026-05-06 thinking it was crashing pages,
-      // but the post-removal run revealed the bot was getting
-      // bounced to the OAuth login page on every tab navigation
-      // (diagnostic showed 'visible buttons: FORGOT PASSWORD? |
-      // LOGIN'). Tab navigation worked one run earlier WHEN this
-      // override was active. Restore the minimal version (just the
-      // webdriver flag — drop the plugins/languages/window.chrome
-      // patches that may have been the actual crash source). Owner-
-      // confirmed: same credentials manually open every page fine,
-      // so SureLC's auth guard is reading webdriver=true and
-      // refusing the session for admin pages.
-      await ctxBrowser.addInitScript(() => {
-        try {
-          Object.defineProperty(Navigator.prototype, "webdriver", {
-            get: () => undefined,
-            configurable: true,
-          })
-        } catch {
-          /* property already locked; best-effort */
-        }
-      })
-      const page = await ctxBrowser.newPage()
-      page.setDefaultTimeout(30_000)
+      // Reuse a cached authenticated BGA session when one is valid, only
+      // doing a full OAuth login (loginAdmin) when the cache is missing /
+      // expired / rejected. getAuthenticatedPage owns the fail-safe fallback:
+      // any uncertainty on the reuse path drops through to a normal login, so
+      // this is never worse than logging in every time (which is what we did
+      // before). Context options below are passed through verbatim.
+      const { context: ctxBrowser, page, reused, loginResult } =
+        await getAuthenticatedPage(browser, input.adminCreds, logger, {
+          contextOptions: {
+            viewport: { width: 1280, height: 900 },
+            // Standard Chrome 124 / Linux UA. Previously we appended
+            // "Set4LifeBot" to make our outbound traffic identifiable in
+            // SureLC's logs, but that was a giant "I am a bot, please
+            // block me" flag — owner-confirmed 2026-05-06 the SureLC
+            // OAuth portal accepts the login (which is also the path
+            // most-likely to be UA-checked) but every admin page (like
+            // /bga/producers) bounces back to OAuth on the very first
+            // navigation. Account has no MFA and works flawlessly
+            // manually with the same credentials, so the only meaningful
+            // remaining difference between manual + bot is the bot
+            // identifier in the User-Agent. Drop it.
+            userAgent:
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          },
+          // Hide navigator.webdriver before any SureLC page JS reads it.
+          // I removed this 2026-05-06 thinking it was crashing pages,
+          // but the post-removal run revealed the bot was getting
+          // bounced to the OAuth login page on every tab navigation
+          // (diagnostic showed 'visible buttons: FORGOT PASSWORD? |
+          // LOGIN'). Tab navigation worked one run earlier WHEN this
+          // override was active. Restore the minimal version (just the
+          // webdriver flag — drop the plugins/languages/window.chrome
+          // patches that may have been the actual crash source). Owner-
+          // confirmed: same credentials manually open every page fine,
+          // so SureLC's auth guard is reading webdriver=true and
+          // refusing the session for admin pages.
+          initScripts: [
+            () => {
+              try {
+                Object.defineProperty(Navigator.prototype, "webdriver", {
+                  get: () => undefined,
+                  configurable: true,
+                })
+              } catch {
+                /* property already locked; best-effort */
+              }
+            },
+          ],
+        })
       const tabCtx = makeTabContext(page, logger, input.jobId)
 
-      const loginResult = await loginAdmin(page, input.adminCreds, logger)
+      // reused === true means a valid cached session was verified authed and
+      // NO OAuth login ran; loginResult is only present when we actually
+      // logged in, so preserve the exact fatal/reason handling from before.
+      const loginOk = reused || !!loginResult?.ok
       await finishLogin({
-        ok: loginResult.ok,
-        msg: loginResult.ok
-          ? "Logged in"
-          : loginResult.reason
+        ok: loginOk,
+        msg: loginOk
+          ? reused
+            ? "Logged in (reused session)"
+            : "Logged in"
+          : loginResult?.reason
             ? `Login failed — ${loginResult.reason}`
             : "Login failed — check credentials",
       })
-      if (!loginResult.ok) {
+      if (!loginOk) {
         result.success = false
         result.stage = "admin_login_failed"
-        result.needsHumanReason = loginResult.reason ?? "admin BGA login failed"
+        result.needsHumanReason = loginResult?.reason ?? "admin BGA login failed"
         await ctxBrowser.close().catch(() => {})
         return finalize(result, evidenceDir, [...tabCtx.evidenceFiles])
       }
