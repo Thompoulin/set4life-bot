@@ -57,6 +57,19 @@ const EXPIRY_SKEW_MS = 60_000
  *  reuse a dead session for long. */
 const FALLBACK_TTL_MS = 8 * 60_000
 
+/** Kill switch (2026-07-12): when BOT_DISABLE_SESSION_CACHE is set we NEVER
+ *  reuse a cached session — always do a fresh loginAdmin, exactly like the
+ *  pre-2026-07-10 behavior. The 2026-07-10 session-cache change broke
+ *  admin_setup fleet-wide (52 agents): a reused session passed
+ *  verifyAuthenticated AND add_producer, but bounced the affiliation /
+ *  profile AG-Grid navigation and threw — because Playwright's storageState
+ *  snapshots cookies + localStorage but NOT sessionStorage, which the SPA
+ *  needs for in-app routing. Flip this env var on the dyno to recover
+ *  immediately; no code redeploy needed to toggle it back. */
+const SESSION_CACHE_DISABLED =
+  process.env.BOT_DISABLE_SESSION_CACHE === "1" ||
+  process.env.BOT_DISABLE_SESSION_CACHE === "true"
+
 /** Options passed through to browser.newContext(), plus an optional list of
  *  init scripts (botRunner hides navigator.webdriver via addInitScript). */
 export interface AuthContextOptions {
@@ -105,6 +118,7 @@ export async function getAuthenticatedPage(
   // invalidate/refresh can't tear it mid-check.
   const snapshot = cached
   if (
+    !SESSION_CACHE_DISABLED &&
     snapshot &&
     snapshot.email === adminCreds.email &&
     Date.now() < snapshot.expiresAt - EXPIRY_SKEW_MS
@@ -152,7 +166,7 @@ export async function getAuthenticatedPage(
   const page = await context.newPage()
   page.setDefaultTimeout(timeout)
   const loginResult = await loginAdmin(page, adminCreds, logger)
-  if (loginResult.ok) {
+  if (loginResult.ok && !SESSION_CACHE_DISABLED) {
     try {
       const storageState = await context.storageState()
       cached = {
@@ -199,6 +213,7 @@ export async function tryReuseContext(
 ): Promise<{ context: BrowserContext; page: Page } | null> {
   const snapshot = cached
   if (
+    SESSION_CACHE_DISABLED ||
     !snapshot ||
     snapshot.email !== email ||
     Date.now() >= snapshot.expiresAt - EXPIRY_SKEW_MS
