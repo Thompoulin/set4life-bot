@@ -542,6 +542,18 @@ export async function gotoBga(
     .cookies()
     .then((cs) => cs.map((c) => `${c.domain}:${c.name}`))
     .catch(() => [] as string[])
+  // DIAGNOSTIC (2026-07-12): capture the bounce page's title + visible text so
+  // we can tell a bot-detection CHALLENGE (Datadome/PerimeterX/"verify you're
+  // human") apart from a plain SureLC login form. Distinguishes datacenter-IP
+  // bot-blocking from a session-not-carried flow issue.
+  const pageContent = await page
+    .evaluate(() => ({
+      title: document.title,
+      bodyText: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 600),
+      hasEmailInput: !!document.querySelector('input[type="email"],input[data-cy="email-input"]'),
+      hasPasswordInput: !!document.querySelector('input[type="password"]'),
+    }))
+    .catch(() => ({ title: "(unreadable)", bodyText: "", hasEmailInput: false, hasPasswordInput: false }))
   logger.warn(
     {
       target: targetUrl,
@@ -549,6 +561,9 @@ export async function gotoBga(
       localStorageKeys: diag.localKeys,
       sessionStorageKeys: diag.sessionKeys,
       cookieNames,
+      pageTitle: pageContent.title,
+      pageBodyText: pageContent.bodyText,
+      looksLikeLoginForm: pageContent.hasEmailInput && pageContent.hasPasswordInput,
     },
     "gotoBga: all strategies bounced; session diagnostic dump",
   )
