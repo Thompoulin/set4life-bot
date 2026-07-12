@@ -793,6 +793,14 @@ export async function runActivation(
   } catch (err: any) {
     result.success = false
     result.error = err?.message || "orchestrator threw"
+    // DIAGNOSTIC (2026-07-12): the fleet-wide admin_setup bail leaves stage
+    // "launched" with no reason in the timeline — the throw escapes every
+    // inner handler. Log the message + stack at error level so the exact
+    // throwing operation shows in `dokku logs s4l-surelc-bot`.
+    logger.error(
+      { err: err?.message, stack: err?.stack, stage: result.stage, producerId: result.producerId },
+      "orchestrator threw — admin_setup bailed to outer catch",
+    )
     return finalize(result, evidenceDir, result.evidenceFiles)
   } finally {
     await browser.close().catch(() => {})
