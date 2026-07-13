@@ -744,14 +744,32 @@ export async function repReview(
     // manually 2026-06-03; the 2nd open reliably gave SSN/DOB). Without
     // this the run no-ops on the email-skew/bypass path.
     let ssnHost = await page.$('auth-ssn-input')
-    for (let gateAttempt = 1; gateAttempt <= 3 && !ssnHost; gateAttempt++) {
+    for (let gateAttempt = 1; gateAttempt <= 6 && !ssnHost; gateAttempt++) {
       logger.warn(
         { gateAttempt, url: page.url() },
-        "[Rep auth] SSN/DOB gate not present (email/password gate?) — re-navigating review URL",
+        "[Rep auth] SSN/DOB gate not present — re-triggering OAuth (empty authorize shell / email-password skew)",
       )
-      await page.waitForTimeout(1500 * gateAttempt)
+      await page.waitForTimeout(2000 * gateAttempt)
+      // The SureLC OAuth authorize page (accounts.surancebay.com) sometimes
+      // renders an EMPTY Angular shell — 0 inputs, no auth-ssn-input — for a
+      // fresh context (observed 2026-07-13, Elizabeth: a later retry rendered
+      // the gate fine and signing succeeded). A plain goto() back to the same
+      // review URL can be treated as a no-op by the browser, so alternate a
+      // full reload() to force the SPA to re-bootstrap.
+      if (gateAttempt % 2 === 0) {
+        await page
+          .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
+          .catch(() => undefined)
+      } else {
+        await page
+          .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+          .catch(() => undefined)
+      }
+      // Let the OAuth bundle finish loading before deciding the gate is
+      // absent — the authorize page needs the network to settle before the
+      // SSN component mounts.
       await page
-        .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+        .waitForLoadState("networkidle", { timeout: 20_000 })
         .catch(() => undefined)
       await page
         .waitForSelector(

@@ -42,8 +42,11 @@ const DISCLOSURE_LABEL_PATTERNS = [
     { key: "q5_license_revoked", pattern: /licen[sc]e\s+(?:suspend|cancel|revok)/i },
     // Insurance company canceled your contract / terminated.
     { key: "q6_insurer_terminated", pattern: /(?:insurance\s+company|insurer)\s+(?:cancel|terminat).*(?:contract|appointment)/i },
-    // Bankruptcy.
-    { key: "q7_bankruptcy", pattern: /bankrupt/i },
+    // Bankruptcy — PERSONAL "filed/declared bankruptcy" (Q15/Q15a). The
+    // firm (Q15b) and pending (Q15c) variants are peeled off by explicit
+    // early-return branches in pickYnForLabel/disclosureKeyForLabel BEFORE
+    // this generic pattern runs, so they don't inherit the personal answer.
+    { key: "q7_bankruptcy_personal", pattern: /bankrupt/i },
     // Bond denied / surety refused.
     { key: "q8_bond_denied", pattern: /(?:bond|surety).*(?:denied|refused)/i },
     // Unpaid premiums / indebted to insurance company.
@@ -91,6 +94,20 @@ const DISCLOSURE_LABEL_PATTERNS = [
  */
 const ISSUING_COMPANY_PATTERN = /(?:select\s+yes\s+to\s+include|issuing\s+company|include\s+this\s+(?:carrier|entity).*?with\s+this\s+request|company\s+appointment\s+request)/i;
 /**
+ * Issuing companies S4L is NOT contracted with, even when they ride
+ * along on a bundled request. American Amicable's request bundles four
+ * issuing-company opt-ins; per Ana's authoritative screenshot of the
+ * correct application answers (2026-07-08), only Occidental Life of NC
+ * should be YES — Pioneer American, Pioneer Security, AND IA American
+ * Life must all be NO (S4L doesn't carry them). The default "include
+ * everything" YES wrongly opted agents into them. Answer NO for these
+ * specific issuers; all other issuing companies still default YES (we
+ * contract with the whole group on every other bundled carrier). Scoped
+ * to the issuing-company branch below so it can't affect any other
+ * question.
+ */
+const NON_CONTRACTED_ISSUER_PATTERN = /pioneer\s+(?:american|security)|\bia\s+american/i;
+/**
  * Affirmative product-line questions ("Will you be selling Final
  * Expense products through this Marketing Organization relationship?",
  * carrier-asked variants of "Will you sell <product> with us?", etc).
@@ -104,10 +121,14 @@ const ISSUING_COMPANY_PATTERN = /(?:select\s+yes\s+to\s+include|issuing\s+compan
  * correctly.
  */
 const PRODUCT_OPT_IN_PATTERN = /will\s+you\s+be\s+selling\s+(?:final\s+expense|life|annuity|medicare|whole\s+life|term)\s+products?/i;
-function pickYnForLabel(label, disclosures) {
-    // Carrier sub-opt-in always YES — rep wants the appointment included.
-    if (ISSUING_COMPANY_PATTERN.test(label))
-        return "Y";
+export function pickYnForLabel(label, disclosures) {
+    // Carrier sub-opt-in defaults YES (rep wants the appointment included) —
+    // EXCEPT issuers we're not contracted with (e.g. the Pioneer entities
+    // bundled under American Amicable), which must be NO so we stop opting
+    // agents into carriers S4L doesn't carry.
+    if (ISSUING_COMPANY_PATTERN.test(label)) {
+        return NON_CONTRACTED_ISSUER_PATTERN.test(label) ? "N" : "Y";
+    }
     // Product-line opt-in always YES — Set4Life agents sell the
     // standard life portfolio (FE, Term, Whole Life, Annuity, etc).
     if (PRODUCT_OPT_IN_PATTERN.test(label))
@@ -137,8 +158,30 @@ function pickYnForLabel(label, disclosures) {
     }
     if (!disclosures)
         return "N";
+    // Back-fill personal-bankruptcy from the legacy coarse flag so older app
+    // payloads (which only send q7_bankruptcy) still answer Q15/Q15a "Yes".
+    const d = {
+        ...disclosures,
+        q7_bankruptcy_personal: disclosures.q7_bankruptcy_personal ?? disclosures.q7_bankruptcy,
+    };
+    // Bankruptcy is three separate questions; peel the firm + pending variants
+    // off BEFORE the generic /bankrupt/i pattern so they answer from their own
+    // flags instead of inheriting the personal answer.
+    // Q15b — a brokerage/insurance FIRM you were associated with went bankrupt.
+    // Distinguished from the Q15 parent ("...personally OR any...firm...") and
+    // Q15a ("personally filed...") by the ABSENCE of "personal" in the label.
+    if (/(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
+        !/personal/i.test(label)) {
+        return d.q7_firm_bankruptcy ? "Y" : "N";
+    }
+    // Q15c — is the bankruptcy currently PENDING (a discharged bankruptcy is
+    // NOT pending; answering Yes here is both false and triggers an
+    // unsatisfiable explanation card).
+    if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
+        return d.q7_bankruptcy_pending ? "Y" : "N";
+    }
     for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-        if (pattern.test(label) && disclosures[key])
+        if (pattern.test(label) && d[key])
             return "Y";
     }
     return "N";
@@ -164,7 +207,7 @@ function pickYnForLabel(label, disclosures) {
  * Kept in lockstep with pickYnForLabel's disclosure branches above; any
  * change there must change here too.
  */
-function disclosureKeyForLabel(label, disclosures) {
+export function disclosureKeyForLabel(label, disclosures) {
     if (!disclosures)
         return null;
     if (ISSUING_COMPANY_PATTERN.test(label))
@@ -176,8 +219,22 @@ function disclosureKeyForLabel(label, disclosures) {
     if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
         return disclosures.q3_securities_violation ? "q3_securities_violation" : null;
     }
+    // Lockstep with pickYnForLabel's bankruptcy split: back-fill personal from
+    // the legacy flag, then peel firm (Q15b) + pending (Q15c) off before the
+    // generic /bankrupt/i loop so the coverage-audit signal stays correct.
+    const d = {
+        ...disclosures,
+        q7_bankruptcy_personal: disclosures.q7_bankruptcy_personal ?? disclosures.q7_bankruptcy,
+    };
+    if (/(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
+        !/personal/i.test(label)) {
+        return d.q7_firm_bankruptcy ? "q7_firm_bankruptcy" : null;
+    }
+    if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
+        return d.q7_bankruptcy_pending ? "q7_bankruptcy_pending" : null;
+    }
     for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-        if (pattern.test(label) && disclosures[key])
+        if (pattern.test(label) && d[key])
             return key;
     }
     return null;
@@ -462,11 +519,30 @@ export async function repReview(browser, input, parentLogger, jobId) {
         // manually 2026-06-03; the 2nd open reliably gave SSN/DOB). Without
         // this the run no-ops on the email-skew/bypass path.
         let ssnHost = await page.$('auth-ssn-input');
-        for (let gateAttempt = 1; gateAttempt <= 3 && !ssnHost; gateAttempt++) {
-            logger.warn({ gateAttempt, url: page.url() }, "[Rep auth] SSN/DOB gate not present (email/password gate?) — re-navigating review URL");
-            await page.waitForTimeout(1500 * gateAttempt);
+        for (let gateAttempt = 1; gateAttempt <= 6 && !ssnHost; gateAttempt++) {
+            logger.warn({ gateAttempt, url: page.url() }, "[Rep auth] SSN/DOB gate not present — re-triggering OAuth (empty authorize shell / email-password skew)");
+            await page.waitForTimeout(2000 * gateAttempt);
+            // The SureLC OAuth authorize page (accounts.surancebay.com) sometimes
+            // renders an EMPTY Angular shell — 0 inputs, no auth-ssn-input — for a
+            // fresh context (observed 2026-07-13, Elizabeth: a later retry rendered
+            // the gate fine and signing succeeded). A plain goto() back to the same
+            // review URL can be treated as a no-op by the browser, so alternate a
+            // full reload() to force the SPA to re-bootstrap.
+            if (gateAttempt % 2 === 0) {
+                await page
+                    .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
+                    .catch(() => undefined);
+            }
+            else {
+                await page
+                    .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+                    .catch(() => undefined);
+            }
+            // Let the OAuth bundle finish loading before deciding the gate is
+            // absent — the authorize page needs the network to settle before the
+            // SSN component mounts.
             await page
-                .goto(input.reviewUrl, { waitUntil: "domcontentloaded", timeout: 60_000 })
+                .waitForLoadState("networkidle", { timeout: 20_000 })
                 .catch(() => undefined);
             await page
                 .waitForSelector('auth-ssn-input, input[matinput], input.mat-mdc-input-element, input[type="password"]', { timeout: 30_000 })
@@ -803,9 +879,25 @@ async function reviewOneCarrier(ctx, idx, input) {
         // longer blocks when none does. All adverse disclosures (felony, fraud,
         // bankruptcy, license/regulatory actions, judgments, E&O claims, etc.)
         // remain strictly guarded exactly as before.
-        const NON_BLOCKING_BIOGRAPHICAL_KEYS = new Set(["q18_other_names"]);
+        // q19_irs_matters added 2026-07-08 (owner-approved, Option A): several
+        // carriers' wizards have NO IRS-matters question at all — verified
+        // American Amicable's full Step-4/5 question list (its only tax item is
+        // the "judgments / tax liens / bad debts / collections" question, which
+        // maps to q16 and is answered separately). When a carrier simply doesn't
+        // ask about IRS matters, there is nothing to answer, so leaving it
+        // unplaced is not a false statement and must not hard-block the sign
+        // (was stranding Claudia Martinez on AmAm 2026-07-07). It is STILL
+        // answered "Yes" whenever a matching IRS/tax-matter question appears
+        // (DISCLOSURE_LABEL_PATTERNS unchanged); it just no longer blocks when
+        // none does — same treatment as q18_other_names. All truly-adverse
+        // disclosures (felony, fraud, bankruptcy, license/regulatory actions,
+        // judgments/tax liens q16, E&O claims, etc.) remain strictly guarded.
+        const NON_BLOCKING_UNPLACED_KEYS = new Set([
+            "q18_other_names",
+            "q19_irs_matters",
+        ]);
         const trueKeys = Object.entries(input.disclosures)
-            .filter(([k, v]) => v === true && !NON_BLOCKING_BIOGRAPHICAL_KEYS.has(k))
+            .filter(([k, v]) => v === true && !NON_BLOCKING_UNPLACED_KEYS.has(k))
             .map(([k]) => k);
         const placed = new Set([
             ...step4Filled.placedKeys,
@@ -814,7 +906,12 @@ async function reviewOneCarrier(ctx, idx, input) {
         const unplaced = trueKeys.filter((k) => !placed.has(k));
         if (unplaced.length > 0) {
             await snapshot(ctx, `rep-carrier${idx}-disclosure-unplaced`);
-            logger.warn({ idx, unplaced, placed: [...placed] }, "[Rep] true disclosure(s) matched no carrier question — routing to human, not signing");
+            // Log the ACTUAL question labels this carrier surfaced so we can see
+            // how it worded the unmatched disclosure (e.g. the IRS/tax question)
+            // and widen the DISCLOSURE_LABEL_PATTERNS regex precisely — instead
+            // of guessing at synonyms on a compliance-sensitive question.
+            const seenLabels = [...step4Filled.labels, ...step5Filled.labels].filter(Boolean);
+            logger.warn({ idx, unplaced, placed: [...placed], seenLabels }, "[Rep] true disclosure(s) matched no carrier question — routing to human, not signing");
             return {
                 ok: false,
                 reason: `Questionnaire disclosure(s) [${unplaced.join(", ")}] were flagged true at onboarding ` +
@@ -1449,7 +1546,18 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
                 no++;
         }
     }
-    return { answered: yes + no, yes, no, placedKeys: [...placed] };
+    return {
+        answered: yes + no,
+        yes,
+        no,
+        placedKeys: [...placed],
+        // Raw question labels seen on this step — surfaced so the caller can
+        // log exactly how a carrier worded a question that matched no
+        // disclosure pattern (e.g. an IRS/tax question phrased outside the
+        // q19_irs_matters regex), which is what we need to widen the pattern
+        // safely instead of guessing.
+        labels: groups.map((g) => g.label).filter(Boolean),
+    };
 }
 /**
  * Click every Material radio with the given native value attribute.
