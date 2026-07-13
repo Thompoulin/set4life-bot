@@ -561,37 +561,88 @@ async function addSingleCarrier(
 ): Promise<boolean> {
   const { page, logger } = ctx
 
-  // A Fastlane available-carrier entry is a list row containing the
-  // carrier's name text and an ADD button/icon. We don't assume a
-  // specific tag (SureLC has used <tr>, mat-list-item, and custom
-  // <bga-*> cards across builds), so we search by "some container that
-  // has the carrier name AND an ADD control" across a few likely
-  // wrappers, then click the ADD control inside it.
-  const containerSelectors = [
-    "mat-row",
-    "tr",
-    "mat-list-item",
-    ".viewport__item",
-    '[class*="carrier"]',
-    '[class*="row"]',
-    "li",
-  ]
-  const addSelectors = [
-    'button:has-text("ADD")',
-    'button:has-text("Add")',
-    'button[aria-label*="add" i]',
-    'mat-icon:has-text("add")',
-    'button:has(mat-icon:has-text("add"))',
-  ]
+  // SureLC's Fastlane "Step 2 — Carriers" (2026-07 rebuild) renders each
+  // available carrier as:
+  //   <div class="items__item item" id="item-<NAIC>">
+  //     <div class="item__left">
+  //       <div class="item__line1">Carrier Name</div> …
+  //     </div>
+  //     <button class="item__select-button">ADD</button>
+  //   </div>
+  // The prior markup this bot scanned (mat-row / tr / mat-list-item /
+  // [class*="row"]) is GONE — none of those match `div.items__item.item`,
+  // so the old code silently added 0 carriers, left NEXT disabled, and
+  // stalled every activation at admin_setup_partial fleet-wide (2026-07-10
+  // onward). Two robust locators now:
+  //   1. `#item-<NAIC>` — the row id carries the carrier's NAIC. Exact,
+  //      language/label-proof. Primary path.
+  //   2. Carrier-name text inside `.items__item` / `.item`. Fallback.
+  // Adding a carrier moves its row into the Selected column and swaps
+  // ADD→REMOVE, so we only ever click a button whose text is ADD.
 
-  // Try exact name match first, then a fuzzy prefix, then NAIC.
+  const clickAddInRow = async (row: any, via: string): Promise<boolean> => {
+    await row.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => undefined)
+    const addSelectors = [
+      'button.item__select-button:has-text("ADD")',
+      'button.item__select-button',
+      'button:has-text("ADD")',
+      'button:has-text("Add")',
+      'button[aria-label*="add" i]',
+      'button:has(mat-icon:has-text("add"))',
+    ]
+    for (const addSel of addSelectors) {
+      const addBtn = await row.$(addSel).catch(() => null)
+      if (!addBtn) continue
+      if (!(await addBtn.isVisible().catch(() => false))) continue
+      // Never click a REMOVE control (an already-selected row reuses the
+      // same button class with different text).
+      const btnText = (
+        await addBtn
+          .evaluate((el: Element) => (el.textContent || "").trim())
+          .catch(() => "")
+      ).toUpperCase()
+      if (btnText.includes("REMOVE")) continue
+      try {
+        await addBtn.click({ timeout: 3000 })
+        logger.info(
+          { carrierName, via: `${via} / ${addSel}` },
+          "[Fastlane] clicked ADD for selected carrier",
+        )
+        await settle(page, 400)
+        return true
+      } catch {
+        /* try next selector */
+      }
+    }
+    return false
+  }
+
+  // ── Primary: NAIC row id (#item-<naic>) ──
+  const naic = (carrierNaic || "").trim()
+  if (/^\d+$/.test(naic)) {
+    const row = await page.$(`#item-${naic}`).catch(() => null)
+    if (row && (await clickAddInRow(row, `#item-${naic}`))) return true
+  }
+
+  // ── Fallback: match the row by carrier-name text ──
   const nameCandidates = [carrierName]
   // A distinctive prefix (first 3 significant words) helps when the
-  // on-screen name has extra suffixes ("Insurance Company", "- Independent
-  // Order Of", etc.) our DB may abbreviate or omit.
+  // on-screen name has extra suffixes our DB may abbreviate or omit.
   const words = carrierName.split(/\s+/).filter(Boolean)
   if (words.length > 3) nameCandidates.push(words.slice(0, 3).join(" "))
   const targetNorm = normalizeCarrier(carrierName)
+
+  const containerSelectors = [
+    ".items__item",
+    ".item",
+    '[id^="item-"]',
+    "mat-row",
+    "tr",
+    "mat-list-item",
+    "li",
+    '[class*="carrier"]',
+    '[class*="row"]',
+  ]
 
   for (const container of containerSelectors) {
     for (const nameFrag of nameCandidates) {
@@ -615,55 +666,12 @@ async function addSingleCarrier(
           targetNorm.includes(rowNorm) ||
           (words[0] && rowNorm.includes(normalizeCarrier(words[0])))
         if (!overlaps) continue
-        for (const addSel of addSelectors) {
-          const addBtn = await row.$(addSel).catch(() => null)
-          if (addBtn) {
-            const visible = await addBtn.isVisible().catch(() => false)
-            if (!visible) continue
-            try {
-              await addBtn.click({ timeout: 3000 })
-              logger.info(
-                { carrierName, via: `${container} / ${addSel}` },
-                "[Fastlane] clicked ADD for selected carrier",
-              )
-              return true
-            } catch {
-              /* try next selector */
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // NAIC/carrier-id fallback — some builds render the carrier id in the
-  // row; search rows whose text contains it.
-  if (carrierNaic) {
-    for (const container of containerSelectors) {
-      let rows: any[] = []
-      try {
-        rows = await page.$$(
-          `${container}:has-text("${carrierNaic.replace(/"/g, '\\"')}")`,
-        )
-      } catch {
-        rows = []
-      }
-      for (const row of rows) {
-        for (const addSel of addSelectors) {
-          const addBtn = await row.$(addSel).catch(() => null)
-          if (addBtn && (await addBtn.isVisible().catch(() => false))) {
-            try {
-              await addBtn.click({ timeout: 3000 })
-              logger.info(
-                { carrierName, carrierNaic },
-                "[Fastlane] clicked ADD for selected carrier (matched by NAIC)",
-              )
-              return true
-            } catch {
-              /* ignore */
-            }
-          }
-        }
+        // Skip a row already in the Selected column.
+        const cls = await row
+          .evaluate((el: Element) => (el as HTMLElement).className || "")
+          .catch(() => "")
+        if (/\bselected\b/.test(cls)) continue
+        if (await clickAddInRow(row, container)) return true
       }
     }
   }
