@@ -432,6 +432,56 @@ export async function gotoBga(
     /* malformed current URL; ignore */
   }
 
+  // ── Attempt 0: CLICK the real in-app nav link (navigate like a human) ──
+  // The BGA SPA keeps its auth session in memory. A cold/hard page-load of a
+  // deep /bga route — and, since ~2026-07-10, a synthetic pushState the
+  // router no longer honors — both bounce to /oauth/authorize. Confirmed
+  // with the owner 2026-07-13: pasting `/bga/producers` into the address bar
+  // logs even a human out, but CLICKING "Producers" inside the app works,
+  // because a real click is client-side Angular routing that keeps the
+  // session. So we now navigate the way a human does. This is robust to the
+  // SureLC app/router (or Chromium) change that broke the old pushState hack;
+  // the pushState + hard-nav attempts below remain as fallbacks.
+  try {
+    const seg = targetPathOnly.split("/").filter(Boolean).pop() || ""
+    if (seg) {
+      const label = seg.charAt(0).toUpperCase() + seg.slice(1) // producers → Producers
+      const candidates = [
+        page.locator(`a[href$="/${seg}"]`).first(),
+        page.locator(`a[href*="/${seg}"]`).first(),
+        page.locator(`[routerlink*="${seg}"]`).first(),
+        page.getByRole("link", { name: new RegExp(`^${label}s?$`, "i") }).first(),
+        page.getByRole("button", { name: new RegExp(`^${label}s?$`, "i") }).first(),
+      ]
+      for (const loc of candidates) {
+        const found = await loc.count().catch(() => 0)
+        if (!found) continue
+        await loc.click({ timeout: 4_000 }).catch(() => {})
+        await page.waitForTimeout(1_200)
+        await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {})
+        let here = ""
+        try {
+          here = new URL(page.url()).pathname
+        } catch {
+          /* malformed */
+        }
+        if (here === targetPathOnly || here.startsWith(`${targetPathOnly}/`)) {
+          logger.info({ targetUrl }, "gotoBga: in-app nav-link click succeeded")
+          return { ok: true }
+        }
+      }
+      logger.warn(
+        { target: targetUrl },
+        "gotoBga: no in-app nav link matched (or click didn't land); falling back to pushState/hard-nav",
+      )
+    }
+  } catch (err: any) {
+    logger.warn(
+      { err: err?.message, target: targetUrl },
+      "gotoBga: nav-link click attempt threw; falling back",
+    )
+  }
+
   // ── Attempt 1: in-SPA navigation via History API ────────────────
   // Only works if we're already on a logged-in /bga/* page (same origin
   // as the target); cross-origin pushState would throw a SecurityError.
