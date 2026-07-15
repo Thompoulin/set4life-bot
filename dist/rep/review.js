@@ -947,7 +947,28 @@ async function reviewOneCarrier(ctx, idx, input) {
     // Step 6 — Review & Sign: PDF viewer renders, then Apply My
     // Signature button enables once the rep has scrolled to the bottom.
     await snapshot(ctx, `rep-carrier${idx}-step6-review-loading`);
-    const pdfReady = await waitForPdfViewer(page);
+    let pdfReady = await waitForPdfViewer(page);
+    if (!pdfReady) {
+        // SureLC's OAuth has been dropping the session mid-signing lately: the
+        // review page bounces to accounts.surancebay.com/oauth/authorize during
+        // the PDF wait, so the viewer "never loads" (surfaced as the generic PDF
+        // error with an OAuth URL in the diag). Reloading the CURRENT signing page
+        // re-establishes the session in place (keeps this carrier's wizard
+        // context, unlike re-navigating to the review URL) — retry the wait once
+        // before giving up.
+        const bounceUrl = String(page._lastPdfDiag?.url || page.url());
+        if (/accounts\.surancebay\.com\/oauth|\/oauth\/authorize/i.test(bounceUrl)) {
+            logger.warn({ bounceUrl }, "[Rep step6] PDF wait bounced to OAuth — reloading to re-establish session, retrying once");
+            await page
+                .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
+                .catch(() => undefined);
+            await page
+                .waitForLoadState("networkidle", { timeout: 20_000 })
+                .catch(() => undefined);
+            await settle(page, 2500);
+            pdfReady = await waitForPdfViewer(page);
+        }
+    }
     if (!pdfReady) {
         const diag = page._lastPdfDiag;
         const diagSummary = diag
