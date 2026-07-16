@@ -945,6 +945,80 @@ export async function repReview(
   }
 }
 
+// Fill SureLC's rep SSN/DOB auth gate and click LOGIN. Assumes the
+// auth-ssn-input gate is already present on the page. Mirrors the inline
+// Step-0 auth fill; used by the Step-6 OAuth-bounce recovery to
+// re-authenticate IN PLACE when SureLC drops the ar-review session
+// mid-wizard (that bounce re-renders this same SSN/DOB gate). Returns
+// {ok:false, reason} if a required field/button is missing.
+async function fillRepAuthGate(
+  ctx: TabContext,
+  ssnLast6: string,
+  dob: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  const { page } = ctx
+  const ssnFocused = await page
+    .evaluate(() => {
+      const el = document.querySelector(
+        "auth-ssn-input input.hidden, auth-ssn-input input:not([readonly])",
+      ) as HTMLInputElement | null
+      if (!el) return false
+      el.focus()
+      return true
+    })
+    .catch(() => false)
+  if (!ssnFocused) {
+    const host = await page.$("auth-ssn-input")
+    await host?.click().catch(() => undefined)
+  }
+  await page.waitForTimeout(300)
+  await page.keyboard.type(ssnLast6, { delay: 100 })
+  await page.waitForTimeout(500)
+
+  const dobSlashed = dob.replace(/-/g, "/")
+  const dobInput = await page.$(
+    'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
+  )
+  if (!dobInput) return { ok: false, reason: "DOB field not found at re-auth" }
+  try {
+    await (dobInput as any).fill(dobSlashed, { force: true, timeout: 10_000 })
+  } catch {
+    await page.evaluate((val: string) => {
+      const el = document.querySelector(
+        'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
+      ) as HTMLInputElement | null
+      if (!el) return
+      const proto = Object.getPrototypeOf(el)
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set
+      setter?.call(el, val)
+      el.dispatchEvent(new Event("input", { bubbles: true }))
+      el.dispatchEvent(new Event("change", { bubbles: true }))
+      el.dispatchEvent(new Event("blur", { bubbles: true }))
+    }, dobSlashed)
+  }
+  await page.keyboard.press("Tab").catch(() => undefined)
+  await page.waitForTimeout(500)
+
+  const authBtn = await firstVisible(page, [
+    'button:has-text("LOGIN")',
+    'button:has-text("Login")',
+    'button:has-text("Sign In")',
+    'button:has-text("Authenticate")',
+    'button:has-text("Verify")',
+    'button:has-text("Continue")',
+    'button:has-text("Submit")',
+    'button[type="submit"]',
+    'button.mat-flat-button.mat-primary',
+  ])
+  if (!authBtn) return { ok: false, reason: "LOGIN button not found at re-auth" }
+  await Promise.all([
+    page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {}),
+    authBtn.click(),
+  ])
+  await settle(page, 3000)
+  return { ok: true }
+}
+
 async function reviewOneCarrier(
   ctx: TabContext,
   idx: number,
@@ -1227,27 +1301,57 @@ async function reviewOneCarrier(
   await snapshot(ctx, `rep-carrier${idx}-step6-review-loading`)
   let pdfReady = await waitForPdfViewer(page)
   if (!pdfReady) {
-    // SureLC's OAuth has been dropping the session mid-signing lately: the
-    // review page bounces to accounts.surancebay.com/oauth/authorize during
-    // the PDF wait, so the viewer "never loads" (surfaced as the generic PDF
-    // error with an OAuth URL in the diag). Reloading the CURRENT signing page
-    // re-establishes the session in place (keeps this carrier's wizard
-    // context, unlike re-navigating to the review URL) — retry the wait once
-    // before giving up.
+    // The ar-review OAuth session drops mid-wizard, so the signing page
+    // bounces to accounts.surancebay.com/oauth/authorize during the PDF wait
+    // and the viewer "never loads" (surfaced as the generic PDF error with an
+    // OAuth URL in the diag). This is the real cause of the recurring "PDF
+    // viewer did not load" — a BOT bug, not SureLC instability: that OAuth
+    // page re-renders the rep SSN/DOB gate, and the previous recovery just
+    // reload()'d it, which re-lands on the login gate WITHOUT re-entering
+    // credentials, so the PDF never appears. Correct recovery: re-authenticate
+    // in place (fill SSN/DOB + LOGIN), let OAuth redirect back to the
+    // appointment (SureLC persists wizard progress server-side, so it resumes
+    // at the furthest step), then retry the PDF wait.
     const bounceUrl = String((page as any)._lastPdfDiag?.url || page.url())
     if (/accounts\.surancebay\.com\/oauth|\/oauth\/authorize/i.test(bounceUrl)) {
       logger.warn(
         { bounceUrl },
-        "[Rep step6] PDF wait bounced to OAuth — reloading to re-establish session, retrying once",
+        "[Rep step6] PDF wait bounced to OAuth — re-authenticating rep in place, retrying once",
       )
+      // Wait for the SSN/DOB gate to mount on the OAuth authorize page.
       await page
-        .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
-        .catch(() => undefined)
-      await page
-        .waitForLoadState("networkidle", { timeout: 20_000 })
+        .waitForSelector('auth-ssn-input, input.mat-mdc-input-element', {
+          timeout: 30_000,
+        })
         .catch(() => undefined)
       await settle(page, 2500)
-      pdfReady = await waitForPdfViewer(page)
+      if (await page.$("auth-ssn-input")) {
+        const reauth = await fillRepAuthGate(ctx, input.ssnLast6, input.dob)
+        if (reauth.ok) {
+          // OAuth redirected back into the appointment. Re-accept the policy
+          // gate if it's shown again, then retry the PDF wait — SureLC resumes
+          // the wizard at the furthest persisted step (i.e. review & sign).
+          await acceptPoliciesIfShown(page).catch(() => undefined)
+          await settle(page, 2500)
+          pdfReady = await waitForPdfViewer(page)
+        } else {
+          logger.warn(
+            { reason: reauth.reason },
+            "[Rep step6] re-auth after OAuth bounce failed",
+          )
+        }
+      } else {
+        // No SSN/DOB gate rendered (empty OAuth shell) — fall back to the old
+        // reload so we at least retry rather than bailing outright.
+        await page
+          .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
+          .catch(() => undefined)
+        await page
+          .waitForLoadState("networkidle", { timeout: 20_000 })
+          .catch(() => undefined)
+        await settle(page, 2500)
+        pdfReady = await waitForPdfViewer(page)
+      }
     }
   }
   if (!pdfReady) {
