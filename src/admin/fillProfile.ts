@@ -2454,27 +2454,44 @@ async function fillEno(
   // silently no-op'd because the inputs didn't exist yet, then let the
   // bot navigate away with empty required fields and trigger SureLC's
   // "Invalid Information Detected" modal on the next tab.
-  let uploaded = false
-  const uploadBtn = await firstVisible(page, [
+  // July-2026 SureLC rebuild: the E&O upload affordance is now an ICON-ONLY
+  // Material button (a `publish` mat-icon ligature inside button.message__button)
+  // — no "UPLOAD"/"Browse" text anywhere. The old selector list missed it, so
+  // the bot fell back to stuffing the hidden Angular file input directly; the
+  // page then showed "Processing… / Uploading the file…" forever because
+  // SureLC's uploader keys off ITS OWN filechooser event, not a raw input
+  // change (verified from the Destiney Hall run snapshots, 2026-07-21 —
+  // stage 1 spinner never completed across two 300s runs). Clicking the real
+  // button + answering the filechooser is the only path that works on the
+  // rebuilt UI, so it's now first in the list and the direct-input path is a
+  // last resort.
+  const ENO_UPLOAD_BUTTON_SELECTORS = [
+    'button.message__button:has(mat-icon:text-is("publish"))',
+    'button:has(mat-icon:text-is("publish"))',
+    'button:has-text("publish")',
     'button:has-text("UPLOAD")',
     'button:has-text("Upload")',
     'button:has-text("Browse")',
     'a:has-text("UPLOAD")',
-  ])
-  if (uploadBtn) {
+  ]
+  const uploadViaButton = async (): Promise<boolean> => {
+    const btn = await firstVisible(page, ENO_UPLOAD_BUTTON_SELECTORS)
+    if (!btn) return false
     try {
       await assertOnProducerTab(page, producerId, "eno")
       const [fc] = await Promise.all([
         page.waitForEvent("filechooser", { timeout: 8_000 }),
-        (uploadBtn as any).click(),
+        (btn as any).click(),
       ])
       await fc.setFiles(downloaded.localPath)
-      uploaded = true
       await settle(page, 2500)
+      return true
     } catch (err: any) {
       logger.warn("[E&O] filechooser path threw", { err: err.message })
+      return false
     }
   }
+  let uploaded = await uploadViaButton()
   if (!uploaded) {
     await assertOnProducerTab(page, producerId, "eno")
     uploaded = await uploadRemoteFile(
@@ -2502,9 +2519,15 @@ async function fillEno(
   // while accommodating SureLC's slowest observed runs.
   const PARSE_BUDGET_MS = 300_000
   const POLL_MS = 1_500
+  // If the panel sits on stage 1 ("Uploading the file…") this long, the upload
+  // never actually reached SureLC (the direct-input symptom above) — reload the
+  // tab and retry ONCE through the real button path instead of burning the
+  // whole budget on a spinner that will never move.
+  const STUCK_UPLOADING_MS = 90_000
   const start = Date.now()
   let cleared = false
   let parseDone = false
+  let retriedStuckUpload = false
   while (Date.now() - start < PARSE_BUDGET_MS) {
     cleared = await waitForTabClear(page, "eno", POLL_MS)
     if (cleared) {
@@ -2523,6 +2546,26 @@ async function fillEno(
     if (!stillWorking) {
       parseDone = true
       break
+    }
+    const stuckUploading =
+      /Uploading the file/i.test(bodyText) &&
+      !/File['’]s type detection[\s\S]{0,40}(done|check)/i.test(bodyText)
+    if (
+      stuckUploading &&
+      !retriedStuckUpload &&
+      Date.now() - start > STUCK_UPLOADING_MS
+    ) {
+      retriedStuckUpload = true
+      logger.warn(
+        { elapsedMs: Date.now() - start },
+        "[E&O] stuck at 'Uploading the file…' — reloading tab and retrying via the upload button",
+      )
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {})
+      await settle(page, 3000)
+      await assertOnProducerTab(page, producerId, "eno")
+      const retried = await uploadViaButton()
+      logger.info({ retried }, "[E&O] stuck-upload retry attempted")
+      continue
     }
     logger.info({ elapsedMs: Date.now() - start }, "[E&O] processing — waiting")
   }
