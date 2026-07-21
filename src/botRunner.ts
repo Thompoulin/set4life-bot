@@ -720,11 +720,23 @@ export async function runActivation(
         result.stage = r.ok ? "rep_review_complete" : "rep_review_failed"
         if (!r.ok) result.success = false
         const skippedCount = r.skipped?.length ?? 0
+        // Each failed carrier's reason already carries the exact blocker the
+        // wizard rejected on (reviewOneCarrier builds "BLOCKED ON — red
+        // required fields → …" / "unsatisfiable carrier-question card(s)").
+        // The summary used to drop it, so the admin only saw "3 failed" with
+        // no way to know WHICH questions to answer or sign manually. Surface
+        // the per-carrier reasons so it's an actionable inventory (owner
+        // 2026-07-21 — the compliance-safe half of the questionnaire fix: the
+        // bot never guesses a carrier answer, it names what a human must set).
+        const failDetail = (r.failed ?? [])
+          .map((f: { reason?: string }) => (f?.reason || "unknown").slice(0, 400))
+          .join(" ||| ")
         await finishRep({
           ok: r.ok,
           msg: r.ok
             ? `Signed ${r.signed} carrier(s)${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`
-            : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`,
+            : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}` +
+              (failDetail ? ` — needs human on: ${failDetail}` : ""),
           meta: r as any,
         })
       } catch (err: any) {
