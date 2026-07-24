@@ -469,39 +469,63 @@ export async function runActivation(
               )
               if (dedup) {
                 logger.info({ producerId, dedup }, "[Fastlane] pre-dedup result")
-                // Skip Fastlane if the producer has ANY active
-                // appointment-requests. Fastlane is a "submit one
-                // producer for many carriers" wizard — it doesn't
-                // take a missing-carriers list, it just creates a
-                // fresh Producer-stage row for every configured
-                // carrier. Firing on top of existing active rows
-                // produces the BGA duplicates that Ana then has to
-                // discard by hand (2026-05-23 incident; previously
-                // Tonette 2026-05-18→05-20 and Zachary 2026-05-09).
+                // Fastlane only adds the carriers we pass in
+                // `selectedCarriers` (never ADD ALL). Safe path when
+                // some appointments already exist:
+                //   • If every selected carrier already has an alive
+                //     appointment-request → skip (avoid Producer-stage
+                //     dups Ana has to discard).
+                //   • If selected carriers are MISSING → run Fastlane
+                //     for the missing ones only.
                 //
-                // The earlier `>= 8 OR (deleted > 0 with active)`
-                // threshold was a workaround for the 8-active-rep
-                // common case; reps stuck at 1–7 active still
-                // triggered Fastlane each retry and accumulated
-                // dupes. Now: if the dedup pass found any alive
-                // request, contracting is considered already-
-                // submitted — admin handles further additions
-                // manually via the BGA portal. The brand-new case
-                // (zero alive) still fires Fastlane normally.
-                if (dedup.uniqueCarriers >= 1) {
+                // Prior gate `uniqueCarriers >= 1` was too aggressive:
+                // agents stuck with only Foresters (or any partial
+                // set) never got the rest of their portfolio submitted
+                // (Juan Pablo Betancurt 2026-07-24). Keep the zero-
+                // alive first-time path, and only skip when the
+                // selection is fully covered.
+                const selectedForGate = (input.contracting?.carriers || [])
+                  .map((c: any) => String(c?.carrierName || "").trim())
+                  .filter((n: string) => n.length > 0)
+                const aliveNames = new Set(
+                  Object.keys(dedup.byCarrierStage || {}).map((n) =>
+                    n.toLowerCase(),
+                  ),
+                )
+                const missingSelected = selectedForGate.filter(
+                  (n: string) => !aliveNames.has(n.toLowerCase()),
+                )
+                if (
+                  selectedForGate.length > 0 &&
+                  missingSelected.length === 0
+                ) {
                   adminPhase.contracting = {
                     submitted: ["already-submitted-skipped-fastlane"],
                     failed: [],
                   }
                   await finishContracting({
                     ok: true,
-                    msg: `Skipped Fastlane — already have ${dedup.uniqueCarriers} active appointment-request(s) (deleted ${dedup.deleted} dup(s))`,
+                    msg: `Skipped Fastlane — all ${selectedForGate.length} selected carrier(s) already have active appointment-request(s) (deleted ${dedup.deleted} dup(s))`,
                   })
                   preDedupSkipsFastlane = true
+                } else if (
+                  selectedForGate.length > 0 &&
+                  missingSelected.length > 0
+                ) {
+                  // Stash missing names so Fastlane runs with only these
+                  // (avoids re-submitting alive carriers).
+                  ;(input as any).__fastlaneMissingCarriers = missingSelected
+                  logger.info(
+                    {
+                      producerId,
+                      alive: selectedForGate.length - missingSelected.length,
+                      missing: missingSelected,
+                    },
+                    "[Fastlane] partial portfolio — will submit only missing selected carriers",
+                  )
                 }
-                // else dedup.uniqueCarriers === 0 → confirmed zero active
-                // requests → genuine first-time contracting; Fastlane
-                // runs normally below.
+                // else selectedForGate empty OR uniqueCarriers === 0 →
+                // Fastlane runs with full selection (or nothing if empty).
               } else {
                 // dedup === null: could not read existing-request state.
                 // FAIL-SAFE: skip Fastlane rather than risk duplicates.
@@ -556,12 +580,22 @@ export async function runActivation(
             // adds exactly those and never "ADD ALL" (owner directive).
             // input.contracting.carriers is the agent's selection from
             // agent_carrier_contracting (built by the backoffice pipeline).
+            // When pre-dedup found a partial portfolio, restrict further
+            // to the missing names only (see __fastlaneMissingCarriers).
+            const missingOnly: string[] | undefined = (input as any)
+              .__fastlaneMissingCarriers
+            const missingSet = missingOnly
+              ? new Set(missingOnly.map((n) => n.toLowerCase()))
+              : null
             const selectedCarriers = (input.contracting?.carriers || [])
               .map((c) => ({
                 carrierName: (c.carrierName || "").trim(),
                 carrierNaic: c.carrierNaic,
               }))
               .filter((c) => c.carrierName.length > 0)
+              .filter((c) =>
+                missingSet ? missingSet.has(c.carrierName.toLowerCase()) : true,
+              )
             const r = await runFastlaneOneProducerManyCarriers(tabCtx, {
               producerDisplayName,
               producerId,
