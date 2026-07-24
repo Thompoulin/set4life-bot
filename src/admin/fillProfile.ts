@@ -981,6 +981,18 @@ const QUESTION_KEYWORD_MAP: Array<{ slug: string; match: (t: string) => boolean 
   { slug: "bankruptcyPending", match: (t) => /bankruptcy pending/i.test(t) },
   { slug: "hasLiens", match: (t) => /liens|unsatisfied judgments/i.test(t) },
   { slug: "alias", match: (t) => /used any other name|alias/i.test(t) },
+  // Missing from the original v2 map (Ana 2026-07-22): interruptions / Q9
+  // mismatches + Q2/Q17 "No" never landing because these slugs never matched.
+  { slug: "interruptions", match: (t) => /interruptions in licensing|license.*interrupt|lapsed.*license|reinstat/i.test(t) },
+  { slug: "wasDisciplined", match: (t) => /disciplined by|sanctioned|censured|penalized/i.test(t) },
+  { slug: "hadComplaint", match: (t) => /consumer.*complaint|complaint.*against you/i.test(t) },
+  { slug: "consumerComplaint", match: (t) => /consumer initiated complaint/i.test(t) },
+  { slug: "secNonInsuranceLicense", match: (t) => /non.?insurance|securities license.*revoked/i.test(t) },
+  { slug: "dishonestOrUnethical", match: (t) => /dishonest|unethical|fraudulent practice/i.test(t) },
+  { slug: "relatedToFinance", match: (t) => /financial institution|related to finance|banking/i.test(t) },
+  { slug: "revenueServiceMatters", match: (t) => /internal revenue|irs|revenue service/i.test(t) },
+  // Foresters / carrier misc often surfaces this wording
+  { slug: "usWorkAuth", match: (t) => /legally entitled to work|authorized to work|work in the (usa|united states)/i.test(t) },
 ]
 
 const matchQuestionSlug = (text: string): string | null => {
@@ -1025,6 +1037,15 @@ const getSlugQuestionPattern = (slug: string): string => {
     bankruptcyPending: "bankruptcy pending",
     hasLiens: "liens|unsatisfied judgments",
     alias: "used any other name|alias",
+    interruptions: "interruptions in licensing|license.*interrupt|lapsed.*license",
+    wasDisciplined: "disciplined by|sanctioned|censured|penalized",
+    hadComplaint: "consumer.*complaint|complaint.*against you",
+    consumerComplaint: "consumer initiated complaint",
+    secNonInsuranceLicense: "non.?insurance|securities license.*revoked",
+    dishonestOrUnethical: "dishonest|unethical|fraudulent practice",
+    relatedToFinance: "financial institution|related to finance|banking",
+    revenueServiceMatters: "internal revenue|irs|revenue service",
+    usWorkAuth: "legally entitled to work|authorized to work|work in the (usa|united states)",
   }
   return map[slug] || slug
 }
@@ -1079,12 +1100,52 @@ async function fillQuestionsV2(
     { matchedSlugs: presentSlugs.size },
     "[Questions/v2] question inventory",
   )
+
+  // Pass 1: explicitly set No answers. v1 used "ALL NO" then flipped Yes;
+  // v2 only handled Yes and left unanswered radios blank, so questions that
+  // should be No (Q2/Q17 etc.) never carried over (Ana 2026-07-22).
+  let noSet = 0
+  for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
+    if (!ans || ans.answer !== "no") continue
+    if (!presentSlugs.has(slug) && !getSlugQuestionPattern(slug)) continue
+    const clicked = await page
+      .evaluate((slugMap) => {
+        const sbQs = Array.from(document.querySelectorAll("sb-question"))
+        for (const q of sbQs) {
+          const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+          const wanted = slugMap.some((re: any) =>
+            new RegExp(re.pattern, re.flags).test(txt),
+          )
+          if (!wanted) continue
+          const no = q.querySelector(
+            'input[type="radio"][value="false"]',
+          ) as HTMLInputElement | null
+          if (no && !no.checked) {
+            no.click()
+            return true
+          }
+          return false
+        }
+        return false
+      }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+      .catch(() => false)
+    if (clicked) noSet++
+  }
+  if (noSet > 0) {
+    logger.info({ noSet }, "[Questions/v2] set No radios")
+    await page.waitForTimeout(400)
+  }
+
   let yesSet = 0
   let saved = 0
   let skipped = 0
   for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
     if (!ans || ans.answer !== "yes") continue
-    if (!presentSlugs.has(slug)) {
+    // Don't require presentSlugs membership alone — matchQuestionSlug may
+    // have missed a newly-added keyword even though getSlugQuestionPattern
+    // can still target the text. Prefer pattern match.
+    const pattern = getSlugQuestionPattern(slug)
+    if (!presentSlugs.has(slug) && pattern === slug) {
       logger.warn({ slug }, "[Questions/v2] no on-screen question matched our slug")
       continue
     }
