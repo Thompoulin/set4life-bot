@@ -406,26 +406,67 @@ export async function runFastlaneOneProducerManyCarriers(ctx, input) {
         await snapshot(ctx, "fastlane-04-carriers-after-add-selected");
         // If we wanted carriers and added ZERO, do not walk States/Products/
         // Preview — NEXT may stay disabled and the old path lied with
-        // "SUBMIT button not found". Fail with the real reason.
+        // "SUBMIT button not found". Diagnose: is the carrier simply not
+        // offered in this BGA's Fastlane grid (UHL for S4L LOA, 2026-07-26
+        // Tangela) vs a locator bug?
         if (wanted.length > 0 && added.length === 0) {
-            let availableSample = "";
+            let availableNames = [];
             try {
-                availableSample = await page.evaluate(() => {
-                    const items = Array.from(document.querySelectorAll('.items__item .item__line1, .item .item__line1, [id^="item-"]'));
-                    return items
-                        .map((el) => (el.innerText || el.textContent || "").trim())
-                        .filter((t) => t.length > 0)
-                        .slice(0, 15)
-                        .join(" | ");
+                availableNames = await page.evaluate(() => {
+                    const items = Array.from(document.querySelectorAll('.items__item .item__line1, .item .item__line1'));
+                    const names = items
+                        .map((el) => (el.innerText || el.textContent || "")
+                        .split("\n")[0]
+                        .trim())
+                        .filter((t) => t.length > 0);
+                    // de-dupe preserve order
+                    return Array.from(new Set(names));
                 });
             }
             catch {
-                /* ignore */
+                availableNames = [];
+            }
+            const availableSample = availableNames.slice(0, 20).join(" | ");
+            const availableNorm = availableNames.map(normalizeCarrier);
+            const unavailable = [];
+            const maybeUiMiss = [];
+            for (const name of notFound) {
+                const candidates = expandCarrierNames(name).map(normalizeCarrier);
+                const inGrid = candidates.some((c) => availableNorm.some((a) => a.includes(c) ||
+                    c.includes(a) ||
+                    c
+                        .split(" ")
+                        .filter((w) => w.length > 2)
+                        .every((w) => a.includes(w))));
+                if (inGrid)
+                    maybeUiMiss.push(name);
+                else
+                    unavailable.push(name);
+            }
+            // All missing carriers simply aren't offered on Fastlane for this
+            // BGA (e.g. United Home Life not in S4L LOA's available list).
+            // Don't fail Phase A / admin_setup_partial — the rest of the
+            // portfolio is already submitted; UHL needs a manual/alternate
+            // path. Returning ok keeps the agent advancing.
+            if (unavailable.length === notFound.length && unavailable.length > 0) {
+                logger.warn({ unavailable, availableSample }, "[Fastlane] selected carrier(s) not offered in Fastlane available list — skipping (not a bot failure)");
+                return {
+                    ok: true,
+                    skipped: true,
+                    skipReason: `Fastlane does not offer: ${unavailable.join(", ")} — needs manual/alternate contracting`,
+                    reason: `Skipped Fastlane — carrier(s) not available in BGA Fastlane grid: ${unavailable.join(", ")}`,
+                };
             }
             return {
                 ok: false,
-                reason: `Fastlane could not find any selected carrier(s) to ADD: ${notFound.join(", ")}` +
-                    (availableSample ? ` (available sample: ${availableSample})` : ""),
+                reason: `Fastlane could not ADD selected carrier(s): ${notFound.join(", ")}` +
+                    (unavailable.length
+                        ? ` [not in grid: ${unavailable.join(", ")}]`
+                        : "") +
+                    (maybeUiMiss.length
+                        ? ` [in grid but ADD missed: ${maybeUiMiss.join(", ")}]`
+                        : "") +
+                    (availableSample ? ` (available: ${availableSample})` : ""),
             };
         }
     }
