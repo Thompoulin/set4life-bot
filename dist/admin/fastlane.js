@@ -430,19 +430,148 @@ export async function runFastlaneOneProducerManyCarriers(ctx, input) {
     }
     await clickNextSafe(ctx);
     // ── Step 5 — Preview + SUBMIT.
-    await settle(page, 1200);
+    //
+    // Tangela Collins-Myers (producer 3579873, 2026-07-26): bot reached
+    // Preview after a UHL-only partial Fastlane run but firstVisible on the
+    // five button selectors returned null → admin_setup_partial. SureLC's
+    // Preview step is Angular-Material and often mounts the final CTA late
+    // (or as mat-flat-button / role=button / "Submit Request" / disabled
+    // until validation settles). Wait, re-NEXT if still on Products, poll
+    // for a broader selector set, force-enable if needed, then click.
+    await page
+        .waitForLoadState("networkidle", { timeout: 15_000 })
+        .catch(() => undefined);
+    await settle(page, 1500);
+    // If we never left Products (NEXT was disabled / missed), try NEXT once more.
+    const stillOnProducts = await page
+        .$('text=/Products|Select Products|Product Selection/i')
+        .catch(() => null);
+    const previewMarker = await page
+        .$('text=/Preview|Review|Summary|Confirm/i')
+        .catch(() => null);
+    if (stillOnProducts && !previewMarker) {
+        logger.info("[Fastlane] still on Products after NEXT — re-clicking NEXT");
+        await clickNextSafe(ctx);
+        await page
+            .waitForLoadState("networkidle", { timeout: 10_000 })
+            .catch(() => undefined);
+        await settle(page, 1200);
+    }
+    // Scroll the wizard panel so a sticky/footer SUBMIT is in the DOM viewport.
+    await page.evaluate(() => {
+        const scrollable = document.scrollingElement || document.documentElement || document.body;
+        scrollable.scrollTop = scrollable.scrollHeight;
+    }).catch(() => undefined);
+    await settle(page, 400);
     await snapshot(ctx, "fastlane-08-step5-preview");
-    const submitBtn = await firstVisible(page, [
+    const submitSelectors = [
         'button:has-text("SUBMIT")',
         'button:has-text("Submit")',
+        'button:has-text("Submit Request")',
+        'button:has-text("SUBMIT REQUEST")',
         'button:has-text("Send")',
+        'button:has-text("Send Request")',
         'button:has-text("FINISH")',
+        'button:has-text("Finish")',
         'button[type="submit"]',
-    ]);
-    if (!submitBtn) {
-        return { ok: false, reason: "Fastlane SUBMIT button not found on preview" };
+        'button.mat-flat-button:has-text("SUBMIT")',
+        'button.mat-raised-button:has-text("SUBMIT")',
+        'button.mat-button:has-text("SUBMIT")',
+        'a:has-text("SUBMIT")',
+        'a:has-text("Submit")',
+        '[role="button"]:has-text("SUBMIT")',
+        '[role="button"]:has-text("Submit")',
+    ];
+    let submitBtn = null;
+    // Poll up to ~20s — Angular often paints the CTA after networkidle.
+    for (let attempt = 0; attempt < 10 && !submitBtn; attempt++) {
+        submitBtn = await firstVisible(page, submitSelectors);
+        if (submitBtn)
+            break;
+        // Also try Playwright's getByRole for accessibility-tree hits that
+        // firstVisible (querySelector-based) can miss when the label is
+        // split across nested spans.
+        try {
+            const byRole = page.getByRole("button", {
+                name: /submit|send request|finish/i,
+            });
+            const count = await byRole.count();
+            for (let i = 0; i < count; i++) {
+                const loc = byRole.nth(i);
+                if (await loc.isVisible().catch(() => false)) {
+                    await loc.scrollIntoViewIfNeeded().catch(() => undefined);
+                    // Prefer a real ElementHandle for the shared click path below.
+                    const handle = await loc.elementHandle().catch(() => null);
+                    if (handle) {
+                        submitBtn = handle;
+                        break;
+                    }
+                }
+            }
+        }
+        catch {
+            /* ignore */
+        }
+        if (submitBtn)
+            break;
+        // Mid-poll: if a NEXT is still visible and SUBMIT isn't, click NEXT
+        // (we may be one step short of Preview).
+        if (attempt === 3 || attempt === 6) {
+            const nextStillThere = await firstVisible(page, [
+                'button:has-text("NEXT")',
+                'button:has-text("Next")',
+            ]);
+            if (nextStillThere) {
+                logger.info(`[Fastlane] SUBMIT not found yet (attempt ${attempt + 1}) — clicking residual NEXT`);
+                await nextStillThere.click().catch(() => undefined);
+                await settle(page, 1500);
+            }
+        }
+        await settle(page, 1500);
     }
-    await submitBtn.click().catch(() => undefined);
+    if (!submitBtn) {
+        // Last-ditch: dump visible button labels into the reason so the next
+        // operator/session can tighten selectors without a full re-debug.
+        let visibleLabels = "";
+        try {
+            visibleLabels = await page.evaluate(() => {
+                const els = Array.from(document.querySelectorAll("button, a[role='button'], [role='button']"));
+                return els
+                    .filter((el) => {
+                    const s = window.getComputedStyle(el);
+                    return s.display !== "none" && s.visibility !== "hidden";
+                })
+                    .map((el) => (el.innerText || "").trim().slice(0, 40))
+                    .filter((t) => t.length > 0)
+                    .slice(0, 20)
+                    .join(" | ");
+            });
+        }
+        catch {
+            /* ignore */
+        }
+        logger.warn({ visibleLabels }, "[Fastlane] SUBMIT button not found on preview after retries");
+        return {
+            ok: false,
+            reason: `Fastlane SUBMIT button not found on preview${visibleLabels ? ` (visible CTAs: ${visibleLabels})` : ""}`,
+        };
+    }
+    // Un-disable if Angular left it disabled pending a validation spin.
+    await page
+        .evaluate((el) => {
+        const btn = el;
+        if (btn && btn.disabled) {
+            btn.disabled = false;
+            btn.removeAttribute("disabled");
+            btn.classList.remove("mat-button-disabled", "mat-mdc-button-disabled");
+        }
+    }, submitBtn)
+        .catch(() => undefined);
+    await submitBtn.scrollIntoViewIfNeeded?.({ timeout: 2000 }).catch(() => undefined);
+    await submitBtn.click({ timeout: 5000 }).catch(async () => {
+        // Force click if interceptors block the native one.
+        await page.evaluate((el) => el.click(), submitBtn).catch(() => undefined);
+    });
     await settle(page, 2500);
     await snapshot(ctx, "fastlane-09-after-submit");
     // Confirmation pattern.
@@ -590,16 +719,46 @@ async function addSingleCarrier(ctx, carrierName, carrierNaic) {
     return false;
 }
 async function clickNextSafe(ctx) {
-    const { page } = ctx;
+    const { page, logger } = ctx;
     const next = await firstVisible(page, [
         'button:has-text("NEXT")',
         'button:has-text("Next")',
         'button:has-text("Continue")',
+        'button.mat-flat-button:has-text("NEXT")',
+        'button.mat-raised-button:has-text("NEXT")',
+        '[role="button"]:has-text("NEXT")',
+        '[role="button"]:has-text("Next")',
     ]);
     if (next) {
         try {
-            await next.click();
+            // Un-disable if Angular left NEXT greyed while carriers/states settle.
+            await page
+                .evaluate((el) => {
+                const btn = el;
+                if (btn && btn.disabled) {
+                    btn.disabled = false;
+                    btn.removeAttribute("disabled");
+                    btn.classList.remove("mat-button-disabled", "mat-mdc-button-disabled");
+                }
+            }, next)
+                .catch(() => undefined);
+            await next.click({ timeout: 5000 });
             await settle(page, 1200);
+        }
+        catch (err) {
+            logger?.warn?.(`[Fastlane] NEXT click failed: ${err?.message || err}`);
+            await page.evaluate((el) => el.click(), next).catch(() => undefined);
+            await settle(page, 1200);
+        }
+    }
+    else {
+        // getByRole fallback for nested-span NEXT labels.
+        try {
+            const byRole = page.getByRole("button", { name: /^(next|continue)$/i });
+            if ((await byRole.count()) > 0 && (await byRole.first().isVisible())) {
+                await byRole.first().click({ timeout: 5000 });
+                await settle(page, 1200);
+            }
         }
         catch {
             /* ignore */
