@@ -71,6 +71,85 @@ function normalizeCarrier(s: string): string {
     .trim()
 }
 
+/**
+ * Short DB codes → on-screen SureLC Fastlane labels (and NAIC when known).
+ * agent_carrier_contracting.carrierName is often a short code ("UHL") while
+ * Fastlane renders the full legal name ("United Home Life…"). Without these
+ * aliases, addSingleCarrier looks for text "UHL" and finds nothing — Tangela
+ * Collins-Myers 2026-07-26: missing UHL, added 0/1, then SUBMIT not found
+ * because NEXT stayed on the empty Carriers step.
+ */
+const CARRIER_ALIASES: Record<
+  string,
+  { names: string[]; naic?: string }
+> = {
+  uhl: {
+    names: [
+      "United Home Life",
+      "United Homelife",
+      "United Home Life Insurance",
+      "UHL",
+    ],
+    // United Home Life Insurance Company — NAIC used by SureLC item ids.
+    naic: "69922",
+  },
+  "f&g": {
+    names: ["Fidelity & Guaranty", "Fidelity and Guaranty", "F&G", "FGL"],
+  },
+  f_and_g: {
+    names: ["Fidelity & Guaranty", "Fidelity and Guaranty", "F&G", "FGL"],
+  },
+  fg: {
+    names: ["Fidelity & Guaranty", "Fidelity and Guaranty", "F&G", "FGL"],
+  },
+  sbli: {
+    names: ["SBLI", "Savings Bank Life", "Quility Term"],
+  },
+  foresters: {
+    names: ["Foresters", "Independent Order Of Foresters"],
+  },
+  americo: {
+    names: ["Americo"],
+  },
+  transamerica: {
+    names: ["Transamerica"],
+  },
+  "american amicable": {
+    names: ["American Amicable"],
+  },
+  centrian: {
+    names: ["Centrian"],
+  },
+  nlg: {
+    names: ["National Life Group", "NLG"],
+  },
+  "mutual of omaha": {
+    names: ["Mutual of Omaha"],
+  },
+}
+
+/** Expand a DB carrier name into all label fragments we should try on-screen. */
+function expandCarrierNames(carrierName: string): string[] {
+  const raw = (carrierName || "").trim()
+  if (!raw) return []
+  const key = normalizeCarrier(raw)
+  const out: string[] = [raw]
+  const alias = CARRIER_ALIASES[key] || CARRIER_ALIASES[raw.toLowerCase()]
+  if (alias) {
+    for (const n of alias.names) {
+      if (!out.some((x) => normalizeCarrier(x) === normalizeCarrier(n))) {
+        out.push(n)
+      }
+    }
+  }
+  return out
+}
+
+function aliasNaic(carrierName: string): string | undefined {
+  const key = normalizeCarrier(carrierName || "")
+  return CARRIER_ALIASES[key]?.naic
+}
+
 const FASTLANE_URL = "https://surelc.surancebay.com/bga/fastlane"
 
 export async function runFastlaneOneProducerManyCarriers(
@@ -392,7 +471,10 @@ export async function runFastlaneOneProducerManyCarriers(
     for (const c of selected) {
       const name = (c.carrierName || "").trim()
       if (!name) continue
-      const ok = await addSingleCarrier(ctx, name, c.carrierNaic)
+      // Prefer explicit NAIC from the pipeline; fall back to known aliases
+      // (UHL → 69922) when the carriers.sureLcCarrierId row is null.
+      const naic = (c.carrierNaic || "").trim() || aliasNaic(name)
+      const ok = await addSingleCarrier(ctx, name, naic)
       if (ok) added.push(name)
       else notFound.push(name)
       await settle(page, 500)
@@ -403,6 +485,35 @@ export async function runFastlaneOneProducerManyCarriers(
         (notFound.length ? `, could not find: ${notFound.join(", ")}` : ""),
     )
     await snapshot(ctx, "fastlane-04-carriers-after-add-selected")
+
+    // If we wanted carriers and added ZERO, do not walk States/Products/
+    // Preview — NEXT may stay disabled and the old path lied with
+    // "SUBMIT button not found". Fail with the real reason.
+    if (wanted.length > 0 && added.length === 0) {
+      let availableSample = ""
+      try {
+        availableSample = await page.evaluate(() => {
+          const items = Array.from(
+            document.querySelectorAll(
+              '.items__item .item__line1, .item .item__line1, [id^="item-"]',
+            ),
+          )
+          return items
+            .map((el) => ((el as HTMLElement).innerText || el.textContent || "").trim())
+            .filter((t) => t.length > 0)
+            .slice(0, 15)
+            .join(" | ")
+        })
+      } catch {
+        /* ignore */
+      }
+      return {
+        ok: false,
+        reason:
+          `Fastlane could not find any selected carrier(s) to ADD: ${notFound.join(", ")}` +
+          (availableSample ? ` (available sample: ${availableSample})` : ""),
+      }
+    }
   }
   await clickNextSafe(ctx)
 
@@ -760,19 +871,21 @@ async function addSingleCarrier(
   }
 
   // ── Primary: NAIC row id (#item-<naic>) ──
-  const naic = (carrierNaic || "").trim()
+  const naic = (carrierNaic || "").trim() || aliasNaic(carrierName) || ""
   if (/^\d+$/.test(naic)) {
     const row = await page.$(`#item-${naic}`).catch(() => null)
     if (row && (await clickAddInRow(row, `#item-${naic}`))) return true
   }
 
-  // ── Fallback: match the row by carrier-name text ──
-  const nameCandidates = [carrierName]
+  // ── Fallback: match the row by carrier-name text (+ short-code aliases) ──
+  const nameCandidates = expandCarrierNames(carrierName)
   // A distinctive prefix (first 3 significant words) helps when the
   // on-screen name has extra suffixes our DB may abbreviate or omit.
-  const words = carrierName.split(/\s+/).filter(Boolean)
-  if (words.length > 3) nameCandidates.push(words.slice(0, 3).join(" "))
-  const targetNorm = normalizeCarrier(carrierName)
+  for (const base of [...nameCandidates]) {
+    const words = base.split(/\s+/).filter(Boolean)
+    if (words.length > 3) nameCandidates.push(words.slice(0, 3).join(" "))
+  }
+  const targetNorms = nameCandidates.map(normalizeCarrier).filter(Boolean)
 
   const containerSelectors = [
     ".items__item",
@@ -803,10 +916,18 @@ async function addSingleCarrier(
           .evaluate((el: Element) => (el.textContent || "").trim())
           .catch(() => "")
         const rowNorm = normalizeCarrier(rowText)
-        const overlaps =
-          rowNorm.includes(targetNorm) ||
-          targetNorm.includes(rowNorm) ||
-          (words[0] && rowNorm.includes(normalizeCarrier(words[0])))
+        const overlaps = targetNorms.some(
+          (tn) =>
+            rowNorm.includes(tn) ||
+            tn.includes(rowNorm) ||
+            // Token overlap: every significant word of a short target
+            // appears in the row (e.g. "united home life" ⊂ full label).
+            (tn.split(" ").filter((w) => w.length > 2).length > 0 &&
+              tn
+                .split(" ")
+                .filter((w) => w.length > 2)
+                .every((w) => rowNorm.includes(w))),
+        )
         if (!overlaps) continue
         // Skip a row already in the Selected column.
         const cls = await row
@@ -818,8 +939,30 @@ async function addSingleCarrier(
     }
   }
 
+  // Last resort: scan every available item row for alias token overlap
+  // (handles cases where :has-text fails on nested Angular nodes).
+  try {
+    const allItems = await page.$$('.items__item, [id^="item-"]')
+    for (const row of allItems) {
+      const rowText = await row
+        .evaluate((el: Element) => (el.textContent || "").trim())
+        .catch(() => "")
+      const rowNorm = normalizeCarrier(rowText)
+      const hit = targetNorms.some((tn) => {
+        if (!tn || tn.length < 2) return false
+        if (rowNorm.includes(tn) || tn.includes(rowNorm)) return true
+        const toks = tn.split(" ").filter((w) => w.length > 2)
+        return toks.length > 0 && toks.every((w) => rowNorm.includes(w))
+      })
+      if (!hit) continue
+      if (await clickAddInRow(row, "scan-all-items")) return true
+    }
+  } catch {
+    /* ignore */
+  }
+
   logger.warn(
-    { carrierName, carrierNaic },
+    { carrierName, carrierNaic: naic || carrierNaic, triedNames: nameCandidates },
     "[Fastlane] could not find ADD control for selected carrier",
   )
   return false
