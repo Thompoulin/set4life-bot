@@ -3,7 +3,7 @@ import { z } from "zod"
 import pino from "pino"
 import { runActivation, type RunActivationInput } from "./botRunner.js"
 import { captureBgaTokens } from "./bgaTokenCapture.js"
-import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
+import { CHROMIUM_ARGS, launchChromium, browserPoolStats } from "./browserArgs.js"
 import { getAuthenticatedPage } from "./admin/sessionCache.js"
 
 const logger = pino({ name: "s4l-surelc-bot" })
@@ -285,7 +285,11 @@ const app = express()
 app.use(express.json({ limit: "1mb" }))
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true })
+  // browserPool makes the 2026-07-27 starvation visible before it bites:
+  // sustained queued>0 means runs are waiting on a browser, and active
+  // pinned at max with a growing queue is the shape that used to end in
+  // "operation aborted due to timeout" alerts.
+  res.json({ ok: true, browserPool: browserPoolStats() })
 })
 
 app.post("/run-activation", async (req, res) => {
