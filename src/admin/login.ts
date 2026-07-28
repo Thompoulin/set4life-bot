@@ -192,6 +192,50 @@ async function attemptLogin(
   }
   await pwField.fill(creds.password)
 
+  // Capture what the AUTH CALL itself says, and any error the UI flashes.
+  //
+  // collectVisibleErrors() runs only after the 30s waitForURL below, by which
+  // time a Material snackbar has long auto-dismissed — so it returned [] even
+  // for a genuine "invalid credentials", the bounce got classified as the
+  // transient datacenter-IP block, and the wrapper retried forever. That
+  // misclassification is what hid the 2026-07-27 outage for 3 days.
+  //
+  // Watching the network instead is authoritative: SureLC's own response tells
+  // us wrong-password vs locked vs rate-limited, and it can't dismiss itself.
+  const authSignals: string[] = []
+  const onResponse = (resp: {
+    url: () => string
+    status: () => number
+    text: () => Promise<string>
+  }) => {
+    const u = resp.url()
+    if (!/accounts\.surancebay\.com/.test(u)) return
+    if (!/(token|login|auth|authorize|signin)/i.test(u)) return
+    const status = resp.status()
+    if (status < 400) return
+    void resp
+      .text()
+      .then((body) => {
+        authSignals.push(`${status} ${u.split("?")[0]} ${body.slice(0, 200).replace(/\s+/g, " ")}`)
+      })
+      .catch(() => {
+        authSignals.push(`${status} ${u.split("?")[0]} (body unreadable)`)
+      })
+  }
+  page.on("response", onResponse as any)
+  // Snapshot any error the UI paints while we're still waiting, before it fades.
+  const errorWatcher = page
+    .waitForSelector("mat-error, .error, .alert, [role=alert], snack-bar-container, .mat-mdc-snack-bar-label", {
+      timeout: 25_000,
+      state: "visible",
+    })
+    .then((el) => el?.textContent())
+    .then((t) => {
+      const s = (t ?? "").trim()
+      if (s) authSignals.push(`ui:${s}`)
+    })
+    .catch(() => undefined)
+
   const submit = await firstVisible(page, [
     'button[type="submit"]',
     'input[type="submit"]',
@@ -221,7 +265,11 @@ async function attemptLogin(
     // bounced — "Invalid email or password" / "MFA required" / etc.
     // Without this the owner has to dig into Dokku logs to see what
     // SureLC is actually complaining about.
-    const errors = await collectVisibleErrors(page)
+    await errorWatcher
+    page.off("response", onResponse as any)
+    // Late-collected DOM errors plus anything we caught live (network + the
+    // snackbar before it faded). The live signals are the trustworthy ones.
+    const errors = [...(await collectVisibleErrors(page)), ...authSignals]
     const finalUrl = page.url()
 
     // A FORCED PASSWORD CHANGE looks identical to a transient bounce: SureLC
@@ -277,6 +325,10 @@ async function attemptLogin(
     }
     return { ok: false, reason, fatal }
   }
+
+  // Success path — drop the response listener (the browser is reused for the
+  // rest of the run, so leaving it attached would keep buffering auth bodies).
+  page.off("response", onResponse as any)
 
   // URL transitioned to /bga/* — but that's not a guarantee the SPA
   // actually stored OAuth tokens. The previous failure mode (owner-
