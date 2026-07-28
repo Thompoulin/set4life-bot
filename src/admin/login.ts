@@ -223,6 +223,32 @@ async function attemptLogin(
     // SureLC is actually complaining about.
     const errors = await collectVisibleErrors(page)
     const finalUrl = page.url()
+
+    // A FORCED PASSWORD CHANGE looks identical to a transient bounce: SureLC
+    // renders no error text, so collectVisibleErrors comes back empty and we
+    // parked on the OAuth page. That cost 3 days on 2026-07-27 — the bot
+    // retried 6× per request forever, browsers piled up until the box was out
+    // of memory, and every agent surfaced as "operation aborted due to
+    // timeout" while the real cause was a password-expiry screen nobody could
+    // see. Detect it explicitly, make it FATAL so the retry storm stops, and
+    // say exactly what a human has to do.
+    const passwordChange = await detectPasswordChangeScreen(page)
+    if (passwordChange) {
+      logger.error(
+        { url: finalUrl, indicator: passwordChange, attempt },
+        "admin login: SureLC is forcing a PASSWORD CHANGE on the bot service account",
+      )
+      return {
+        ok: false,
+        fatal: true,
+        reason:
+          `SureLC is forcing a password change on the bot service account. ` +
+          `Set a new password at https://surelc.surancebay.com/bga/ and update ` +
+          `SURELC_ADMIN_PASSWORD on s4l-production. Nothing will contract until then. ` +
+          `(matched: ${passwordChange})`,
+      }
+    }
+
     logger.warn(
       { url: finalUrl, errors, attempt },
       "admin login: did not land on /bga/* — likely wrong credentials or MFA prompt",
@@ -370,6 +396,37 @@ async function collectVisibleErrors(page: Page): Promise<string[]> {
       return Array.from(new Set(out)).slice(0, 5)
     })
     .catch(() => [] as string[])
+}
+
+/**
+ * Is SureLC showing a "you must change your password" wall?
+ *
+ * Checked three ways because SureLC gives us nothing to work with: no error
+ * text and no distinctive status code. A URL match is the strongest signal; a
+ * second password field (new + confirm) on a page we didn't land on is the
+ * next; visible copy is the fallback. Returns the matched indicator so the
+ * alert can say WHY we think so, rather than asserting it blindly.
+ */
+async function detectPasswordChangeScreen(page: Page): Promise<string | null> {
+  try {
+    const href = page.url()
+    if (/(change|reset|expire|update)[-_]?password|password[-_]?(change|reset|expired|update)/i.test(href)) {
+      return `url:${href}`
+    }
+    return await page.evaluate(() => {
+      const PATTERNS =
+        /(change|update|reset|create)\s+(your\s+)?password|password\s+(has\s+)?(expired|must\s+be\s+changed)|new\s+password|temporary\s+password/i
+      // Two or more password inputs = new + confirm, i.e. a set-password form
+      // rather than the single-field sign-in form.
+      const pwFields = document.querySelectorAll('input[type="password"]')
+      if (pwFields.length >= 2) return `form:${pwFields.length}-password-fields`
+      const text = (document.body?.innerText ?? "").slice(0, 4000)
+      const m = text.match(PATTERNS)
+      return m ? `text:${m[0]}` : null
+    })
+  } catch {
+    return null
+  }
 }
 
 function looksLikeStillOnOauthForm(href: string): boolean {
