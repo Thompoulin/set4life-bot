@@ -188,9 +188,16 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
   { key: "q2_misdemeanor", pattern: /misdemeanor/i },
   // Regulatory action / commissioner / department of insurance complaint.
   { key: "q3_regulatory_action", pattern: /(?:state\s+(?:insurance|securities)|commissioner|department\s+of\s+insurance|sanction|disciplinary)/i },
-  { key: "q4_license_denied", pattern: /licen[sc]e\s+(?:denied|refused\s+to\s+issue)/i },
-  // License suspended/canceled/revoked.
-  { key: "q5_license_revoked", pattern: /licen[sc]e\s+(?:suspend|cancel|revok)/i },
+  { key: "q4_license_denied", pattern: /licen[sc]e[\s\S]{0,40}(?:denied|refused\s+to\s+issue)/i },
+  // License suspended/canceled/revoked. The verb does NOT always sit
+  // immediately after "license": carriers commonly bundle all four
+  // outcomes into one prompt — "Have you ever had an insurance or
+  // securities license denied, suspended, cancelled or revoked?"
+  // (observed verbatim on Sean Way + Shekethia Claiborne, 2026-08-04).
+  // The old `licen[sc]e\s+(?:suspend|...)` required adjacency, so
+  // "denied," in between made it miss, the rep's TRUE q5 landed on no
+  // question, and the run was routed to a human. Allow a short gap.
+  { key: "q5_license_revoked", pattern: /licen[sc]e[\s\S]{0,40}(?:suspend|cancel|revok)/i },
   // Insurance company canceled your contract / terminated.
   { key: "q6_insurer_terminated", pattern: /(?:insurance\s+company|insurer)\s+(?:cancel|terminat).*(?:contract|appointment)/i },
   // Bankruptcy — PERSONAL "filed/declared bankruptcy" (Q15/Q15a). The
@@ -204,16 +211,31 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
   { key: "q9_unpaid_premiums", pattern: /(?:unpaid\s+premium|indebted.*insur|debit\s+balance)/i },
   // Fiduciary breach.
   { key: "q10_fiduciary_breach", pattern: /fiduciary/i },
-  // Fraud investigation / subject of any investigation.
-  { key: "q11_fraud_investigation", pattern: /(?:fraud|subject\s+of\s+(?:any\s+)?investigation)/i },
+  // Fraud investigation / subject of — or currently UNDER — any
+  // investigation. "Are you currently under investigation by any legal
+  // or regulatory authority?" (observed verbatim on Jhovanny Jimenez +
+  // Michael Wills, 2026-08-04) contains neither "fraud" nor "subject
+  // of", so the old pattern missed it and their true q11 was routed to
+  // a human rather than disclosed.
+  { key: "q11_fraud_investigation", pattern: /(?:fraud|(?:subject\s+of|under)\s+(?:any\s+)?investigation)/i },
   // Consent order / order of any kind.
   { key: "q12_consent_order", pattern: /consent\s+order/i },
   // Continuing-education violation.
   { key: "q13_ce_violation", pattern: /continu(?:ing|ed)\s+education|CE\s+violation/i },
   // Lawsuit / litigation pending / defendant.
   { key: "q14_lawsuit_pending", pattern: /(?:defendant|lawsuit|litigation|civil\s+action)/i },
-  // E&O claim.
-  { key: "q15_eo_claim", pattern: /(?:e&o|errors\s+and\s+omissions).*claim/i },
+  // E&O claim. The claim word can come EITHER side of the E&O phrase:
+  // "Has any lawsuit or claim ever been made against your surety
+  // company, or errors and omissions insurer, arising out of your sales
+  // or practices..." (observed verbatim on Sean Way, 2026-08-04) puts
+  // "claim" first, so the old `(?:e&o|errors and omissions).*claim`
+  // never matched. Require both tokens within a short span, either
+  // order, so we don't match a bare mention of E&O coverage.
+  {
+    key: "q15_eo_claim",
+    pattern:
+      /(?:(?:e&o|errors\s+and\s+omissions)[\s\S]{0,120}(?:claim|lawsuit)|(?:claim|lawsuit)[\s\S]{0,120}(?:e&o|errors\s+and\s+omissions))/i,
+  },
   // Judgments / tax liens / bad debts.
   { key: "q16_unsatisfied_judgments", pattern: /(?:judgment|tax\s*lien|bad\s*debt|collection)/i },
   // Financial-institution related.
@@ -373,13 +395,38 @@ export function disclosureKeyForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
 ): string | null {
-  if (!disclosures) return null
-  if (ISSUING_COMPANY_PATTERN.test(label)) return null
-  if (PRODUCT_OPT_IN_PATTERN.test(label)) return null
+  return disclosureKeysForLabel(label, disclosures)[0] ?? null
+}
+
+/**
+ * Every disclosure key this label covers AND the rep flagged true.
+ *
+ * Why plural: carriers routinely fold several of our separate
+ * disclosures into ONE prompt. "Have you ever had an insurance or
+ * securities license denied, suspended, cancelled or revoked?" is a
+ * single question that discloses BOTH q4_license_denied and
+ * q5_license_revoked. `pickYnForLabel` already answers such a question
+ * "Yes" correctly (it returns Y on the first true match), but the
+ * coverage audit only ever recorded ONE key — so the second stayed in
+ * `unplaced`, the run reported a disclosure that "matched no question",
+ * and a correctly-answered carrier was routed to a human anyway. Sean
+ * Way and Shekethia Claiborne both stalled on exactly this 2026-08-04.
+ *
+ * Returning every matching key fixes the audit WITHOUT changing a single
+ * answer — the form is filled identically; we just stop raising a false
+ * alarm about it.
+ */
+export function disclosureKeysForLabel(
+  label: string,
+  disclosures: RepReviewInput["disclosures"] | undefined,
+): string[] {
+  if (!disclosures) return []
+  if (ISSUING_COMPANY_PATTERN.test(label)) return []
+  if (PRODUCT_OPT_IN_PATTERN.test(label)) return []
   if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
-    return null
+    return []
   if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
-    return disclosures.q3_securities_violation ? "q3_securities_violation" : null
+    return disclosures.q3_securities_violation ? ["q3_securities_violation"] : []
   }
   // Lockstep with pickYnForLabel's bankruptcy split: back-fill personal from
   // the legacy flag, then peel firm (Q15b) + pending (Q15c) off before the
@@ -393,15 +440,17 @@ export function disclosureKeyForLabel(
     /(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
     !/personal/i.test(label)
   ) {
-    return d.q7_firm_bankruptcy ? "q7_firm_bankruptcy" : null
+    return d.q7_firm_bankruptcy ? ["q7_firm_bankruptcy"] : []
   }
   if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
-    return d.q7_bankruptcy_pending ? "q7_bankruptcy_pending" : null
+    return d.q7_bankruptcy_pending ? ["q7_bankruptcy_pending"] : []
   }
+  // ALL matches, not just the first — see the doc comment above.
+  const keys: string[] = []
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-    if (pattern.test(label) && d[key]) return key
+    if (pattern.test(label) && d[key] && !keys.includes(key)) keys.push(key)
   }
-  return null
+  return keys
 }
 
 /**
@@ -1966,7 +2015,10 @@ async function fillRadiosByLabelLookup(
   const placed = new Set<string>()
   for (const { name, label, values } of groups) {
     const ans = pickYnForLabel(label, disclosures)
-    const placedKey = ans === "Y" ? disclosureKeyForLabel(label, disclosures) : null
+    // ALL disclosure keys this one question covers (carriers bundle
+    // several of ours into a single prompt) — see disclosureKeysForLabel.
+    const placedKeysForLabel =
+      ans === "Y" ? disclosureKeysForLabel(label, disclosures) : []
     // Per-group value detection: a single wizard step can MIX schemes —
     // carrier Y/N questions alongside background-disclosure questions
     // rendered with value="true"/"false" on the SAME step (American
@@ -2039,7 +2091,7 @@ async function fillRadiosByLabelLookup(
     if (clicked) {
       if (ans === "Y") {
         yes++
-        if (placedKey) placed.add(placedKey)
+        for (const k of placedKeysForLabel) placed.add(k)
       } else no++
     }
   }
