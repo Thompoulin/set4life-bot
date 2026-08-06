@@ -677,13 +677,56 @@ async function fillCarrierQuestionExplanations(
         }
       }
 
+      // 1b) DATE-FIRST modal shape. Captured live from Sean Way's Foresters
+      //     card 2026-08-06: the modal opens with ONLY an "Occurrence Date"
+      //     input, its datepicker toggle, CANCEL and CREATE — no textarea and
+      //     no SELECT button at all. The description/attachment step only
+      //     appears after the date is committed with CREATE. The old code
+      //     looked for a textarea immediately, found none, and gave up with
+      //     descFilled=false/attached=false while holding the rep's letter —
+      //     which is what stranded every disclosure-Yes rep at Producer.
+      //
+      //     So: if there's no textarea yet but there IS a CREATE, commit the
+      //     date and re-look. Cheap, and a no-op on the older single-step
+      //     modal shape (which has a textarea from the start).
+      const hasTextareaNow = (await dialog.locator("textarea").count().catch(() => 0)) > 0
+      if (!hasTextareaNow) {
+        const createBtn = dialog.locator('button:has-text("CREATE")').first()
+        if ((await createBtn.count().catch(() => 0)) > 0) {
+          await createBtn.click({ timeout: 4000 }).catch(() => undefined)
+          await page.waitForTimeout(2000)
+          const dom = await page
+            .evaluate(() => {
+              const d = document.querySelector("mat-dialog-container")
+              if (!d) return "(dialog closed after CREATE)"
+              return Array.from(
+                d.querySelectorAll("input, textarea, button, mat-select, [contenteditable]"),
+              )
+                .slice(0, 20)
+                .map((e) => ({
+                  tag: e.tagName,
+                  txt: (e.textContent || "").trim().slice(0, 20),
+                  ph: e.getAttribute("placeholder"),
+                }))
+            })
+            .catch(() => null)
+          logger.info(
+            { idx, afterCreate: dom },
+            "[Rep step4] date-first modal — committed date, inspecting next step",
+          )
+        }
+      }
+
       // 2) Explanation text → the Description textarea. Playwright .fill()
       //    drives Angular's form control properly; a raw value-set is
       //    dropped by ngModel, so DONE would save an empty description and
       //    the red card would persist (verified Jimenez 2026-06-02).
+      //    Re-resolve the dialog: on the date-first shape CREATE may have
+      //    swapped the dialog contents (or opened a second one).
       let descFilled = false
       try {
-        const ta = dialog.locator("textarea").first()
+        const liveDialog = page.locator("mat-dialog-container:visible").last()
+        const ta = liveDialog.locator("textarea").first()
         if (await ta.count()) {
           await ta.fill(pick.explanation)
           descFilled = true
