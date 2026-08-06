@@ -241,8 +241,23 @@ const DISCLOSURE_LABEL_PATTERNS: Array<{
   { key: "q11_fraud_investigation", pattern: /(?:fraud|(?:subject\s+of|under)\s+(?:any\s+)?investigation)/i },
   // Consent order / order of any kind.
   { key: "q12_consent_order", pattern: /consent\s+order/i },
-  // Continuing-education violation.
-  { key: "q13_ce_violation", pattern: /continu(?:ing|ed)\s+education|CE\s+violation/i },
+  // "q13_ce_violation" is a MISNOMER. The flag is set by onboarding's
+  // q13_parent, whose text is "Have you ever had any interruptions in
+  // licensing?" (client/src/components/onboarding/types.ts) — nothing to do
+  // with continuing education. The old CE-only pattern therefore matched
+  // nothing on any carrier wizard, so every rep who answered yes to the
+  // interruptions question was reported as an unplaced disclosure and routed
+  // to a human forever: Sean Way, Shekethia Claiborne, David Grenier and
+  // Grantley Wilson, the only 4 of 99 reps with this flag set.
+  //
+  // Carriers DO ask it — "Have you ever had any interruptions in licensing?*"
+  // appears verbatim on the Foresters and NLG wizards (captured 2026-08-05/06).
+  // Match the real wording; keep the CE wording too in case a carrier words it
+  // that way, since the flag's name implies some carriers might.
+  {
+    key: "q13_ce_violation",
+    pattern: /interruption(?:s)?\s+in\s+licens|continu(?:ing|ed)\s+education|CE\s+violation/i,
+  },
   // Lawsuit / litigation pending / defendant.
   { key: "q14_lawsuit_pending", pattern: /(?:defendant|lawsuit|litigation|civil\s+action)/i },
   // E&O claim. The claim word can come EITHER side of the E&O phrase:
