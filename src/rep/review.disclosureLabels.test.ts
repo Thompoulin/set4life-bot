@@ -23,7 +23,7 @@
  *     stranded the rep (Sean Way, Jhovanny Jimenez, Michael Wills,
  *     Shekethia Claiborne — all stuck from 2026-06-05).
  */
-import { pickYnForLabel, disclosureKeysForLabel } from "./review"
+import { pickYnForLabel, disclosureKeysForLabel } from "./review.js"
 
 // --- Verbatim labels from the 2026-08-04 seenLabels captures ---
 const L_LICENSE =

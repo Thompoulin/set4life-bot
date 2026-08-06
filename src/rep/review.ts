@@ -629,8 +629,38 @@ async function fillCarrierQuestionExplanations(
         )
       } else {
         unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)")
+        // Dump the modal's actual control inventory. descFilled/attached
+        // both false means our selectors (`textarea`, `button:has-text
+        // ("SELECT")`) matched NOTHING — i.e. SureLC's modal isn't shaped
+        // the way this code assumes, and we saved an empty explanation
+        // while holding the rep's letter in `pool`. The screenshot below
+        // is written to a tmp evidence dir that does not survive the
+        // container, so it has never been available when diagnosing this.
+        // Logging the inventory puts the one fact needed to fix the
+        // selectors into the durable log instead (2026-08-05: Ana was
+        // right that nothing was missing — pool had 7 entries and the bot
+        // still reported the card unsatisfiable).
+        const modalControls = await page
+          .evaluate(() => {
+            const d = document.querySelector("mat-dialog-container")
+            if (!d) return null
+            return Array.from(
+              d.querySelectorAll(
+                "input, textarea, button, mat-select, [contenteditable]",
+              ),
+            )
+              .slice(0, 25)
+              .map((e) => ({
+                tag: e.tagName,
+                cls: (e.className || "").toString().slice(0, 40),
+                txt: (e.textContent || "").trim().slice(0, 24),
+                ph: e.getAttribute("placeholder"),
+                fcn: e.getAttribute("formcontrolname"),
+              }))
+          })
+          .catch(() => null)
         logger.warn(
-          { idx, saved, descFilled, attached, q: questionText.slice(0, 80) },
+          { idx, saved, descFilled, attached, q: questionText.slice(0, 80), modalControls },
           "[Rep step4] explanation modal not satisfied — capturing + closing",
         )
         await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}-unfilled`)
