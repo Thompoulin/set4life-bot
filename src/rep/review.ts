@@ -145,6 +145,27 @@ export interface RepReviewInput {
     q19_irs_matters?: boolean
   }
   /**
+   * Carrier-SPECIFIC question answers, keyed by the `surelcAnswerKey` slug
+   * on `carrier_questions` (merged onto questionnaire_responses.surelcAnswers).
+   *
+   * Distinct from `disclosures`: those are the 19 standard background
+   * questions every carrier asks in some wording. These are questions only
+   * a particular carrier asks, whose answers cannot be derived from anything
+   * we already hold — e.g. NLG asks for ethnicity, whether the rep has ever
+   * been FINRA licensed, whether they are a legal resident of the US, and
+   * whether they intend to solicit in New York.
+   *
+   * Values are the rep's own answer: "yes" | "no" for yes_no questions, or
+   * the literal string for text/select.
+   *
+   * CRITICAL: a missing entry means UNKNOWN, never "no". `pickYnForLabel`
+   * defaults unrecognised labels to "N", which for a question like "Are you
+   * a legal resident of the United States?" is both false and harmful. The
+   * carrier-question guard refuses to sign rather than let that happen —
+   * see CARRIER_QUESTION_PATTERNS.
+   */
+  carrierAnswers?: Record<string, string | undefined>
+  /**
    * Per-disclosure explanation letters + supporting docs from the rep's
    * onboarding (`questionnaire_responses.surelc_answers`). When a carrier's
    * Carrier-Questions step (Step 4) answers "Yes", SureLC shows a red
@@ -301,10 +322,85 @@ const NON_CONTRACTED_ISSUER_PATTERN =
 const PRODUCT_OPT_IN_PATTERN =
   /will\s+you\s+be\s+selling\s+(?:final\s+expense|life|annuity|medicare|whole\s+life|term)\s+products?/i
 
+/**
+ * Carrier-SPECIFIC questions, matched to the `surelcAnswerKey` slug holding
+ * the rep's answer. Only questions whose answer we cannot derive from
+ * anything else belong here.
+ *
+ * Transcribed from Ana's 2026-08-06 capture of a live NLG request. NLG is the
+ * first carrier to need this: its Step 5 Questionnaire is the usual 8
+ * background questions (covered by `disclosures`), but its Step 4 "Producer
+ * Questions" ask for data we never collect. Verified what the bot would do
+ * without this table — it answered "No" to BOTH "Do you attest that you have
+ * lawful authorization to work in the United States?" and "Are you a legal
+ * resident of the United States?", which is false, denies the rep's own
+ * attestation, and would sink the contract.
+ *
+ * `required: true` means the bot must NOT proceed without a real answer.
+ */
+const CARRIER_QUESTION_PATTERNS: Array<{
+  slug: string
+  pattern: RegExp
+  required: boolean
+}> = [
+  { slug: "nlgCurrentlyContracted", pattern: /currently\s+contracted\s+with\s+national\s+life/i, required: true },
+  { slug: "nlgSolicitNewYork", pattern: /solicit\s+business\s+in\s+new\s+york/i, required: true },
+  { slug: "nlgEsiAffiliationAck", pattern: /esi\s+affiliation|equity\s+services\s+incorporated/i, required: true },
+  { slug: "nlgFinraLicensed", pattern: /\bfinra\b.{0,40}(?:ever\s+been\s+)?licen[sc]ed/i, required: true },
+  { slug: "nlgUnderIndictment", pattern: /are\s+you\s+now\s+under\s+indictment/i, required: true },
+  { slug: "nlgIrsBackupWithholding", pattern: /backup\s+withholding/i, required: true },
+  { slug: "nlgLegalResidentUs", pattern: /legal\s+resident\s+of\s+the\s+united\s+states/i, required: true },
+  { slug: "nlgConsumerReportCopy", pattern: /consumer\s+report.{0,120}copy\s+of\s+the\s+big\s+report/i, required: true },
+  // Work authorisation IS derivable — usWorkAuth is collected at onboarding —
+  // but it is carrier-worded here, so route it through the same lookup rather
+  // than let the disclosure patterns miss it and default No.
+  { slug: "usWorkAuth", pattern: /lawful\s+authorization\s+to\s+work\s+in\s+the\s+united\s+states/i, required: true },
+]
+
+export type CarrierQuestionMatch = {
+  slug: string
+  required: boolean
+  /** "Y" | "N" when we hold a real answer; null when we do NOT. */
+  answer: "Y" | "N" | null
+}
+
+/**
+ * If `label` is a known carrier-specific question, return its slug and the
+ * rep's stored answer — or `answer: null` when we hold none. Returns null when
+ * the label isn't a carrier-specific question at all.
+ *
+ * Callers MUST treat `answer: null` on a `required` question as "cannot
+ * proceed", never as "No".
+ */
+export function carrierQuestionForLabel(
+  label: string,
+  carrierAnswers: Record<string, string | undefined> | undefined,
+): CarrierQuestionMatch | null {
+  for (const { slug, pattern, required } of CARRIER_QUESTION_PATTERNS) {
+    if (!pattern.test(label)) continue
+    const raw = (carrierAnswers?.[slug] ?? "").toString().trim().toLowerCase()
+    const answer = raw === "yes" || raw === "y" || raw === "true"
+      ? "Y"
+      : raw === "no" || raw === "n" || raw === "false"
+        ? "N"
+        : null
+    return { slug, required, answer }
+  }
+  return null
+}
+
 export function pickYnForLabel(
   label: string,
   disclosures: RepReviewInput["disclosures"] | undefined,
+  carrierAnswers?: Record<string, string | undefined>,
 ): "Y" | "N" {
+  // Carrier-specific questions answer from the rep's own stored answer.
+  // A known question with NO stored answer falls through to the normal
+  // path only so this function keeps its "Y"|"N" contract — the REAL
+  // protection is the caller's unanswered-required guard, which blocks
+  // the sign before any of these reach the form.
+  const cq = carrierQuestionForLabel(label, carrierAnswers)
+  if (cq?.answer) return cq.answer
   // Carrier sub-opt-in defaults YES (rep wants the appointment included) —
   // EXCEPT issuers we're not contracted with (e.g. the Pioneer entities
   // bundled under American Amicable), which must be NO so we stop opting
@@ -1231,6 +1327,7 @@ async function reviewOneCarrier(
     page,
     "yn",
     input.disclosures,
+    input.carrierAnswers,
   )
   logger.info(
     { ...step4Filled },
@@ -1270,11 +1367,40 @@ async function reviewOneCarrier(
     page,
     "tf",
     input.disclosures,
+    input.carrierAnswers,
   )
   logger.info(
     { ...step5Filled },
     "[Rep step5] questionnaire answered from disclosures",
   )
+
+  // Carrier-question guard — a carrier-specific question we hold no answer
+  // for must NEVER be auto-filled. pickYnForLabel's default is "N", so
+  // without this the bot would tell NLG the rep is not a legal resident of
+  // the US and has no lawful work authorisation — both false, both denying
+  // the rep's own attestation, and both fatal to the contract. Verified
+  // against the real wording 2026-08-06 before this guard existed.
+  {
+    const unanswered = [
+      ...step4Filled.unansweredCarrierQuestions,
+      ...step5Filled.unansweredCarrierQuestions,
+    ]
+    if (unanswered.length > 0) {
+      logger.warn(
+        { idx, unanswered },
+        "[Rep] carrier-specific question(s) with no stored answer — routing to human, not signing",
+      )
+      return {
+        ok: false,
+        reason:
+          `This carrier asks question(s) we have no answer for: ` +
+          `${unanswered.join("; ")}. The bot will not guess on a carrier form — ` +
+          `answering "No" by default would be a false statement about the rep. ` +
+          `Collect these at onboarding (carrier_questions) or have a human complete ` +
+          `this carrier's questionnaire. Do NOT auto-sign.`,
+      }
+    }
+  }
 
   // Compliance guard — every TRUE disclosure must have landed on a
   // recognized question across Step 4 + Step 5. A true flag that matched
@@ -1989,7 +2115,17 @@ async function fillRadiosByLabelLookup(
   page: Page,
   scheme: "yn" | "tf",
   disclosures: RepReviewInput["disclosures"] | undefined,
-): Promise<{ answered: number; yes: number; no: number; placedKeys: string[]; labels: string[] }> {
+  carrierAnswers?: Record<string, string | undefined>,
+): Promise<{
+  answered: number
+  yes: number
+  no: number
+  placedKeys: string[]
+  labels: string[]
+  /** Required carrier-specific questions we hold NO answer for. Non-empty
+   *  means the caller must refuse to sign — see the guard in repReview. */
+  unansweredCarrierQuestions: string[]
+}> {
   const yesValue = scheme === "yn" ? "Y" : "true"
   const noValue = scheme === "yn" ? "N" : "false"
 
@@ -2043,8 +2179,17 @@ async function fillRadiosByLabelLookup(
   // committed). The caller diffs this against the rep's true flags to
   // catch a disclosure that matched no on-screen question.
   const placed = new Set<string>()
+  const unansweredCarrierQuestions: string[] = []
   for (const { name, label, values } of groups) {
-    const ans = pickYnForLabel(label, disclosures)
+    // Record a required carrier-specific question we cannot answer BEFORE
+    // filling anything — pickYnForLabel would otherwise write "N", which on
+    // e.g. "Are you a legal resident of the United States?" is a false
+    // statement about the rep.
+    const cqMatch = carrierQuestionForLabel(label, carrierAnswers)
+    if (cqMatch && cqMatch.required && !cqMatch.answer) {
+      unansweredCarrierQuestions.push(`${cqMatch.slug}: ${label.slice(0, 90)}`)
+    }
+    const ans = pickYnForLabel(label, disclosures, carrierAnswers)
     // ALL disclosure keys this one question covers (carriers bundle
     // several of ours into a single prompt) — see disclosureKeysForLabel.
     const placedKeysForLabel =
@@ -2130,6 +2275,7 @@ async function fillRadiosByLabelLookup(
     yes,
     no,
     placedKeys: [...placed],
+    unansweredCarrierQuestions,
     // Raw question labels seen on this step — surfaced so the caller can
     // log exactly how a carrier worded a question that matched no
     // disclosure pattern (e.g. an IRS/tax question phrased outside the
