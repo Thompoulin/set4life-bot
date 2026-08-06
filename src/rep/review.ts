@@ -689,30 +689,44 @@ async function fillCarrierQuestionExplanations(
       //     So: if there's no textarea yet but there IS a CREATE, commit the
       //     date and re-look. Cheap, and a no-op on the older single-step
       //     modal shape (which has a textarea from the start).
-      const hasTextareaNow = (await dialog.locator("textarea").count().catch(() => 0)) > 0
-      if (!hasTextareaNow) {
-        const createBtn = dialog.locator('button:has-text("CREATE")').first()
-        if ((await createBtn.count().catch(() => 0)) > 0) {
-          await createBtn.click({ timeout: 4000 }).catch(() => undefined)
-          await page.waitForTimeout(2000)
+      // The modal is a DOCUMENT CHOOSER, not a form. Captured live from
+      // Jhovanny Jimenez's card 2026-08-06, its controls are:
+      //   [UPLOAD NEW DOCUMENT] [CREATE EXPLANATION] [SELECT FROM ...]
+      //   [CANCEL] [CREATE]
+      // There is no textarea until "CREATE EXPLANATION" is clicked — that is
+      // what opens the text editor. The old code looked for a textarea
+      // immediately, found none, and gave up while holding the rep's letter.
+      //
+      // Scope by FIRST visible dialog, not `.last()`. The previous `.last()`
+      // resolved to a different (empty) container, which is why `attached`
+      // came back false even though a "SELECT FROM ..." button is plainly
+      // present in the DOM — the locator was searching the wrong dialog.
+      const liveDlg = () => page.locator("mat-dialog-container:visible").first()
+      if ((await liveDlg().locator("textarea").count().catch(() => 0)) === 0) {
+        const createExpl = liveDlg()
+          .locator('button:has-text("CREATE EXPLANATION")')
+          .first()
+        if ((await createExpl.count().catch(() => 0)) > 0) {
+          await createExpl.click({ timeout: 4000 }).catch(() => undefined)
+          await page.waitForTimeout(2500)
           const dom = await page
             .evaluate(() => {
               const d = document.querySelector("mat-dialog-container")
-              if (!d) return "(dialog closed after CREATE)"
+              if (!d) return "(dialog closed)"
               return Array.from(
                 d.querySelectorAll("input, textarea, button, mat-select, [contenteditable]"),
               )
                 .slice(0, 20)
                 .map((e) => ({
                   tag: e.tagName,
-                  txt: (e.textContent || "").trim().slice(0, 20),
+                  txt: (e.textContent || "").trim().slice(0, 22),
                   ph: e.getAttribute("placeholder"),
                 }))
             })
             .catch(() => null)
           logger.info(
-            { idx, afterCreate: dom },
-            "[Rep step4] date-first modal — committed date, inspecting next step",
+            { idx, afterCreateExplanation: dom },
+            "[Rep step4] opened CREATE EXPLANATION editor",
           )
         }
       }
@@ -725,7 +739,7 @@ async function fillCarrierQuestionExplanations(
       //    swapped the dialog contents (or opened a second one).
       let descFilled = false
       try {
-        const liveDialog = page.locator("mat-dialog-container:visible").last()
+        const liveDialog = page.locator("mat-dialog-container:visible").first()
         const ta = liveDialog.locator("textarea").first()
         if (await ta.count()) {
           await ta.fill(pick.explanation)
@@ -743,7 +757,14 @@ async function fillCarrierQuestionExplanations(
       //    belt-and-braces and harmless when the list is empty.
       let attached = false
       try {
-        const sel = dialog.locator('button:has-text("SELECT")').first()
+        // Real label is "library_books SELECT FROM ..." — scope to the FIRST
+        // visible dialog (see the CREATE EXPLANATION note above; `.last()`
+        // resolved to an empty container and silently found nothing).
+        const sel = page
+          .locator("mat-dialog-container:visible")
+          .first()
+          .locator('button:has-text("SELECT FROM"), button:has-text("SELECT")')
+          .first()
         if (await sel.count()) {
           await sel.click({ timeout: 4000 }).catch(() => undefined)
           await page.waitForTimeout(700)
