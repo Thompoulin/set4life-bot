@@ -2104,6 +2104,7 @@ async function fillTraining(
   const start = Date.now()
   let cleared = false
   while (Date.now() - start < PARSE_BUDGET_MS) {
+    const iterStart = Date.now()
     cleared = await waitForTabClear(page, "training", POLL_MS)
     if (cleared) break
     const stillProcessing = await page
@@ -2116,6 +2117,14 @@ async function fillTraining(
       break
     }
     logger.info({ elapsedMs: Date.now() - start }, "[Training] OCR still running — waiting")
+    // waitForTabClear returns FALSE INSTANTLY (not after POLL_MS) whenever
+    // the producer navbar is absent, which is exactly the case here: the
+    // AML flow lives on the deep sub-route /training/add/manually. Without
+    // this the loop spun at ~2 ms per pass — Agustin Quinones 2026-08-07
+    // logged the same elapsedMs 18 times inside 56 ms — burning a core for
+    // the full budget. Pace the loop regardless of how the wait exited.
+    const spent = Date.now() - iterStart
+    if (spent < POLL_MS) await page.waitForTimeout(POLL_MS - spent)
   }
   await snapshot(ctx, "tab-training-after-wait")
 
@@ -2217,6 +2226,22 @@ async function fillTraining(
     await (trainingSaveBtn as any).click().catch(() => undefined)
     await settle(page, 2_000)
     cleared = await waitForTabClear(page, "training", 10_000)
+  }
+  // Verify from the TAB, never from the sub-route. waitForTabClear needs
+  // `a.navbar-tab[href$="/training"]` in the DOM and returns false when it
+  // is missing (a deliberate guard against false positives). The AML form
+  // lives at /training/add/manually?..., where that navbar is not rendered
+  // — so asking there ALWAYS answers "not complete", even on a clean save.
+  // Agustin Quinones 2026-08-07: reported "Training tab did not verify
+  // complete" and blocked contracting while SureLC already held his AML
+  // record (WebCE, completed 2026-08-02). Navigate back, then re-ask.
+  if (!cleared) {
+    await goToTab(page, producerId, "training", logger).catch(() => undefined)
+    await settle(page, 1_000)
+    cleared = await waitForTabClear(page, "training", 10_000)
+    if (cleared) {
+      logger.info("[Training] tab is clean once re-checked from the tab itself")
+    }
   }
   await snapshot(ctx, "tab-training-after")
   if (!uploaded) {
@@ -2635,11 +2660,31 @@ async function fillEno(
     return { ok: false, reason: `E&O upload did not attach a file. ${await describeUploadablePage(page)}` }
   }
   if (!parseDone) {
-    return {
-      ok: false,
-      reason: `E&O parse did not finish within ${PARSE_BUDGET_MS / 1000}s. ${await describeUploadablePage(page)}`,
-      details: { extracted, policyNumber, carrier, caseLimit, totalLimit, effective, expiration },
+    // SureLC's OCR stalls indefinitely on large scanned-image certs —
+    // Rebecca Perez 2026-08-07: a 2.5 MB phone photo wrapped in a PDF
+    // sat in "Policy data parsing" past the whole 5-minute budget while
+    // a clean 900 KB PDF on the same run parsed fine.
+    //
+    // We do not actually NEED the OCR. Phase 3 below types every
+    // required field from OUR OWN record (policy #, limits, dates,
+    // carrier) and only defers to the parser for the carrier typeahead.
+    // Returning here threw that away and hard-blocked contracting, which
+    // is how 49 agents accumulated 302 E&O failures since mid-July.
+    // Give up only when we have nothing to type.
+    const canFillManually = Boolean(
+      policyNumberValue && effectiveValue && expirationValue,
+    )
+    if (!canFillManually) {
+      return {
+        ok: false,
+        reason: `E&O parse did not finish within ${PARSE_BUDGET_MS / 1000}s and no local policy data to fall back on. ${await describeUploadablePage(page)}`,
+        details: { extracted, policyNumber, carrier, caseLimit, totalLimit, effective, expiration },
+      }
     }
+    logger.warn(
+      { elapsedMs: Date.now() - start, policyNumber: policyNumberValue },
+      "[E&O] parse budget exhausted — falling through to manual fill from our own record",
+    )
   }
   if (cleared) {
     // Tab warning already gone — SureLC saved the policy on its own
