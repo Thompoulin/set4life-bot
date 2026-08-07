@@ -1940,27 +1940,21 @@ async function fillTraining(
   // bailed because the upload form isn't rendered when AML is done.)
   // If the AML header row holds a `MM/DD/YYYY` token, the rep already
   // has an AML cert on file and we no-op.
-  const amlRowText = await page
-    .$$eval("body", (els) => {
-      const root = els[0]
-      const txt = root?.innerText || ""
-      // Pull the line containing "Anti-Money Laundering" + the
-      // ~80 chars after it.
-      const i = txt.search(/Anti[- ]?Money Laundering/i)
-      if (i < 0) return ""
-      return txt.slice(i, i + 200)
-    })
-    .catch(() => "")
-  if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText)) {
-    logger.info({ amlRowExcerpt: amlRowText.slice(0, 120) }, "[Training] AML already on file (date detected) — skipping upload")
-    return { ok: true, alreadyDone: true, details: { detected: "amlRowHasDate" } }
-  }
-
-  // Wait for the certificates XHR to land before clicking UPLOAD.
+  // Wait for the certificates XHR to land BEFORE deciding anything.
   // Verified 2026-05-05 that the UPLOAD button appears in the DOM
   // before /training/courses/certificates returns; clicking it
   // pre-XHR navigates to a half-wired add page that silently swallows
   // the upload. Race-free pattern: wait up to 10s for the XHR.
+  //
+  // This wait used to sit AFTER the already-on-file detector below,
+  // which made that detector race the very request that renders the
+  // row it looks for. Agustin Quinones 2026-08-07: the XHR missed its
+  // 10s window, so the page still had no AML row, the detector found
+  // nothing, and the bot went off to upload a certificate for a rep
+  // who already had one on file (WebCE, completed 2026-08-02) — then
+  // failed with "AML upload did not attach a file" because SureLC
+  // renders no file input once AML is complete. Read the page only
+  // after its data has arrived.
   await page
     .waitForResponse(
       (r) => /\/training\/courses\/certificates/.test(r.url()) && r.status() === 200,
@@ -1971,6 +1965,32 @@ async function fillTraining(
         "[Training] certificates XHR did not return in 10s — proceeding anyway",
       ),
     )
+  await settle(page, 1_200)
+
+  const readAmlRow = async () =>
+    page
+      .$$eval("body", (els) => {
+        const root = els[0]
+        const txt = root?.innerText || ""
+        // Pull the line containing "Anti-Money Laundering" + the
+        // ~80 chars after it.
+        const i = txt.search(/Anti[- ]?Money Laundering/i)
+        if (i < 0) return ""
+        return txt.slice(i, i + 200)
+      })
+      .catch(() => "")
+  // Re-read a few times: even after the XHR resolves, Angular needs a
+  // frame or two to paint the row, and a false "no AML on file" here
+  // costs a whole wasted run.
+  let amlRowText = await readAmlRow()
+  for (let i = 0; i < 4 && !/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText); i++) {
+    await page.waitForTimeout(1_000)
+    amlRowText = await readAmlRow()
+  }
+  if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText)) {
+    logger.info({ amlRowExcerpt: amlRowText.slice(0, 120) }, "[Training] AML already on file (date detected) — skipping upload")
+    return { ok: true, alreadyDone: true, details: { detected: "amlRowHasDate" } }
+  }
 
   // The AML row lives inside a custom Angular component <sb-aml-course>.
   // Verified live 2026-05-05 — scoping inside this component is the
