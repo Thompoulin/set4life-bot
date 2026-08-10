@@ -1,186 +1,116 @@
+import { gotoBga, settle, uploadRemoteFile, firstVisible } from "../tabs/helpers.js";
 import { harvestBearer } from "./setTransferTypes.js";
-const BGA_BASE = "https://surelc.surancebay.com/surecrm";
-/** Keys that plausibly carry a requirement or document collection. */
-const REQUIREMENT_KEY_HINTS = [
-    "requirement",
-    "document",
-    "attachment",
-    "file",
-    "form",
-    "upload",
-    "lor",
-    "release",
-];
-function summarizeRequirements(appointment) {
-    const out = {};
-    for (const [key, value] of Object.entries(appointment)) {
-        const k = key.toLowerCase();
-        if (!REQUIREMENT_KEY_HINTS.some((h) => k.includes(h)))
-            continue;
-        // Keep arrays shallow — we want shape, not a giant dump in the log.
-        if (Array.isArray(value)) {
-            out[key] = value.slice(0, 12).map((entry) => entry && typeof entry === "object"
-                ? Object.fromEntries(Object.entries(entry).filter(([, v]) => typeof v !== "object" || v === null))
-                : entry);
-        }
-        else {
-            out[key] = value;
-        }
-    }
-    return out;
+const BGA_BASE = "https://surelc.surancebay.com";
+async function readAttachments(page, producerId) {
+    const bearer = await harvestBearer(page, 15_000);
+    if (!bearer)
+        return [];
+    const res = await fetch(`${BGA_BASE}/surecrm/attachments/${producerId}?withUndefined=true&withUnlinkedBusinessChecks=false`, { headers: { Authorization: `Bearer ${bearer}` } });
+    if (!res.ok)
+        return [];
+    const rows = (await res.json());
+    return (Array.isArray(rows) ? rows : []).map((r) => ({
+        id: r.id,
+        tags: r.tags ?? [],
+        formType: r.formType,
+        file: r.uploadedFileName ?? r.description,
+        carrierId: r.carrierId,
+    }));
 }
-/**
- * Candidate attach routes, tried in order. Every one of these is a
- * GUESS modelled on the known `/appointments-requests/{id}` surface —
- * none is confirmed. They only ever run with LOR_UPLOAD_ENABLED=true.
- */
-function candidateUploadUrls(appointmentRequestId) {
-    const base = `${BGA_BASE}/appointments-requests/${appointmentRequestId}`;
-    return [`${base}/documents`, `${base}/attachments`, `${base}/files`];
+/** Dump any open dialog's text so one run tells us what the tag picker asks for. */
+async function captureDialogs(page) {
+    return page
+        .$$eval("[role=dialog], mat-dialog-container, .mat-mdc-dialog-container", (els) => els.map((e) => e.innerText.slice(0, 600)))
+        .catch(() => []);
 }
 export async function uploadReleaseFormsForProducer(page, logger, input) {
     const uploadEnabled = process.env.LOR_UPLOAD_ENABLED === "true";
     const result = {
         ok: true,
+        uploadEnabled,
         uploaded: [],
         reconOnly: [],
-        notFound: [],
         failed: [],
-        recon: [],
-        uploadEnabled,
+        attachmentsBefore: [],
     };
     const wanted = input.carriers.filter((c) => c.carrierName && c.releaseFormUrl);
     if (wanted.length === 0)
         return result;
-    // Same SPA nudge as setTransferTypes — cheapest idempotent way to make
-    // the page issue a /surecrm/* request so we can lift the Bearer.
-    page
-        .evaluate((id) => {
-        history.pushState({}, "", `/bga/producers/${id}/profile`);
-        window.dispatchEvent(new PopStateEvent("popstate", { state: {} }));
-    }, input.producerId)
-        .catch(() => undefined);
-    const bearer = await harvestBearer(page, 15_000);
-    if (!bearer) {
-        result.ok = false;
-        result.failed.push({ carrier: "(all)", reason: "could not harvest Bearer from SPA" });
-        return result;
-    }
-    const gaId = input.gaId || "1322";
-    let list;
-    try {
-        const listRes = await fetch(`${BGA_BASE}/appointments-requests?producerId=${input.producerId}&gaId=${gaId}`, { headers: { Authorization: `Bearer ${bearer}` } });
-        if (!listRes.ok) {
-            result.ok = false;
-            result.failed.push({
-                carrier: "(all)",
-                reason: `list appointment-requests HTTP ${listRes.status}`,
-            });
-            return result;
-        }
-        list = (await listRes.json());
-    }
-    catch (err) {
+    const nav = await gotoBga(page, `${BGA_BASE}/bga/producers/${input.producerId}/documents`, logger);
+    if (!nav.ok) {
         result.ok = false;
         result.failed.push({
             carrier: "(all)",
-            reason: `list appointment-requests threw: ${err?.message || "error"}`,
+            reason: `BGA session bounced to OAuth at ${nav.finalUrl} opening the Documents tab`,
         });
         return result;
     }
+    await settle(page, 1_200);
+    result.attachmentsBefore = await readAttachments(page, input.producerId);
+    const beforeIds = new Set(result.attachmentsBefore.map((a) => a.id));
+    if (!uploadEnabled) {
+        result.reconOnly = wanted.map((c) => c.carrierName);
+        logger.info({
+            producerId: input.producerId,
+            attachments: result.attachmentsBefore,
+            carriers: result.reconOnly,
+        }, "[LOR] recon only (LOR_UPLOAD_ENABLED not set) — Documents tab read, nothing written");
+        return result;
+    }
+    // ── Write path ──
     for (const carrier of wanted) {
-        const target = list
-            .filter((a) => (a.carrierName || "").trim().toLowerCase() ===
-            carrier.carrierName.trim().toLowerCase())
-            .filter((a) => a.stage !== "Discarded")[0];
-        if (!target) {
-            result.notFound.push(carrier.carrierName);
-            continue;
-        }
-        // GET the full row — the list view omits requirements.
-        let full;
         try {
-            const res = await fetch(`${BGA_BASE}/appointments-requests/${target.appointmentRequestId}`, { headers: { Authorization: `Bearer ${bearer}` } });
-            if (!res.ok) {
+            // Same primitive that already lands AML + E&O on this producer.
+            const picked = await uploadRemoteFile(page, 'input[type="file"]', carrier.releaseFormUrl, logger);
+            if (!picked) {
                 result.failed.push({
                     carrier: carrier.carrierName,
-                    reason: `GET single HTTP ${res.status}`,
+                    reason: "no file input on the Documents tab (UI changed?)",
                 });
                 continue;
             }
-            full = (await res.json());
+            await settle(page, 2_000);
+            // SureLC asks for a document type after the file is chosen. Capture
+            // whatever it shows — this is what pins the correct tag — then make
+            // a best-effort save. If the labels don't match, the read-back below
+            // catches it rather than us assuming success.
+            const dialogs = await captureDialogs(page);
+            if (dialogs.length > 0) {
+                result.dialogRecon = [...(result.dialogRecon ?? []), ...dialogs];
+                logger.info({ dialogs }, "[LOR] document dialog after file pick");
+            }
+            const saveBtn = await firstVisible(page, [
+                'button:has-text("SAVE")',
+                'button:has-text("Save")',
+                'button:has-text("UPLOAD")',
+                'button:has-text("Upload")',
+                'button:has-text("ADD")',
+            ]);
+            if (saveBtn) {
+                await saveBtn.click().catch(() => undefined);
+                await settle(page, 3_000);
+            }
+            // Verification is the read-back, not the click. A new attachment
+            // must actually exist on the producer.
+            const after = await readAttachments(page, input.producerId);
+            result.attachmentsAfter = after;
+            const fresh = after.filter((a) => !beforeIds.has(a.id));
+            if (fresh.length > 0) {
+                fresh.forEach((a) => beforeIds.add(a.id));
+                result.uploaded.push(carrier.carrierName);
+                logger.info({ carrier: carrier.carrierName, attached: fresh }, "[LOR] release form attached to producer Documents");
+            }
+            else {
+                result.failed.push({
+                    carrier: carrier.carrierName,
+                    reason: "file was picked but no new attachment appeared — the type/tag step probably wasn't satisfied (see dialogRecon)",
+                });
+            }
         }
         catch (err) {
             result.failed.push({
                 carrier: carrier.carrierName,
-                reason: `GET single threw: ${err?.message || "error"}`,
-            });
-            continue;
-        }
-        result.recon.push({
-            carrier: carrier.carrierName,
-            appointmentRequestId: target.appointmentRequestId,
-            stage: target.stage,
-            type: target.type,
-            objectKeys: Object.keys(full).sort(),
-            requirementSummary: summarizeRequirements(full),
-        });
-        if (!uploadEnabled) {
-            result.reconOnly.push(carrier.carrierName);
-            continue;
-        }
-        // ── Write path — only with LOR_UPLOAD_ENABLED=true ──
-        let fileBuf;
-        let filename;
-        try {
-            const fileRes = await fetch(carrier.releaseFormUrl);
-            if (!fileRes.ok) {
-                result.failed.push({
-                    carrier: carrier.carrierName,
-                    reason: `LOR fetch HTTP ${fileRes.status}`,
-                });
-                continue;
-            }
-            fileBuf = Buffer.from(await fileRes.arrayBuffer());
-            filename =
-                decodeURIComponent(carrier.releaseFormUrl.split("?")[0]?.split("/").pop() || "release-form.pdf") || "release-form.pdf";
-        }
-        catch (err) {
-            result.failed.push({
-                carrier: carrier.carrierName,
-                reason: `LOR fetch threw: ${err?.message || "error"}`,
-            });
-            continue;
-        }
-        let attached = false;
-        const attempts = [];
-        for (const url of candidateUploadUrls(target.appointmentRequestId)) {
-            try {
-                const form = new FormData();
-                form.append("file", new Blob([new Uint8Array(fileBuf)], { type: "application/pdf" }), filename);
-                const res = await fetch(url, {
-                    method: "POST",
-                    headers: { Authorization: `Bearer ${bearer}` },
-                    body: form,
-                });
-                attempts.push(`${url} → ${res.status}`);
-                if (res.ok) {
-                    attached = true;
-                    break;
-                }
-            }
-            catch (err) {
-                attempts.push(`${url} → threw ${err?.message || "error"}`);
-            }
-        }
-        logger.info({ carrier: carrier.carrierName, attempts }, "[LOR] upload attempts");
-        if (attached) {
-            result.uploaded.push(carrier.carrierName);
-        }
-        else {
-            result.failed.push({
-                carrier: carrier.carrierName,
-                reason: `no candidate upload route accepted the LOR (${attempts.join("; ")})`,
+                reason: `threw: ${err?.message || "error"}`,
             });
         }
     }

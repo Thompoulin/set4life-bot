@@ -543,9 +543,13 @@ export async function runActivation(input, logger) {
                                             uploadEnabled: lorResult.uploadEnabled,
                                             uploaded: lorResult.uploaded,
                                             reconOnly: lorResult.reconOnly,
-                                            notFound: lorResult.notFound,
                                             failed: lorResult.failed,
-                                            recon: lorResult.recon,
+                                            attachmentsBefore: lorResult.attachmentsBefore,
+                                            attachmentsAfter: lorResult.attachmentsAfter,
+                                            // Text of SureLC's document-type dialog. This is what
+                                            // pins the correct tag for a release form — the one
+                                            // detail still unconfirmed.
+                                            dialogRecon: lorResult.dialogRecon,
                                         }, "[Phase A] letter-of-release attach");
                                         if (lorResult.failed.length > 0) {
                                             adminPhase.contracting.failed.push(...lorResult.failed.map((f) => ({
