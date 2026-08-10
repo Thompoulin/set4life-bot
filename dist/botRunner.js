@@ -28,34 +28,31 @@
  * Each phase is independently invocable so the main app can run them
  * with delays in between (waiting for SureLC to send emails, etc.).
  */
-import { chromium } from "playwright";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { loginAdmin } from "./admin/login.js";
+import { getAuthenticatedPage } from "./admin/sessionCache.js";
 import { addProducer, changeAffiliation } from "./admin/addProducer.js";
 import { fillFullProfile } from "./admin/fillProfile.js";
 import { repReview } from "./rep/review.js";
-import { CHROMIUM_ARGS } from "./browserArgs.js";
+import { launchChromium } from "./browserArgs.js";
 import { makeTabContext } from "./tabs/helpers.js";
 import { makeProgressReporter } from "./progressReporter.js";
 export async function runActivation(input, logger) {
     const evidenceDir = path.join(tmpdir(), "surelc-evidence", input.jobId);
     await fs.mkdir(evidenceDir, { recursive: true });
     const phases = new Set(input.phases ?? ["admin_setup", "rep_review", "admin_process"]);
-    const browser = await chromium.launch({
-        headless: true,
-        // --disable-blink-features=AutomationControlled stops Chrome from
-        // exposing the "I am being controlled by automation" signal that
-        // bot-detection scripts read from navigator.webdriver and the
-        // CDP client_id. Combined with the addInitScript on each context
-        // (sets navigator.webdriver = undefined before any page JS runs),
-        // this hides the most common Playwright fingerprints. Owner
-        // confirmed 2026-05-06 same credentials work fine in a real
-        // Chrome browser; only the bot bounces — strongest remaining
-        // suspect after UA cleanup is webdriver fingerprinting.
-        args: CHROMIUM_ARGS,
-    });
+    // CHROMIUM_ARGS includes --disable-blink-features=AutomationControlled,
+    // which stops Chrome from exposing the "I am being controlled by
+    // automation" signal that bot-detection scripts read from
+    // navigator.webdriver and the CDP client_id. Combined with the
+    // addInitScript on each context (sets navigator.webdriver = undefined
+    // before any page JS runs), this hides the most common Playwright
+    // fingerprints. Owner confirmed 2026-05-06 same credentials work fine
+    // in a real Chrome browser; only the bot bounces — strongest remaining
+    // suspect after UA cleanup is webdriver fingerprinting.
+    // launchChromium retries the intermittent SwiftShader SIGSEGV-on-launch.
+    const browser = await launchChromium(logger);
     const result = {
         success: true,
         stage: "launched",
@@ -87,60 +84,73 @@ export async function runActivation(input, logger) {
         let producerId = input.producer.existingProducerId;
         if (phases.has("admin_setup")) {
             const finishLogin = await progress.startStep("phaseA_admin_login", "Logging into SureLC BGA admin");
-            const ctxBrowser = await browser.newContext({
-                viewport: { width: 1280, height: 900 },
-                // Standard Chrome 124 / Linux UA. Previously we appended
-                // "Set4LifeBot" to make our outbound traffic identifiable in
-                // SureLC's logs, but that was a giant "I am a bot, please
-                // block me" flag — owner-confirmed 2026-05-06 the SureLC
-                // OAuth portal accepts the login (which is also the path
-                // most-likely to be UA-checked) but every admin page (like
-                // /bga/producers) bounces back to OAuth on the very first
-                // navigation. Account has no MFA and works flawlessly
-                // manually with the same credentials, so the only meaningful
-                // remaining difference between manual + bot is the bot
-                // identifier in the User-Agent. Drop it.
-                userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            // Reuse a cached authenticated BGA session when one is valid, only
+            // doing a full OAuth login (loginAdmin) when the cache is missing /
+            // expired / rejected. getAuthenticatedPage owns the fail-safe fallback:
+            // any uncertainty on the reuse path drops through to a normal login, so
+            // this is never worse than logging in every time (which is what we did
+            // before). Context options below are passed through verbatim.
+            const { context: ctxBrowser, page, reused, loginResult } = await getAuthenticatedPage(browser, input.adminCreds, logger, {
+                contextOptions: {
+                    viewport: { width: 1280, height: 900 },
+                    // Standard Chrome 124 / Linux UA. Previously we appended
+                    // "Set4LifeBot" to make our outbound traffic identifiable in
+                    // SureLC's logs, but that was a giant "I am a bot, please
+                    // block me" flag — owner-confirmed 2026-05-06 the SureLC
+                    // OAuth portal accepts the login (which is also the path
+                    // most-likely to be UA-checked) but every admin page (like
+                    // /bga/producers) bounces back to OAuth on the very first
+                    // navigation. Account has no MFA and works flawlessly
+                    // manually with the same credentials, so the only meaningful
+                    // remaining difference between manual + bot is the bot
+                    // identifier in the User-Agent. Drop it.
+                    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                },
+                // Hide navigator.webdriver before any SureLC page JS reads it.
+                // I removed this 2026-05-06 thinking it was crashing pages,
+                // but the post-removal run revealed the bot was getting
+                // bounced to the OAuth login page on every tab navigation
+                // (diagnostic showed 'visible buttons: FORGOT PASSWORD? |
+                // LOGIN'). Tab navigation worked one run earlier WHEN this
+                // override was active. Restore the minimal version (just the
+                // webdriver flag — drop the plugins/languages/window.chrome
+                // patches that may have been the actual crash source). Owner-
+                // confirmed: same credentials manually open every page fine,
+                // so SureLC's auth guard is reading webdriver=true and
+                // refusing the session for admin pages.
+                initScripts: [
+                    () => {
+                        try {
+                            Object.defineProperty(Navigator.prototype, "webdriver", {
+                                get: () => undefined,
+                                configurable: true,
+                            });
+                        }
+                        catch {
+                            /* property already locked; best-effort */
+                        }
+                    },
+                ],
             });
-            // Hide navigator.webdriver before any SureLC page JS reads it.
-            // I removed this 2026-05-06 thinking it was crashing pages,
-            // but the post-removal run revealed the bot was getting
-            // bounced to the OAuth login page on every tab navigation
-            // (diagnostic showed 'visible buttons: FORGOT PASSWORD? |
-            // LOGIN'). Tab navigation worked one run earlier WHEN this
-            // override was active. Restore the minimal version (just the
-            // webdriver flag — drop the plugins/languages/window.chrome
-            // patches that may have been the actual crash source). Owner-
-            // confirmed: same credentials manually open every page fine,
-            // so SureLC's auth guard is reading webdriver=true and
-            // refusing the session for admin pages.
-            await ctxBrowser.addInitScript(() => {
-                try {
-                    Object.defineProperty(Navigator.prototype, "webdriver", {
-                        get: () => undefined,
-                        configurable: true,
-                    });
-                }
-                catch {
-                    /* property already locked; best-effort */
-                }
-            });
-            const page = await ctxBrowser.newPage();
-            page.setDefaultTimeout(30_000);
             const tabCtx = makeTabContext(page, logger, input.jobId);
-            const loginResult = await loginAdmin(page, input.adminCreds, logger);
+            // reused === true means a valid cached session was verified authed and
+            // NO OAuth login ran; loginResult is only present when we actually
+            // logged in, so preserve the exact fatal/reason handling from before.
+            const loginOk = reused || !!loginResult?.ok;
             await finishLogin({
-                ok: loginResult.ok,
-                msg: loginResult.ok
-                    ? "Logged in"
-                    : loginResult.reason
+                ok: loginOk,
+                msg: loginOk
+                    ? reused
+                        ? "Logged in (reused session)"
+                        : "Logged in"
+                    : loginResult?.reason
                         ? `Login failed — ${loginResult.reason}`
                         : "Login failed — check credentials",
             });
-            if (!loginResult.ok) {
+            if (!loginOk) {
                 result.success = false;
                 result.stage = "admin_login_failed";
-                result.needsHumanReason = loginResult.reason ?? "admin BGA login failed";
+                result.needsHumanReason = loginResult?.reason ?? "admin BGA login failed";
                 await ctxBrowser.close().catch(() => { });
                 return finalize(result, evidenceDir, [...tabCtx.evidenceFiles]);
             }
@@ -177,15 +187,21 @@ export async function runActivation(input, logger) {
                 // list. If we can't set the affiliation, profile + Fastlane
                 // can't run either — bail with `needs_human` so the timeline
                 // surfaces a clear reason instead of 5 cascading tab failures.
-                let affOk = false;
+                let affResult = { ok: false };
                 try {
-                    affOk = await changeAffiliation(tabCtx, producerId, input.producer.affiliationName);
+                    affResult = await changeAffiliation(tabCtx, producerId, input.producer.affiliationName);
                 }
                 catch (err) {
+                    // An unexpected throw is treated as a hard failure (bail) — we
+                    // only proceed-anyway for the explicit "unverified" nav-bounce
+                    // case that changeAffiliation returns deliberately.
                     logger.warn({ err: err?.message }, "changeAffiliation threw");
-                    affOk = false;
+                    affResult = { ok: false };
                 }
-                if (!affOk) {
+                if (!affResult.ok && !affResult.unverified) {
+                    // Reached the row, affiliation is NOT the target, and we could
+                    // not set it — a genuine wrong/unset affiliation. Profile tabs
+                    // bounce without affiliation, so bail with needs_human.
                     logger.warn({ producerId, affiliation: input.producer.affiliationName }, "changeAffiliation failed — bailing admin_setup before profile/contracting");
                     adminPhase.ok = false;
                     result.success = false;
@@ -194,6 +210,17 @@ export async function runActivation(input, logger) {
                         `Could not set affiliation "${input.producer.affiliationName}" on producer ${producerId}. ` +
                             `BGA profile tabs are inaccessible without affiliation; admin must set it manually in SureLC, then re-run the bot.`;
                     return result;
+                }
+                if (affResult.unverified) {
+                    // Could NOT reach/verify affiliation (BGA list nav bounced or the
+                    // producer row never rendered) — a flaky-nav case, NOT a confirmed
+                    // wrong affiliation. Existing producers are almost always already
+                    // "S4L LOA", so PROCEED to profile/contracting rather than bail on
+                    // one bad nav (Elizabeth Sanchez 2026-07-10 was blocked here). We
+                    // do NOT flag needs_human — that would suppress the daily retest —
+                    // just log loudly. If affiliation genuinely wasn't set, the
+                    // downstream tabs/Fastlane will surface it.
+                    logger.warn({ producerId, affiliation: input.producer.affiliationName }, "changeAffiliation UNVERIFIED (nav bounce / row not rendered) — proceeding to profile + contracting assuming the existing producer is already affiliated; verify in SureLC if downstream steps bounce");
                 }
             }
             else {
@@ -307,39 +334,52 @@ export async function runActivation(input, logger) {
                             const dedup = await dedupAppointmentRequests(tabCtx.page, producerId, "1322", logger);
                             if (dedup) {
                                 logger.info({ producerId, dedup }, "[Fastlane] pre-dedup result");
-                                // Skip Fastlane if the producer has ANY active
-                                // appointment-requests. Fastlane is a "submit one
-                                // producer for many carriers" wizard — it doesn't
-                                // take a missing-carriers list, it just creates a
-                                // fresh Producer-stage row for every configured
-                                // carrier. Firing on top of existing active rows
-                                // produces the BGA duplicates that Ana then has to
-                                // discard by hand (2026-05-23 incident; previously
-                                // Tonette 2026-05-18→05-20 and Zachary 2026-05-09).
+                                // Fastlane only adds the carriers we pass in
+                                // `selectedCarriers` (never ADD ALL). Safe path when
+                                // some appointments already exist:
+                                //   • If every selected carrier already has an alive
+                                //     appointment-request → skip (avoid Producer-stage
+                                //     dups Ana has to discard).
+                                //   • If selected carriers are MISSING → run Fastlane
+                                //     for the missing ones only.
                                 //
-                                // The earlier `>= 8 OR (deleted > 0 with active)`
-                                // threshold was a workaround for the 8-active-rep
-                                // common case; reps stuck at 1–7 active still
-                                // triggered Fastlane each retry and accumulated
-                                // dupes. Now: if the dedup pass found any alive
-                                // request, contracting is considered already-
-                                // submitted — admin handles further additions
-                                // manually via the BGA portal. The brand-new case
-                                // (zero alive) still fires Fastlane normally.
-                                if (dedup.uniqueCarriers >= 1) {
+                                // Prior gate `uniqueCarriers >= 1` was too aggressive:
+                                // agents stuck with only Foresters (or any partial
+                                // set) never got the rest of their portfolio submitted
+                                // (Juan Pablo Betancurt 2026-07-24). Keep the zero-
+                                // alive first-time path, and only skip when the
+                                // selection is fully covered.
+                                const selectedForGate = (input.contracting?.carriers || [])
+                                    .map((c) => String(c?.carrierName || "").trim())
+                                    .filter((n) => n.length > 0);
+                                const aliveNames = new Set(Object.keys(dedup.byCarrierStage || {}).map((n) => n.toLowerCase()));
+                                const missingSelected = selectedForGate.filter((n) => !aliveNames.has(n.toLowerCase()));
+                                if (selectedForGate.length > 0 &&
+                                    missingSelected.length === 0) {
                                     adminPhase.contracting = {
                                         submitted: ["already-submitted-skipped-fastlane"],
                                         failed: [],
                                     };
                                     await finishContracting({
                                         ok: true,
-                                        msg: `Skipped Fastlane — already have ${dedup.uniqueCarriers} active appointment-request(s) (deleted ${dedup.deleted} dup(s))`,
+                                        msg: `Skipped Fastlane — all ${selectedForGate.length} selected carrier(s) already have active appointment-request(s) (deleted ${dedup.deleted} dup(s))`,
                                     });
                                     preDedupSkipsFastlane = true;
                                 }
-                                // else dedup.uniqueCarriers === 0 → confirmed zero active
-                                // requests → genuine first-time contracting; Fastlane
-                                // runs normally below.
+                                else if (selectedForGate.length > 0 &&
+                                    missingSelected.length > 0) {
+                                    // Stash missing names so Fastlane runs with only these
+                                    // (avoids re-submitting alive carriers).
+                                    ;
+                                    input.__fastlaneMissingCarriers = missingSelected;
+                                    logger.info({
+                                        producerId,
+                                        alive: selectedForGate.length - missingSelected.length,
+                                        missing: missingSelected,
+                                    }, "[Fastlane] partial portfolio — will submit only missing selected carriers");
+                                }
+                                // else selectedForGate empty OR uniqueCarriers === 0 →
+                                // Fastlane runs with full selection (or nothing if empty).
                             }
                             else {
                                 // dedup === null: could not read existing-request state.
@@ -384,9 +424,28 @@ export async function runActivation(input, logger) {
                         const producerDisplayName = lastName && firstName
                             ? `${lastName}, ${firstName}`
                             : input.producer.lastName || "";
+                        // Pass ONLY the agent's selected carriers to Fastlane so it
+                        // adds exactly those and never "ADD ALL" (owner directive).
+                        // input.contracting.carriers is the agent's selection from
+                        // agent_carrier_contracting (built by the backoffice pipeline).
+                        // When pre-dedup found a partial portfolio, restrict further
+                        // to the missing names only (see __fastlaneMissingCarriers).
+                        const missingOnly = input
+                            .__fastlaneMissingCarriers;
+                        const missingSet = missingOnly
+                            ? new Set(missingOnly.map((n) => n.toLowerCase()))
+                            : null;
+                        const selectedCarriers = (input.contracting?.carriers || [])
+                            .map((c) => ({
+                            carrierName: (c.carrierName || "").trim(),
+                            carrierNaic: c.carrierNaic,
+                        }))
+                            .filter((c) => c.carrierName.length > 0)
+                            .filter((c) => missingSet ? missingSet.has(c.carrierName.toLowerCase()) : true);
                         const r = await runFastlaneOneProducerManyCarriers(tabCtx, {
                             producerDisplayName,
                             producerId,
+                            selectedCarriers,
                         });
                         adminPhase.contracting = {
                             submitted: r.ok ? ["all-via-fastlane"] : [],
@@ -463,6 +522,50 @@ export async function runActivation(input, logger) {
                                 catch (err) {
                                     logger.warn({ err: err?.message }, "[Phase A] transfer-type flip threw — non-blocking");
                                 }
+                                // Having just flipped these to "Transfer", the carrier
+                                // now wants a Letter of Release. Attach it. Recon-only
+                                // until LOR_UPLOAD_ENABLED=true — the BGA attach route
+                                // is still unconfirmed, so by default this GETs the
+                                // appointments and logs their requirement shape rather
+                                // than POSTing anything at live SureLC.
+                                try {
+                                    const lorCarriers = (input.contracting?.carriers || [])
+                                        .filter((c) => c.requestType === "Transfer" && c.releaseFormUrl)
+                                        .map((c) => ({
+                                        carrierName: c.carrierName || "",
+                                        releaseFormUrl: c.releaseFormUrl,
+                                    }))
+                                        .filter((c) => c.carrierName);
+                                    if (lorCarriers.length > 0) {
+                                        const { uploadReleaseFormsForProducer } = await import("./admin/uploadReleaseForms.js");
+                                        const lorResult = await uploadReleaseFormsForProducer(tabCtx.page, logger, { producerId, carriers: lorCarriers });
+                                        logger.info({
+                                            uploadEnabled: lorResult.uploadEnabled,
+                                            uploaded: lorResult.uploaded,
+                                            reconOnly: lorResult.reconOnly,
+                                            notFound: lorResult.notFound,
+                                            failed: lorResult.failed,
+                                            recon: lorResult.recon,
+                                        }, "[Phase A] letter-of-release attach");
+                                        if (lorResult.failed.length > 0) {
+                                            adminPhase.contracting.failed.push(...lorResult.failed.map((f) => ({
+                                                carrier: `${f.carrier} (LOR)`,
+                                                reason: f.reason,
+                                            })));
+                                        }
+                                    }
+                                    else {
+                                        const transfersNeedingLor = (input.contracting?.carriers || []).filter((c) => c.requestType === "Transfer" && !c.releaseFormUrl);
+                                        if (transfersNeedingLor.length > 0) {
+                                            logger.warn({
+                                                carriers: transfersNeedingLor.map((c) => c.carrierName),
+                                            }, "[Phase A] Transfer carriers with NO release form URL — carrier will ask for an LOR we don't have");
+                                        }
+                                    }
+                                }
+                                catch (err) {
+                                    logger.warn({ err: err?.message }, "[Phase A] letter-of-release attach threw — non-blocking");
+                                }
                             }
                         }
                     }
@@ -508,11 +611,23 @@ export async function runActivation(input, logger) {
                 if (!r.ok)
                     result.success = false;
                 const skippedCount = r.skipped?.length ?? 0;
+                // Each failed carrier's reason already carries the exact blocker the
+                // wizard rejected on (reviewOneCarrier builds "BLOCKED ON — red
+                // required fields → …" / "unsatisfiable carrier-question card(s)").
+                // The summary used to drop it, so the admin only saw "3 failed" with
+                // no way to know WHICH questions to answer or sign manually. Surface
+                // the per-carrier reasons so it's an actionable inventory (owner
+                // 2026-07-21 — the compliance-safe half of the questionnaire fix: the
+                // bot never guesses a carrier answer, it names what a human must set).
+                const failDetail = (r.failed ?? [])
+                    .map((f) => (f?.reason || "unknown").slice(0, 400))
+                    .join(" ||| ");
                 await finishRep({
                     ok: r.ok,
                     msg: r.ok
                         ? `Signed ${r.signed} carrier(s)${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`
-                        : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}`,
+                        : `Signed ${r.signed}, ${r.failed.length} failed${skippedCount ? `, ${skippedCount} skipped (withdrawn)` : ""}` +
+                            (failDetail ? ` — needs human on: ${failDetail}` : ""),
                     meta: r,
                 });
             }
@@ -573,6 +688,11 @@ export async function runActivation(input, logger) {
     catch (err) {
         result.success = false;
         result.error = err?.message || "orchestrator threw";
+        // DIAGNOSTIC (2026-07-12): the fleet-wide admin_setup bail leaves stage
+        // "launched" with no reason in the timeline — the throw escapes every
+        // inner handler. Log the message + stack at error level so the exact
+        // throwing operation shows in `dokku logs s4l-surelc-bot`.
+        logger.error({ err: err?.message, stack: err?.stack, stage: result.stage, producerId: result.producerId }, "orchestrator threw — admin_setup bailed to outer catch");
         return finalize(result, evidenceDir, result.evidenceFiles);
     }
     finally {

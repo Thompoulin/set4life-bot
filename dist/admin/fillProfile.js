@@ -719,6 +719,18 @@ const QUESTION_KEYWORD_MAP = [
     { slug: "bankruptcyPending", match: (t) => /bankruptcy pending/i.test(t) },
     { slug: "hasLiens", match: (t) => /liens|unsatisfied judgments/i.test(t) },
     { slug: "alias", match: (t) => /used any other name|alias/i.test(t) },
+    // Missing from the original v2 map (Ana 2026-07-22): interruptions / Q9
+    // mismatches + Q2/Q17 "No" never landing because these slugs never matched.
+    { slug: "interruptions", match: (t) => /interruptions in licensing|license.*interrupt|lapsed.*license|reinstat/i.test(t) },
+    { slug: "wasDisciplined", match: (t) => /disciplined by|sanctioned|censured|penalized/i.test(t) },
+    { slug: "hadComplaint", match: (t) => /consumer.*complaint|complaint.*against you/i.test(t) },
+    { slug: "consumerComplaint", match: (t) => /consumer initiated complaint/i.test(t) },
+    { slug: "secNonInsuranceLicense", match: (t) => /non.?insurance|securities license.*revoked/i.test(t) },
+    { slug: "dishonestOrUnethical", match: (t) => /dishonest|unethical|fraudulent practice/i.test(t) },
+    { slug: "relatedToFinance", match: (t) => /financial institution|related to finance|banking/i.test(t) },
+    { slug: "revenueServiceMatters", match: (t) => /internal revenue|irs|revenue service/i.test(t) },
+    // Foresters / carrier misc often surfaces this wording
+    { slug: "usWorkAuth", match: (t) => /legally entitled to work|authorized to work|work in the (usa|united states)/i.test(t) },
 ];
 const matchQuestionSlug = (text) => {
     for (const { slug, match } of QUESTION_KEYWORD_MAP) {
@@ -762,6 +774,15 @@ const getSlugQuestionPattern = (slug) => {
         bankruptcyPending: "bankruptcy pending",
         hasLiens: "liens|unsatisfied judgments",
         alias: "used any other name|alias",
+        interruptions: "interruptions in licensing|license.*interrupt|lapsed.*license",
+        wasDisciplined: "disciplined by|sanctioned|censured|penalized",
+        hadComplaint: "consumer.*complaint|complaint.*against you",
+        consumerComplaint: "consumer initiated complaint",
+        secNonInsuranceLicense: "non.?insurance|securities license.*revoked",
+        dishonestOrUnethical: "dishonest|unethical|fraudulent practice",
+        relatedToFinance: "financial institution|related to finance|banking",
+        revenueServiceMatters: "internal revenue|irs|revenue service",
+        usWorkAuth: "legally entitled to work|authorized to work|work in the (usa|united states)",
     };
     return map[slug] || slug;
 };
@@ -810,13 +831,51 @@ async function fillQuestionsV2(ctx, input) {
             presentSlugs.add(slug);
     }
     logger.info({ matchedSlugs: presentSlugs.size }, "[Questions/v2] question inventory");
+    // Pass 1: explicitly set No answers. v1 used "ALL NO" then flipped Yes;
+    // v2 only handled Yes and left unanswered radios blank, so questions that
+    // should be No (Q2/Q17 etc.) never carried over (Ana 2026-07-22).
+    let noSet = 0;
+    for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
+        if (!ans || ans.answer !== "no")
+            continue;
+        if (!presentSlugs.has(slug) && !getSlugQuestionPattern(slug))
+            continue;
+        const clicked = await page
+            .evaluate((slugMap) => {
+            const sbQs = Array.from(document.querySelectorAll("sb-question"));
+            for (const q of sbQs) {
+                const txt = (q.textContent || "").replace(/\s+/g, " ").trim();
+                const wanted = slugMap.some((re) => new RegExp(re.pattern, re.flags).test(txt));
+                if (!wanted)
+                    continue;
+                const no = q.querySelector('input[type="radio"][value="false"]');
+                if (no && !no.checked) {
+                    no.click();
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+            .catch(() => false);
+        if (clicked)
+            noSet++;
+    }
+    if (noSet > 0) {
+        logger.info({ noSet }, "[Questions/v2] set No radios");
+        await page.waitForTimeout(400);
+    }
     let yesSet = 0;
     let saved = 0;
     let skipped = 0;
     for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
         if (!ans || ans.answer !== "yes")
             continue;
-        if (!presentSlugs.has(slug)) {
+        // Don't require presentSlugs membership alone — matchQuestionSlug may
+        // have missed a newly-added keyword even though getSlugQuestionPattern
+        // can still target the text. Prefer pattern match.
+        const pattern = getSlugQuestionPattern(slug);
+        if (!presentSlugs.has(slug) && pattern === slug) {
             logger.warn({ slug }, "[Questions/v2] no on-screen question matched our slug");
             continue;
         }
@@ -1496,7 +1555,26 @@ async function fillTraining(ctx, producerId, input) {
     // bailed because the upload form isn't rendered when AML is done.)
     // If the AML header row holds a `MM/DD/YYYY` token, the rep already
     // has an AML cert on file and we no-op.
-    const amlRowText = await page
+    // Wait for the certificates XHR to land BEFORE deciding anything.
+    // Verified 2026-05-05 that the UPLOAD button appears in the DOM
+    // before /training/courses/certificates returns; clicking it
+    // pre-XHR navigates to a half-wired add page that silently swallows
+    // the upload. Race-free pattern: wait up to 10s for the XHR.
+    //
+    // This wait used to sit AFTER the already-on-file detector below,
+    // which made that detector race the very request that renders the
+    // row it looks for. Agustin Quinones 2026-08-07: the XHR missed its
+    // 10s window, so the page still had no AML row, the detector found
+    // nothing, and the bot went off to upload a certificate for a rep
+    // who already had one on file (WebCE, completed 2026-08-02) — then
+    // failed with "AML upload did not attach a file" because SureLC
+    // renders no file input once AML is complete. Read the page only
+    // after its data has arrived.
+    await page
+        .waitForResponse((r) => /\/training\/courses\/certificates/.test(r.url()) && r.status() === 200, { timeout: 10_000 })
+        .catch(() => logger.warn("[Training] certificates XHR did not return in 10s — proceeding anyway"));
+    await settle(page, 1_200);
+    const readAmlRow = async () => page
         .$$eval("body", (els) => {
         const root = els[0];
         const txt = root?.innerText || "";
@@ -1508,18 +1586,18 @@ async function fillTraining(ctx, producerId, input) {
         return txt.slice(i, i + 200);
     })
         .catch(() => "");
+    // Re-read a few times: even after the XHR resolves, Angular needs a
+    // frame or two to paint the row, and a false "no AML on file" here
+    // costs a whole wasted run.
+    let amlRowText = await readAmlRow();
+    for (let i = 0; i < 4 && !/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText); i++) {
+        await page.waitForTimeout(1_000);
+        amlRowText = await readAmlRow();
+    }
     if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText)) {
         logger.info({ amlRowExcerpt: amlRowText.slice(0, 120) }, "[Training] AML already on file (date detected) — skipping upload");
         return { ok: true, alreadyDone: true, details: { detected: "amlRowHasDate" } };
     }
-    // Wait for the certificates XHR to land before clicking UPLOAD.
-    // Verified 2026-05-05 that the UPLOAD button appears in the DOM
-    // before /training/courses/certificates returns; clicking it
-    // pre-XHR navigates to a half-wired add page that silently swallows
-    // the upload. Race-free pattern: wait up to 10s for the XHR.
-    await page
-        .waitForResponse((r) => /\/training\/courses\/certificates/.test(r.url()) && r.status() === 200, { timeout: 10_000 })
-        .catch(() => logger.warn("[Training] certificates XHR did not return in 10s — proceeding anyway"));
     // The AML row lives inside a custom Angular component <sb-aml-course>.
     // Verified live 2026-05-05 — scoping inside this component is the
     // only safe way to identify the AML upload button (Training has 6+
@@ -1640,6 +1718,7 @@ async function fillTraining(ctx, producerId, input) {
     const start = Date.now();
     let cleared = false;
     while (Date.now() - start < PARSE_BUDGET_MS) {
+        const iterStart = Date.now();
         cleared = await waitForTabClear(page, "training", POLL_MS);
         if (cleared)
             break;
@@ -1651,6 +1730,15 @@ async function fillTraining(ctx, producerId, input) {
             break;
         }
         logger.info({ elapsedMs: Date.now() - start }, "[Training] OCR still running — waiting");
+        // waitForTabClear returns FALSE INSTANTLY (not after POLL_MS) whenever
+        // the producer navbar is absent, which is exactly the case here: the
+        // AML flow lives on the deep sub-route /training/add/manually. Without
+        // this the loop spun at ~2 ms per pass — Agustin Quinones 2026-08-07
+        // logged the same elapsedMs 18 times inside 56 ms — burning a core for
+        // the full budget. Pace the loop regardless of how the wait exited.
+        const spent = Date.now() - iterStart;
+        if (spent < POLL_MS)
+            await page.waitForTimeout(POLL_MS - spent);
     }
     await snapshot(ctx, "tab-training-after-wait");
     // After Recognition completes, the "Add Training" manual form is
@@ -1748,6 +1836,22 @@ async function fillTraining(ctx, producerId, input) {
         await trainingSaveBtn.click().catch(() => undefined);
         await settle(page, 2_000);
         cleared = await waitForTabClear(page, "training", 10_000);
+    }
+    // Verify from the TAB, never from the sub-route. waitForTabClear needs
+    // `a.navbar-tab[href$="/training"]` in the DOM and returns false when it
+    // is missing (a deliberate guard against false positives). The AML form
+    // lives at /training/add/manually?..., where that navbar is not rendered
+    // — so asking there ALWAYS answers "not complete", even on a clean save.
+    // Agustin Quinones 2026-08-07: reported "Training tab did not verify
+    // complete" and blocked contracting while SureLC already held his AML
+    // record (WebCE, completed 2026-08-02). Navigate back, then re-ask.
+    if (!cleared) {
+        await goToTab(page, producerId, "training", logger).catch(() => undefined);
+        await settle(page, 1_000);
+        cleared = await waitForTabClear(page, "training", 10_000);
+        if (cleared) {
+            logger.info("[Training] tab is clean once re-checked from the tab itself");
+        }
     }
     await snapshot(ctx, "tab-training-after");
     if (!uploaded) {
@@ -2013,28 +2117,46 @@ async function fillEno(ctx, producerId, input) {
     // silently no-op'd because the inputs didn't exist yet, then let the
     // bot navigate away with empty required fields and trigger SureLC's
     // "Invalid Information Detected" modal on the next tab.
-    let uploaded = false;
-    const uploadBtn = await firstVisible(page, [
+    // July-2026 SureLC rebuild: the E&O upload affordance is now an ICON-ONLY
+    // Material button (a `publish` mat-icon ligature inside button.message__button)
+    // — no "UPLOAD"/"Browse" text anywhere. The old selector list missed it, so
+    // the bot fell back to stuffing the hidden Angular file input directly; the
+    // page then showed "Processing… / Uploading the file…" forever because
+    // SureLC's uploader keys off ITS OWN filechooser event, not a raw input
+    // change (verified from the Destiney Hall run snapshots, 2026-07-21 —
+    // stage 1 spinner never completed across two 300s runs). Clicking the real
+    // button + answering the filechooser is the only path that works on the
+    // rebuilt UI, so it's now first in the list and the direct-input path is a
+    // last resort.
+    const ENO_UPLOAD_BUTTON_SELECTORS = [
+        'button.message__button:has(mat-icon:text-is("publish"))',
+        'button:has(mat-icon:text-is("publish"))',
+        'button:has-text("publish")',
         'button:has-text("UPLOAD")',
         'button:has-text("Upload")',
         'button:has-text("Browse")',
         'a:has-text("UPLOAD")',
-    ]);
-    if (uploadBtn) {
+    ];
+    const uploadViaButton = async () => {
+        const btn = await firstVisible(page, ENO_UPLOAD_BUTTON_SELECTORS);
+        if (!btn)
+            return false;
         try {
             await assertOnProducerTab(page, producerId, "eno");
             const [fc] = await Promise.all([
                 page.waitForEvent("filechooser", { timeout: 8_000 }),
-                uploadBtn.click(),
+                btn.click(),
             ]);
             await fc.setFiles(downloaded.localPath);
-            uploaded = true;
             await settle(page, 2500);
+            return true;
         }
         catch (err) {
             logger.warn("[E&O] filechooser path threw", { err: err.message });
+            return false;
         }
-    }
+    };
+    let uploaded = await uploadViaButton();
     if (!uploaded) {
         await assertOnProducerTab(page, producerId, "eno");
         uploaded = await uploadRemoteFile(page, 'input[type="file"]', url, logger).catch(() => false);
@@ -2056,9 +2178,15 @@ async function fillEno(ctx, producerId, input) {
     // while accommodating SureLC's slowest observed runs.
     const PARSE_BUDGET_MS = 300_000;
     const POLL_MS = 1_500;
+    // If the panel sits on stage 1 ("Uploading the file…") this long, the upload
+    // never actually reached SureLC (the direct-input symptom above) — reload the
+    // tab and retry ONCE through the real button path instead of burning the
+    // whole budget on a spinner that will never move.
+    const STUCK_UPLOADING_MS = 90_000;
     const start = Date.now();
     let cleared = false;
     let parseDone = false;
+    let retriedStuckUpload = false;
     while (Date.now() - start < PARSE_BUDGET_MS) {
         cleared = await waitForTabClear(page, "eno", POLL_MS);
         if (cleared) {
@@ -2077,6 +2205,20 @@ async function fillEno(ctx, producerId, input) {
             parseDone = true;
             break;
         }
+        const stuckUploading = /Uploading the file/i.test(bodyText) &&
+            !/File['’]s type detection[\s\S]{0,40}(done|check)/i.test(bodyText);
+        if (stuckUploading &&
+            !retriedStuckUpload &&
+            Date.now() - start > STUCK_UPLOADING_MS) {
+            retriedStuckUpload = true;
+            logger.warn({ elapsedMs: Date.now() - start }, "[E&O] stuck at 'Uploading the file…' — reloading tab and retrying via the upload button");
+            await page.reload({ waitUntil: "domcontentloaded" }).catch(() => { });
+            await settle(page, 3000);
+            await assertOnProducerTab(page, producerId, "eno");
+            const retried = await uploadViaButton();
+            logger.info({ retried }, "[E&O] stuck-upload retry attempted");
+            continue;
+        }
         logger.info({ elapsedMs: Date.now() - start }, "[E&O] processing — waiting");
     }
     await snapshot(ctx, "tab-eno-parse-done");
@@ -2084,11 +2226,26 @@ async function fillEno(ctx, producerId, input) {
         return { ok: false, reason: `E&O upload did not attach a file. ${await describeUploadablePage(page)}` };
     }
     if (!parseDone) {
-        return {
-            ok: false,
-            reason: `E&O parse did not finish within ${PARSE_BUDGET_MS / 1000}s. ${await describeUploadablePage(page)}`,
-            details: { extracted, policyNumber, carrier, caseLimit, totalLimit, effective, expiration },
-        };
+        // SureLC's OCR stalls indefinitely on large scanned-image certs —
+        // Rebecca Perez 2026-08-07: a 2.5 MB phone photo wrapped in a PDF
+        // sat in "Policy data parsing" past the whole 5-minute budget while
+        // a clean 900 KB PDF on the same run parsed fine.
+        //
+        // We do not actually NEED the OCR. Phase 3 below types every
+        // required field from OUR OWN record (policy #, limits, dates,
+        // carrier) and only defers to the parser for the carrier typeahead.
+        // Returning here threw that away and hard-blocked contracting, which
+        // is how 49 agents accumulated 302 E&O failures since mid-July.
+        // Give up only when we have nothing to type.
+        const canFillManually = Boolean(policyNumberValue && effectiveValue && expirationValue);
+        if (!canFillManually) {
+            return {
+                ok: false,
+                reason: `E&O parse did not finish within ${PARSE_BUDGET_MS / 1000}s and no local policy data to fall back on. ${await describeUploadablePage(page)}`,
+                details: { extracted, policyNumber, carrier, caseLimit, totalLimit, effective, expiration },
+            };
+        }
+        logger.warn({ elapsedMs: Date.now() - start, policyNumber: policyNumberValue }, "[E&O] parse budget exhausted — falling through to manual fill from our own record");
     }
     if (cleared) {
         // Tab warning already gone — SureLC saved the policy on its own

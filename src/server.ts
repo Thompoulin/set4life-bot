@@ -157,6 +157,18 @@ const carrierSchema = z.object({
   states: z.array(z.string()).optional(),
   carrierQuestions: z.record(z.string(), z.enum(["yes", "no"])).optional(),
   reviewEmailOverride: z.string().email().optional(),
+  /**
+   * Letter of Release (absolute S3 URL) for a requestType="Transfer"
+   * carrier. Sent by the main app's activationPipeline from
+   * agent_carrier_contracting.releaseFormUrl.
+   *
+   * Flipping a request to "Transfer" (see admin/setTransferTypes) is
+   * precisely what makes the carrier ask for an LOR instead of treating
+   * the rep as a fresh appointment — so without this the bot opts every
+   * transfer into a requirement it cannot satisfy. See
+   * admin/uploadReleaseForms for the consumer.
+   */
+  releaseFormUrl: z.string().url().optional(),
 })
 
 const contractingSchema = z.object({

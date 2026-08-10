@@ -702,6 +702,68 @@ export async function runActivation(
                     "[Phase A] transfer-type flip threw — non-blocking",
                   )
                 }
+
+                // Having just flipped these to "Transfer", the carrier
+                // now wants a Letter of Release. Attach it. Recon-only
+                // until LOR_UPLOAD_ENABLED=true — the BGA attach route
+                // is still unconfirmed, so by default this GETs the
+                // appointments and logs their requirement shape rather
+                // than POSTing anything at live SureLC.
+                try {
+                  const lorCarriers = (input.contracting?.carriers || [])
+                    .filter((c) => c.requestType === "Transfer" && c.releaseFormUrl)
+                    .map((c) => ({
+                      carrierName: c.carrierName || "",
+                      releaseFormUrl: c.releaseFormUrl as string,
+                    }))
+                    .filter((c) => c.carrierName)
+                  if (lorCarriers.length > 0) {
+                    const { uploadReleaseFormsForProducer } = await import(
+                      "./admin/uploadReleaseForms.js"
+                    )
+                    const lorResult = await uploadReleaseFormsForProducer(
+                      tabCtx.page,
+                      logger,
+                      { producerId, carriers: lorCarriers },
+                    )
+                    logger.info(
+                      {
+                        uploadEnabled: lorResult.uploadEnabled,
+                        uploaded: lorResult.uploaded,
+                        reconOnly: lorResult.reconOnly,
+                        notFound: lorResult.notFound,
+                        failed: lorResult.failed,
+                        recon: lorResult.recon,
+                      },
+                      "[Phase A] letter-of-release attach",
+                    )
+                    if (lorResult.failed.length > 0) {
+                      adminPhase.contracting.failed.push(
+                        ...lorResult.failed.map((f) => ({
+                          carrier: `${f.carrier} (LOR)`,
+                          reason: f.reason,
+                        })),
+                      )
+                    }
+                  } else {
+                    const transfersNeedingLor = (
+                      input.contracting?.carriers || []
+                    ).filter((c) => c.requestType === "Transfer" && !c.releaseFormUrl)
+                    if (transfersNeedingLor.length > 0) {
+                      logger.warn(
+                        {
+                          carriers: transfersNeedingLor.map((c) => c.carrierName),
+                        },
+                        "[Phase A] Transfer carriers with NO release form URL — carrier will ask for an LOR we don't have",
+                      )
+                    }
+                  }
+                } catch (err: any) {
+                  logger.warn(
+                    { err: err?.message },
+                    "[Phase A] letter-of-release attach threw — non-blocking",
+                  )
+                }
               }
             }
           }

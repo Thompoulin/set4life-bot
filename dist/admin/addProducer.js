@@ -57,38 +57,46 @@ export async function addProducer(ctx, input) {
             "no longer drives the browser-based 'Add Producer' UI flow.",
     };
 }
-/**
- * Set or change the affiliation on a producer row. Idempotent — if
- * the producer is already on `affiliationName`, returns true without
- * touching the UI. This is critical because SureLC's "Use Always"
- * toggle on the affiliation template DOES NOT auto-apply for
- * producers created via the API (api producers land in the agency
- * with no affiliation, and the DBA tab stays red until we fix it).
- *
- * **The BGA portal blocks every profile-tab navigation** for an
- * unaffiliated producer — `/producers/{id}/dba` etc. silently bounce
- * to OAuth. So this MUST run successfully before any fillProfile work
- * (Sydney 2026-05-07: every profile tab returned `bounced to OAuth`
- * because affiliation was "Not Affiliated" in the producer list).
- *
- * SureLC's BGA producer list is **AG Grid**, not a Material table.
- * Rows are `<div role="row" row-id="{producerId}">` split across 3
- * viewports (left-pinned / center / right-pinned), so any single
- * `[row-id]` matches multiple elements. The actions cell carries
- * `col-id="actions"` and contains an `<sb-dots-menu>` wrapping
- * `<button class="mat-mdc-menu-trigger">` with a `more_vert` icon.
- */
 export async function changeAffiliation(ctx, producerId, affiliationName) {
     const { page, logger } = ctx;
     const nav = await gotoBga(page, PRODUCERS_LIST_URL, logger);
     if (!nav.ok) {
-        logger.warn({ finalUrl: nav.finalUrl }, "changeAffiliation: list nav bounced after retries");
-        return false;
+        logger.warn({ finalUrl: nav.finalUrl }, "changeAffiliation: list nav bounced after retries — cannot verify affiliation; proceeding (existing producer likely already affiliated)");
+        return { ok: false, unverified: true };
     }
     await settle(page);
-    // AG Grid renders rows lazily as you scroll. Wait for at least one
-    // row to appear before we try to find ours; on cold load the grid is
-    // still rendering when we land.
+    // AG Grid is VIRTUALIZED — only rows currently in the viewport render.
+    // On the full unsearched list a producer whose row isn't in the initial
+    // render window is invisible to the row-id selector below, so
+    // changeAffiliation used to time out and bail with a FALSE
+    // "could not set affiliation" → needs_human. Gabriel Fernandez
+    // (producer 8890402) failed this way 6 days straight even though his
+    // "S4L LOA" affiliation was ALREADY set. Filter the grid to just this
+    // producer via the SEARCH BOX so the row is guaranteed to render. The
+    // box supports id ("Search by name, SSN, email, phone, id"); use it,
+    // NOT a `?search=` deep URL — that bounces straight to OAuth.
+    try {
+        const searchBox = await firstVisible(page, [
+            'input[placeholder*="Search by name"]',
+            'input[placeholder*="Search"]',
+        ]);
+        if (searchBox) {
+            await searchBox.click();
+            await searchBox.press("Control+A").catch(() => { });
+            await searchBox.press("Delete").catch(() => { });
+            await searchBox.type(String(producerId), { delay: 20 });
+            await searchBox.press("Enter").catch(() => { });
+            await settle(page);
+            await page.waitForTimeout(800);
+        }
+        else {
+            logger.warn({ producerId }, "changeAffiliation: search box not found — falling back to full-list scan");
+        }
+    }
+    catch (err) {
+        logger.warn({ err: err?.message }, "changeAffiliation: producer search failed — falling back to full-list scan");
+    }
+    // Wait for our (now-filtered) row to render before reading it.
     await page
         .waitForSelector(`[role="row"][row-id="${producerId}"]`, { timeout: 15_000 })
         .catch(() => {
@@ -102,12 +110,12 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
         .$$eval(`[role="row"][row-id="${producerId}"]`, (els) => els.map((el) => el.innerText).join(" "))
         .catch(() => "");
     if (!rowText) {
-        logger.warn({ producerId }, "changeAffiliation: row not found in list (no AG Grid match)");
-        return false;
+        logger.warn({ producerId }, "changeAffiliation: row never rendered — cannot verify affiliation; proceeding (existing producer likely already affiliated)");
+        return { ok: false, unverified: true };
     }
     if (rowText.toLowerCase().includes(affiliationName.toLowerCase())) {
         logger.info({ producerId, affiliationName }, "affiliation already set; no-op");
-        return true;
+        return { ok: true };
     }
     // The actions kebab lives in `[col-id="actions"]` of the right-pinned
     // viewport. <sb-dots-menu> wraps the mat-icon-button trigger.
@@ -116,7 +124,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
         .catch(() => null);
     if (!actionsBtn) {
         logger.warn({ producerId }, "changeAffiliation: actions button not found in AG Grid actions cell");
-        return false;
+        return { ok: false };
     }
     await actionsBtn.click();
     await page.waitForTimeout(500);
@@ -133,7 +141,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     ]);
     if (!change) {
         logger.warn({ producerId }, "changeAffiliation: 'Change Affiliation' menu item not found");
-        return false;
+        return { ok: false };
     }
     await change.click();
     await page.waitForTimeout(500);
@@ -154,7 +162,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     ]);
     if (!affInput) {
         logger.warn({ producerId }, "changeAffiliation: autocomplete input not found in modal");
-        return false;
+        return { ok: false };
     }
     try {
         await affInput.click();
@@ -182,14 +190,14 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
                 .catch(() => []);
             logger.warn({ affiliationName, listedOptions: listed }, "changeAffiliation: no matching mat-option for affiliation name");
             await snapshot(ctx, "admin-affiliation-options-no-match");
-            return false;
+            return { ok: false };
         }
         await opt.click();
         await page.waitForTimeout(400);
     }
     catch (err) {
         logger.warn({ err: err?.message }, "changeAffiliation: typeahead select failed");
-        return false;
+        return { ok: false };
     }
     const apply = await firstVisible(page, [
         'mat-dialog-container button:has-text("APPLY")',
@@ -201,7 +209,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     ]);
     if (!apply) {
         logger.warn({ producerId }, "changeAffiliation: Apply button not found");
-        return false;
+        return { ok: false };
     }
     // Apply is disabled until the autocomplete actually picked an option.
     // Catch the disabled state explicitly so we don't silently treat a
@@ -209,7 +217,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     const disabled = await apply.getAttribute("disabled").catch(() => null);
     if (disabled !== null) {
         logger.warn({ producerId }, "changeAffiliation: Apply still disabled — autocomplete didn't register selection");
-        return false;
+        return { ok: false };
     }
     await apply.click();
     await settle(page, 1500);
@@ -218,7 +226,7 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     const navVerify = await gotoBga(page, PRODUCERS_LIST_URL, logger);
     if (!navVerify.ok) {
         logger.warn({ finalUrl: navVerify.finalUrl }, "changeAffiliation: verify nav bounced after retries");
-        return true; // affiliation was set; treat as success even if we can't verify
+        return { ok: true }; // affiliation was set; treat as success even if we can't verify
     }
     await settle(page);
     await page
@@ -227,5 +235,5 @@ export async function changeAffiliation(ctx, producerId, affiliationName) {
     const after = await page
         .$$eval(`[role="row"][row-id="${producerId}"]`, (els) => els.map((el) => el.innerText).join(" "))
         .catch(() => "");
-    return after.toLowerCase().includes(affiliationName.toLowerCase());
+    return { ok: after.toLowerCase().includes(affiliationName.toLowerCase()) };
 }

@@ -2,7 +2,7 @@
  * Harvest the surecrm bearer JWT from the page's outbound traffic,
  * waiting up to `timeoutMs` for the first matching request.
  */
-async function harvestBearer(page, timeoutMs = 15_000) {
+export async function harvestBearer(page, timeoutMs = 15_000) {
     let bearer = null;
     const handler = (req) => {
         if (bearer)

@@ -31,11 +31,16 @@ export const BGA_LOGIN_URL = "https://surelc.surancebay.com/bga/";
  * failures short-circuit (fatal) so we don't hammer a truly-broken login.
  */
 export async function loginAdmin(page, creds, logger) {
-    const MAX_LOGIN_ATTEMPTS = 4;
+    // Bumped 4 → 8 (2026-07-10). The datacenter-IP bot-detection block is
+    // intermittent and clears on its own within a few tries; giving up at 4
+    // was stranding producers for a full day on what is almost always a
+    // transient wobble. More attempts + longer tail backoff rides out the
+    // throttle window instead.
+    const MAX_LOGIN_ATTEMPTS = 8;
     // Backoff before attempt N (index = attempt number). Attempt 1 is
     // immediate; later attempts wait longer to ride out a throttle window
-    // without turning into a hammer.
-    const BACKOFF_MS = [0, 0, 4_000, 10_000, 20_000];
+    // without turning into a hammer. Tail extended for the extra attempts.
+    const BACKOFF_MS = [0, 0, 4_000, 10_000, 20_000, 30_000, 45_000, 60_000, 60_000];
     let lastReason;
     for (let attempt = 1; attempt <= MAX_LOGIN_ATTEMPTS; attempt++) {
         if (attempt > 1) {
@@ -97,8 +102,11 @@ async function attemptLogin(page, creds, logger, attempt) {
     }
     // Extra beat for Material to finish wiring up the input. Without it
     // isVisible() can race the form's slide-in animation and return false
-    // for an input that's already in the DOM.
-    await page.waitForTimeout(1_500);
+    // for an input that's already in the DOM. Bumped 1.5s → 3s (2026-07-10):
+    // on the datacenter IP the OAuth form's slide-in is noticeably slower
+    // than in a local browser, and 1.5s was still occasionally racing it
+    // ("email input invisible after wait").
+    await page.waitForTimeout(3_000);
     const emailSelectors = [
         'input[data-cy="email-input"]',
         'input[formcontrolname="username"]',
@@ -113,14 +121,19 @@ async function attemptLogin(page, creds, logger, attempt) {
         'input[placeholder*="email" i]',
     ];
     let emailField = await firstVisible(page, emailSelectors);
-    if (!emailField) {
-        // Transient: form rendered (the formReady selector above matched in
-        // the DOM) but firstVisible() couldn't pin a visible field — often a
-        // mid-animation race or an off-screen Material wrapper. Reload once
-        // and retry. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
-        logger.warn({ url: page.url(), attempt }, "admin login: email input invisible after wait — reloading and retrying once");
+    // Transient: form rendered (the formReady selector above matched in the
+    // DOM) but firstVisible() couldn't pin a visible field — often a
+    // mid-animation race or an off-screen Material wrapper. Reload and retry
+    // in-attempt. Fixes Mayo + Estell 2026-05-28 cold-context login fails.
+    // Bumped to TWO in-attempt reloads (2026-07-10): a single reload still
+    // occasionally landed on a not-yet-slid-in form, so give it one more
+    // fresh reload with a longer settle before burning the whole attempt.
+    const IN_ATTEMPT_RELOADS = 2;
+    for (let reload = 1; !emailField && reload <= IN_ATTEMPT_RELOADS; reload++) {
+        logger.warn({ url: page.url(), attempt, reload, of: IN_ATTEMPT_RELOADS }, "admin login: email input invisible after wait — reloading and retrying in-attempt");
         await page.reload({ waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => undefined);
-        await page.waitForTimeout(3_000);
+        // Longer settle on each successive reload (4s, then 6s).
+        await page.waitForTimeout(2_000 + reload * 2_000);
         emailField = await firstVisible(page, emailSelectors);
     }
     if (!emailField) {
@@ -141,6 +154,49 @@ async function attemptLogin(page, creds, logger, attempt) {
         return { ok: false, reason: "Password input not found on SureLC OAuth page" };
     }
     await pwField.fill(creds.password);
+    // Capture what the AUTH CALL itself says, and any error the UI flashes.
+    //
+    // collectVisibleErrors() runs only after the 30s waitForURL below, by which
+    // time a Material snackbar has long auto-dismissed — so it returned [] even
+    // for a genuine "invalid credentials", the bounce got classified as the
+    // transient datacenter-IP block, and the wrapper retried forever. That
+    // misclassification is what hid the 2026-07-27 outage for 3 days.
+    //
+    // Watching the network instead is authoritative: SureLC's own response tells
+    // us wrong-password vs locked vs rate-limited, and it can't dismiss itself.
+    const authSignals = [];
+    const onResponse = (resp) => {
+        const u = resp.url();
+        if (!/accounts\.surancebay\.com/.test(u))
+            return;
+        if (!/(token|login|auth|authorize|signin)/i.test(u))
+            return;
+        const status = resp.status();
+        if (status < 400)
+            return;
+        void resp
+            .text()
+            .then((body) => {
+            authSignals.push(`${status} ${u.split("?")[0]} ${body.slice(0, 200).replace(/\s+/g, " ")}`);
+        })
+            .catch(() => {
+            authSignals.push(`${status} ${u.split("?")[0]} (body unreadable)`);
+        });
+    };
+    page.on("response", onResponse);
+    // Snapshot any error the UI paints while we're still waiting, before it fades.
+    const errorWatcher = page
+        .waitForSelector("mat-error, .error, .alert, [role=alert], snack-bar-container, .mat-mdc-snack-bar-label", {
+        timeout: 25_000,
+        state: "visible",
+    })
+        .then((el) => el?.textContent())
+        .then((t) => {
+        const s = (t ?? "").trim();
+        if (s)
+            authSignals.push(`ui:${s}`);
+    })
+        .catch(() => undefined);
     const submit = await firstVisible(page, [
         'button[type="submit"]',
         'input[type="submit"]',
@@ -168,8 +224,32 @@ async function attemptLogin(page, creds, logger, attempt) {
         // bounced — "Invalid email or password" / "MFA required" / etc.
         // Without this the owner has to dig into Dokku logs to see what
         // SureLC is actually complaining about.
-        const errors = await collectVisibleErrors(page);
+        await errorWatcher;
+        page.off("response", onResponse);
+        // Late-collected DOM errors plus anything we caught live (network + the
+        // snackbar before it faded). The live signals are the trustworthy ones.
+        const errors = [...(await collectVisibleErrors(page)), ...authSignals];
         const finalUrl = page.url();
+        // A FORCED PASSWORD CHANGE looks identical to a transient bounce: SureLC
+        // renders no error text, so collectVisibleErrors comes back empty and we
+        // parked on the OAuth page. That cost 3 days on 2026-07-27 — the bot
+        // retried 6× per request forever, browsers piled up until the box was out
+        // of memory, and every agent surfaced as "operation aborted due to
+        // timeout" while the real cause was a password-expiry screen nobody could
+        // see. Detect it explicitly, make it FATAL so the retry storm stops, and
+        // say exactly what a human has to do.
+        const passwordChange = await detectPasswordChangeScreen(page);
+        if (passwordChange) {
+            logger.error({ url: finalUrl, indicator: passwordChange, attempt }, "admin login: SureLC is forcing a PASSWORD CHANGE on the bot service account");
+            return {
+                ok: false,
+                fatal: true,
+                reason: `SureLC is forcing a password change on the bot service account. ` +
+                    `Set a new password at https://surelc.surancebay.com/bga/ and update ` +
+                    `SURELC_ADMIN_PASSWORD on s4l-production. Nothing will contract until then. ` +
+                    `(matched: ${passwordChange})`,
+            };
+        }
         logger.warn({ url: finalUrl, errors, attempt }, "admin login: did not land on /bga/* — likely wrong credentials or MFA prompt");
         const reason = errors.length
             ? `SureLC: ${errors.join(" / ")}`
@@ -180,8 +260,22 @@ async function attemptLogin(page, creds, logger, attempt) {
         // bounce with no error text is the transient bot-detection block we
         // want the wrapper to retry — not a dead-end.
         const fatal = errors.some((e) => /invalid|incorrect|wrong|locked|disabled|mfa|verification|verify|two[-\s]?factor|authenticator/i.test(e));
+        // Transient bounce (bot-detection block, not a real cred/MFA error):
+        // the page is now parked on the bounced OAuth authorize form. Don't
+        // leave the next attempt to start from that stale, half-submitted
+        // page — re-navigate fresh to the BGA entry URL so the wrapper's next
+        // attempt begins from a clean OAuth handshake (2026-07-10). Fatal
+        // failures skip this since the wrapper won't retry them anyway.
+        if (!fatal) {
+            await page
+                .goto(BGA_LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 45_000 })
+                .catch(() => undefined);
+        }
         return { ok: false, reason, fatal };
     }
+    // Success path — drop the response listener (the browser is reused for the
+    // rest of the run, so leaving it attached would keep buffering auth bodies).
+    page.off("response", onResponse);
     // URL transitioned to /bga/* — but that's not a guarantee the SPA
     // actually stored OAuth tokens. The previous failure mode (owner-
     // reported 2026-05-05 21:56) was: bot reports "Logged in" because the
@@ -299,6 +393,37 @@ async function collectVisibleErrors(page) {
         return Array.from(new Set(out)).slice(0, 5);
     })
         .catch(() => []);
+}
+/**
+ * Is SureLC showing a "you must change your password" wall?
+ *
+ * Checked three ways because SureLC gives us nothing to work with: no error
+ * text and no distinctive status code. A URL match is the strongest signal; a
+ * second password field (new + confirm) on a page we didn't land on is the
+ * next; visible copy is the fallback. Returns the matched indicator so the
+ * alert can say WHY we think so, rather than asserting it blindly.
+ */
+async function detectPasswordChangeScreen(page) {
+    try {
+        const href = page.url();
+        if (/(change|reset|expire|update)[-_]?password|password[-_]?(change|reset|expired|update)/i.test(href)) {
+            return `url:${href}`;
+        }
+        return await page.evaluate(() => {
+            const PATTERNS = /(change|update|reset|create)\s+(your\s+)?password|password\s+(has\s+)?(expired|must\s+be\s+changed)|new\s+password|temporary\s+password/i;
+            // Two or more password inputs = new + confirm, i.e. a set-password form
+            // rather than the single-field sign-in form.
+            const pwFields = document.querySelectorAll('input[type="password"]');
+            if (pwFields.length >= 2)
+                return `form:${pwFields.length}-password-fields`;
+            const text = (document.body?.innerText ?? "").slice(0, 4000);
+            const m = text.match(PATTERNS);
+            return m ? `text:${m[0]}` : null;
+        });
+    }
+    catch {
+        return null;
+    }
 }
 function looksLikeStillOnOauthForm(href) {
     try {

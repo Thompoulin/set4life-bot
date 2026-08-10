@@ -3,7 +3,8 @@ import { z } from "zod";
 import pino from "pino";
 import { runActivation } from "./botRunner.js";
 import { captureBgaTokens } from "./bgaTokenCapture.js";
-import { CHROMIUM_ARGS } from "./browserArgs.js";
+import { launchChromium, browserPoolStats } from "./browserArgs.js";
+import { getAuthenticatedPage } from "./admin/sessionCache.js";
 const logger = pino({ name: "s4l-surelc-bot" });
 const BEARER = process.env.BOT_SHARED_SECRET || "";
 if (!BEARER) {
@@ -139,6 +140,18 @@ const carrierSchema = z.object({
     states: z.array(z.string()).optional(),
     carrierQuestions: z.record(z.string(), z.enum(["yes", "no"])).optional(),
     reviewEmailOverride: z.string().email().optional(),
+    /**
+     * Letter of Release (absolute S3 URL) for a requestType="Transfer"
+     * carrier. Sent by the main app's activationPipeline from
+     * agent_carrier_contracting.releaseFormUrl.
+     *
+     * Flipping a request to "Transfer" (see admin/setTransferTypes) is
+     * precisely what makes the carrier ask for an LOR instead of treating
+     * the rep as a fresh appointment — so without this the bot opts every
+     * transfer into a requirement it cannot satisfy. See
+     * admin/uploadReleaseForms for the consumer.
+     */
+    releaseFormUrl: z.string().url().optional(),
 });
 const contractingSchema = z.object({
     defaultReviewEmail: z.string().email(),
@@ -193,6 +206,9 @@ const repReviewSchema = z.object({
         q5_license_revoked: z.boolean().optional(),
         q6_insurer_terminated: z.boolean().optional(),
         q7_bankruptcy: z.boolean().optional(),
+        q7_bankruptcy_personal: z.boolean().optional(),
+        q7_firm_bankruptcy: z.boolean().optional(),
+        q7_bankruptcy_pending: z.boolean().optional(),
         q8_bond_denied: z.boolean().optional(),
         q9_unpaid_premiums: z.boolean().optional(),
         q10_fiduciary_breach: z.boolean().optional(),
@@ -256,7 +272,11 @@ const activationSchema = z.object({
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.get("/health", (_req, res) => {
-    res.json({ ok: true });
+    // browserPool makes the 2026-07-27 starvation visible before it bites:
+    // sustained queued>0 means runs are waiting on a browser, and active
+    // pinned at max with a growing queue is the shape that used to end in
+    // "operation aborted due to timeout" alerts.
+    res.json({ ok: true, browserPool: browserPoolStats() });
 });
 app.post("/run-activation", async (req, res) => {
     const auth = req.headers.authorization || "";
@@ -322,16 +342,10 @@ app.post("/producer-appointments", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res
                     .status(502)
                     .json({ ok: false, error: loginResult.reason || "admin login failed" });
@@ -420,16 +434,10 @@ app.post("/resend-rep-emails", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" });
             }
             let bearer = "";
@@ -535,16 +543,10 @@ app.post("/create-appointment-requests", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" });
             }
             let bearer = "";
@@ -718,16 +720,10 @@ app.post("/recover-orphan-bga-requests", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" });
             }
             let bearer = "";
@@ -850,16 +846,10 @@ app.post("/diagnose-producer", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const lr = await loginAdmin(page, adminCreds, logger);
-            if (!lr.ok) {
+            const { page, loginResult: lr } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (lr && !lr.ok) {
                 return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" });
             }
             let bearer = "";
@@ -956,16 +946,10 @@ app.post("/cleanup-orphan-explanations", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const lr = await loginAdmin(page, adminCreds, logger);
-            if (!lr.ok)
+            const { page, loginResult: lr } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (lr && !lr.ok)
                 return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" });
             let bearer = "";
             page.on("request", (req) => {
@@ -1077,16 +1061,10 @@ app.post("/set-producer-fields", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const lr = await loginAdmin(page, adminCreds, logger);
-            if (!lr.ok) {
+            const { page, loginResult: lr } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (lr && !lr.ok) {
                 return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" });
             }
             let bearer = "";
@@ -1177,16 +1155,10 @@ app.post("/set-producer-email", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res.status(502).json({ ok: false, error: loginResult.reason || "admin login failed" });
             }
             let bearer = "";
@@ -1332,16 +1304,10 @@ app.post("/patch-appointments-to-resident-state", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const lr = await loginAdmin(page, adminCreds, logger);
-            if (!lr.ok)
+            const { page, loginResult: lr } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (lr && !lr.ok)
                 return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" });
             let bearer = "";
             const handler = (req) => {
@@ -1432,16 +1398,10 @@ app.post("/patch-appointment-email", async (req, res) => {
     try {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const lr = await loginAdmin(page, adminCreds, logger);
-            if (!lr.ok)
+            const { page, loginResult: lr } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1280, height: 900 } } });
+            if (lr && !lr.ok)
                 return res.status(502).json({ ok: false, error: lr.reason || "admin login failed" });
             let bearer = "";
             const handler = (req) => {
@@ -1554,18 +1514,10 @@ app.post("/fill-misc-via-wizard", async (req, res) => {
         const { chromium } = await import("playwright");
         const { loginAdmin } = await import("./admin/login.js");
         const { fillMiscWizard } = await import("./admin/fillMiscWizard.js");
-        const browser = await chromium.launch({
-            headless: true,
-            args: CHROMIUM_ARGS,
-        });
+        const browser = await launchChromium(logger);
         try {
-            const ctx = await browser.newContext({
-                viewport: { width: 1440, height: 900 },
-            });
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(30_000);
-            const loginResult = await loginAdmin(page, adminCreds, logger);
-            if (!loginResult.ok) {
+            const { page, loginResult } = await getAuthenticatedPage(browser, adminCreds, logger, { contextOptions: { viewport: { width: 1440, height: 900 } } });
+            if (loginResult && !loginResult.ok) {
                 return res
                     .status(502)
                     .json({ ok: false, error: loginResult.reason || "admin login failed" });

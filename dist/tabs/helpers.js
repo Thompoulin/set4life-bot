@@ -345,6 +345,52 @@ export async function gotoBga(page, targetUrl, logger) {
     catch {
         /* malformed current URL; ignore */
     }
+    // ── Attempt 0: CLICK the real in-app nav link (navigate like a human) ──
+    // The BGA SPA keeps its auth session in memory. A cold/hard page-load of a
+    // deep /bga route — and, since ~2026-07-10, a synthetic pushState the
+    // router no longer honors — both bounce to /oauth/authorize. Confirmed
+    // with the owner 2026-07-13: pasting `/bga/producers` into the address bar
+    // logs even a human out, but CLICKING "Producers" inside the app works,
+    // because a real click is client-side Angular routing that keeps the
+    // session. So we now navigate the way a human does. This is robust to the
+    // SureLC app/router (or Chromium) change that broke the old pushState hack;
+    // the pushState + hard-nav attempts below remain as fallbacks.
+    try {
+        const seg = targetPathOnly.split("/").filter(Boolean).pop() || "";
+        if (seg) {
+            const label = seg.charAt(0).toUpperCase() + seg.slice(1); // producers → Producers
+            const candidates = [
+                page.locator(`a[href$="/${seg}"]`).first(),
+                page.locator(`a[href*="/${seg}"]`).first(),
+                page.locator(`[routerlink*="${seg}"]`).first(),
+                page.getByRole("link", { name: new RegExp(`^${label}s?$`, "i") }).first(),
+                page.getByRole("button", { name: new RegExp(`^${label}s?$`, "i") }).first(),
+            ];
+            for (const loc of candidates) {
+                const found = await loc.count().catch(() => 0);
+                if (!found)
+                    continue;
+                await loc.click({ timeout: 4_000 }).catch(() => { });
+                await page.waitForTimeout(1_200);
+                await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => { });
+                let here = "";
+                try {
+                    here = new URL(page.url()).pathname;
+                }
+                catch {
+                    /* malformed */
+                }
+                if (here === targetPathOnly || here.startsWith(`${targetPathOnly}/`)) {
+                    logger.info({ targetUrl }, "gotoBga: in-app nav-link click succeeded");
+                    return { ok: true };
+                }
+            }
+            logger.warn({ target: targetUrl }, "gotoBga: no in-app nav link matched (or click didn't land); falling back to pushState/hard-nav");
+        }
+    }
+    catch (err) {
+        logger.warn({ err: err?.message, target: targetUrl }, "gotoBga: nav-link click attempt threw; falling back");
+    }
     // ── Attempt 1: in-SPA navigation via History API ────────────────
     // Only works if we're already on a logged-in /bga/* page (same origin
     // as the target); cross-origin pushState would throw a SecurityError.
@@ -448,12 +494,27 @@ export async function gotoBga(page, targetUrl, logger) {
         .cookies()
         .then((cs) => cs.map((c) => `${c.domain}:${c.name}`))
         .catch(() => []);
+    // DIAGNOSTIC (2026-07-12): capture the bounce page's title + visible text so
+    // we can tell a bot-detection CHALLENGE (Datadome/PerimeterX/"verify you're
+    // human") apart from a plain SureLC login form. Distinguishes datacenter-IP
+    // bot-blocking from a session-not-carried flow issue.
+    const pageContent = await page
+        .evaluate(() => ({
+        title: document.title,
+        bodyText: (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 600),
+        hasEmailInput: !!document.querySelector('input[type="email"],input[data-cy="email-input"]'),
+        hasPasswordInput: !!document.querySelector('input[type="password"]'),
+    }))
+        .catch(() => ({ title: "(unreadable)", bodyText: "", hasEmailInput: false, hasPasswordInput: false }));
     logger.warn({
         target: targetUrl,
         finalUrl: page.url(),
         localStorageKeys: diag.localKeys,
         sessionStorageKeys: diag.sessionKeys,
         cookieNames,
+        pageTitle: pageContent.title,
+        pageBodyText: pageContent.bodyText,
+        looksLikeLoginForm: pageContent.hasEmailInput && pageContent.hasPasswordInput,
     }, "gotoBga: all strategies bounced; session diagnostic dump");
     return { ok: false, finalUrl: page.url() };
 }

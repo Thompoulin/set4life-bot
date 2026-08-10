@@ -1,44 +1,56 @@
-/**
- * Drives a fresh Playwright session through the SureLC BGA portal OAuth2
- * authorization_code login and captures the resulting access_token +
- * refresh_token from the SPA's storage.
- *
- * Why this exists: `/contracting/*` endpoints (the agency LOA carrier
- * list lives there) require a Bearer JWT minted by the `bga` OAuth2
- * client. That client only authorizes `authorization_code` grant, the
- * SPA login is JS-only behind a bot-detection WAF, so curl can't drive
- * it. A real browser can — we already have one in this container.
- *
- * Caller passes a dedicated service-account user/pass. The function
- * returns whatever tokens it finds in localStorage/sessionStorage. The
- * main app caches the refresh_token and uses it via refresh_token grant
- * until it eventually rotates, then re-runs this capture.
- */
-import { chromium } from "playwright";
-import { CHROMIUM_ARGS } from "./browserArgs.js";
+import { launchChromium } from "./browserArgs.js";
+import { tryReuseContext } from "./admin/sessionCache.js";
+const CAPTURE_CONTEXT_OPTIONS = {
+    viewport: { width: 1280, height: 900 },
+    userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+};
 const ENTRY_URL = "https://surelc.surancebay.com/bga/agency/carriers/selected?search=";
 export async function captureBgaTokens(input, logger) {
-    const browser = await chromium.launch({
-        headless: true,
-        args: CHROMIUM_ARGS,
-    });
+    const browser = await launchChromium(logger);
     const urlHistory = [];
     try {
-        const ctx = await browser.newContext({
-            viewport: { width: 1280, height: 900 },
-            userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        const attachNavLogger = (page) => {
+            page.on("framenavigated", (frame) => {
+                if (frame === page.mainFrame()) {
+                    const u = frame.url();
+                    if (u && u !== "about:blank" && urlHistory[urlHistory.length - 1] !== u) {
+                        urlHistory.push(u);
+                        logger.info({ url: u }, "[bga-tokens] navigation");
+                    }
+                }
+            });
+        };
+        // Reuse the cached admin session when one is valid — the SPA only needs
+        // to be authed for us to read its tokens; no fresh OAuth login needed.
+        // Falls through to the full capture-login below on any miss/failure.
+        const reused = await tryReuseContext(browser, input.email, logger, {
+            contextOptions: CAPTURE_CONTEXT_OPTIONS,
         });
+        if (reused) {
+            attachNavLogger(reused.page);
+            await reused.page
+                .goto(ENTRY_URL, { waitUntil: "domcontentloaded", timeout: 45_000 })
+                .catch(() => undefined);
+            const reusedTokens = await waitForTokens(reused.page, logger);
+            if (reusedTokens.accessToken) {
+                return {
+                    ok: true,
+                    accessToken: reusedTokens.accessToken,
+                    refreshToken: reusedTokens.refreshToken,
+                    expiresAt: readJwtExpiry(reusedTokens.accessToken),
+                    storageKeys: reusedTokens.keys,
+                    finalUrl: reused.page.url(),
+                    urlHistory,
+                };
+            }
+            // Cached session didn't yield tokens — discard it and do a full login.
+            logger.warn("[bga-tokens] cached session yielded no tokens — full capture login");
+            await reused.context.close().catch(() => undefined);
+        }
+        const ctx = await browser.newContext(CAPTURE_CONTEXT_OPTIONS);
         const page = await ctx.newPage();
         page.setDefaultTimeout(30_000);
-        page.on("framenavigated", (frame) => {
-            if (frame === page.mainFrame()) {
-                const u = frame.url();
-                if (u && u !== "about:blank" && urlHistory[urlHistory.length - 1] !== u) {
-                    urlHistory.push(u);
-                    logger.info({ url: u }, "[bga-tokens] navigation");
-                }
-            }
-        });
+        attachNavLogger(page);
         logger.info({ url: ENTRY_URL }, "[bga-tokens] navigating to entry URL");
         await page.goto(ENTRY_URL, { waitUntil: "domcontentloaded", timeout: 45_000 });
         await waitForLogin(page, logger);

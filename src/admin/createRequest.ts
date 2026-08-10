@@ -38,6 +38,13 @@ export interface CarrierRequest {
   carrierQuestions?: Record<string, "yes" | "no">
   /** Override the email SureLC sends the review request to. */
   reviewEmailOverride?: string
+  /**
+   * Letter of Release (absolute S3 URL), set by the main app for
+   * requestType="Transfer" carriers. Consumed after the transfer flip
+   * by admin/uploadReleaseForms — a Transfer request without an LOR is
+   * one the carrier will ask us to complete.
+   */
+  releaseFormUrl?: string
 }
 
 export interface CreateRequestInput {

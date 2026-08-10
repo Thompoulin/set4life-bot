@@ -52,7 +52,7 @@ export interface SetTransferTypesResult {
  * Harvest the surecrm bearer JWT from the page's outbound traffic,
  * waiting up to `timeoutMs` for the first matching request.
  */
-async function harvestBearer(page: Page, timeoutMs = 15_000): Promise<string | null> {
+export async function harvestBearer(page: Page, timeoutMs = 15_000): Promise<string | null> {
   let bearer: string | null = null
   const handler = (req: any) => {
     if (bearer) return

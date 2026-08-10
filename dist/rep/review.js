@@ -37,9 +37,16 @@ const DISCLOSURE_LABEL_PATTERNS = [
     { key: "q2_misdemeanor", pattern: /misdemeanor/i },
     // Regulatory action / commissioner / department of insurance complaint.
     { key: "q3_regulatory_action", pattern: /(?:state\s+(?:insurance|securities)|commissioner|department\s+of\s+insurance|sanction|disciplinary)/i },
-    { key: "q4_license_denied", pattern: /licen[sc]e\s+(?:denied|refused\s+to\s+issue)/i },
-    // License suspended/canceled/revoked.
-    { key: "q5_license_revoked", pattern: /licen[sc]e\s+(?:suspend|cancel|revok)/i },
+    { key: "q4_license_denied", pattern: /licen[sc]e[\s\S]{0,40}(?:denied|refused\s+to\s+issue)/i },
+    // License suspended/canceled/revoked. The verb does NOT always sit
+    // immediately after "license": carriers commonly bundle all four
+    // outcomes into one prompt — "Have you ever had an insurance or
+    // securities license denied, suspended, cancelled or revoked?"
+    // (observed verbatim on Sean Way + Shekethia Claiborne, 2026-08-04).
+    // The old `licen[sc]e\s+(?:suspend|...)` required adjacency, so
+    // "denied," in between made it miss, the rep's TRUE q5 landed on no
+    // question, and the run was routed to a human. Allow a short gap.
+    { key: "q5_license_revoked", pattern: /licen[sc]e[\s\S]{0,40}(?:suspend|cancel|revok)/i },
     // Insurance company canceled your contract / terminated.
     { key: "q6_insurer_terminated", pattern: /(?:insurance\s+company|insurer)\s+(?:cancel|terminat).*(?:contract|appointment)/i },
     // Bankruptcy — PERSONAL "filed/declared bankruptcy" (Q15/Q15a). The
@@ -53,16 +60,45 @@ const DISCLOSURE_LABEL_PATTERNS = [
     { key: "q9_unpaid_premiums", pattern: /(?:unpaid\s+premium|indebted.*insur|debit\s+balance)/i },
     // Fiduciary breach.
     { key: "q10_fiduciary_breach", pattern: /fiduciary/i },
-    // Fraud investigation / subject of any investigation.
-    { key: "q11_fraud_investigation", pattern: /(?:fraud|subject\s+of\s+(?:any\s+)?investigation)/i },
+    // Fraud investigation / subject of — or currently UNDER — any
+    // investigation. "Are you currently under investigation by any legal
+    // or regulatory authority?" (observed verbatim on Jhovanny Jimenez +
+    // Michael Wills, 2026-08-04) contains neither "fraud" nor "subject
+    // of", so the old pattern missed it and their true q11 was routed to
+    // a human rather than disclosed.
+    { key: "q11_fraud_investigation", pattern: /(?:fraud|(?:subject\s+of|under)\s+(?:any\s+)?investigation)/i },
     // Consent order / order of any kind.
     { key: "q12_consent_order", pattern: /consent\s+order/i },
-    // Continuing-education violation.
-    { key: "q13_ce_violation", pattern: /continu(?:ing|ed)\s+education|CE\s+violation/i },
+    // "q13_ce_violation" is a MISNOMER. The flag is set by onboarding's
+    // q13_parent, whose text is "Have you ever had any interruptions in
+    // licensing?" (client/src/components/onboarding/types.ts) — nothing to do
+    // with continuing education. The old CE-only pattern therefore matched
+    // nothing on any carrier wizard, so every rep who answered yes to the
+    // interruptions question was reported as an unplaced disclosure and routed
+    // to a human forever: Sean Way, Shekethia Claiborne, David Grenier and
+    // Grantley Wilson, the only 4 of 99 reps with this flag set.
+    //
+    // Carriers DO ask it — "Have you ever had any interruptions in licensing?*"
+    // appears verbatim on the Foresters and NLG wizards (captured 2026-08-05/06).
+    // Match the real wording; keep the CE wording too in case a carrier words it
+    // that way, since the flag's name implies some carriers might.
+    {
+        key: "q13_ce_violation",
+        pattern: /interruption(?:s)?\s+in\s+licens|continu(?:ing|ed)\s+education|CE\s+violation/i,
+    },
     // Lawsuit / litigation pending / defendant.
     { key: "q14_lawsuit_pending", pattern: /(?:defendant|lawsuit|litigation|civil\s+action)/i },
-    // E&O claim.
-    { key: "q15_eo_claim", pattern: /(?:e&o|errors\s+and\s+omissions).*claim/i },
+    // E&O claim. The claim word can come EITHER side of the E&O phrase:
+    // "Has any lawsuit or claim ever been made against your surety
+    // company, or errors and omissions insurer, arising out of your sales
+    // or practices..." (observed verbatim on Sean Way, 2026-08-04) puts
+    // "claim" first, so the old `(?:e&o|errors and omissions).*claim`
+    // never matched. Require both tokens within a short span, either
+    // order, so we don't match a bare mention of E&O coverage.
+    {
+        key: "q15_eo_claim",
+        pattern: /(?:(?:e&o|errors\s+and\s+omissions)[\s\S]{0,120}(?:claim|lawsuit)|(?:claim|lawsuit)[\s\S]{0,120}(?:e&o|errors\s+and\s+omissions))/i,
+    },
     // Judgments / tax liens / bad debts.
     { key: "q16_unsatisfied_judgments", pattern: /(?:judgment|tax\s*lien|bad\s*debt|collection)/i },
     // Financial-institution related.
@@ -121,7 +157,67 @@ const NON_CONTRACTED_ISSUER_PATTERN = /pioneer\s+(?:american|security)|\bia\s+am
  * correctly.
  */
 const PRODUCT_OPT_IN_PATTERN = /will\s+you\s+be\s+selling\s+(?:final\s+expense|life|annuity|medicare|whole\s+life|term)\s+products?/i;
-export function pickYnForLabel(label, disclosures) {
+/**
+ * Carrier-SPECIFIC questions, matched to the `surelcAnswerKey` slug holding
+ * the rep's answer. Only questions whose answer we cannot derive from
+ * anything else belong here.
+ *
+ * Transcribed from Ana's 2026-08-06 capture of a live NLG request. NLG is the
+ * first carrier to need this: its Step 5 Questionnaire is the usual 8
+ * background questions (covered by `disclosures`), but its Step 4 "Producer
+ * Questions" ask for data we never collect. Verified what the bot would do
+ * without this table — it answered "No" to BOTH "Do you attest that you have
+ * lawful authorization to work in the United States?" and "Are you a legal
+ * resident of the United States?", which is false, denies the rep's own
+ * attestation, and would sink the contract.
+ *
+ * `required: true` means the bot must NOT proceed without a real answer.
+ */
+const CARRIER_QUESTION_PATTERNS = [
+    { slug: "nlgCurrentlyContracted", pattern: /currently\s+contracted\s+with\s+national\s+life/i, required: true },
+    { slug: "nlgSolicitNewYork", pattern: /solicit\s+business\s+in\s+new\s+york/i, required: true },
+    { slug: "nlgEsiAffiliationAck", pattern: /esi\s+affiliation|equity\s+services\s+incorporated/i, required: true },
+    { slug: "nlgFinraLicensed", pattern: /\bfinra\b.{0,40}(?:ever\s+been\s+)?licen[sc]ed/i, required: true },
+    { slug: "nlgUnderIndictment", pattern: /are\s+you\s+now\s+under\s+indictment/i, required: true },
+    { slug: "nlgIrsBackupWithholding", pattern: /backup\s+withholding/i, required: true },
+    { slug: "nlgLegalResidentUs", pattern: /legal\s+resident\s+of\s+the\s+united\s+states/i, required: true },
+    { slug: "nlgConsumerReportCopy", pattern: /consumer\s+report.{0,120}copy\s+of\s+the\s+big\s+report/i, required: true },
+    // Work authorisation IS derivable — usWorkAuth is collected at onboarding —
+    // but it is carrier-worded here, so route it through the same lookup rather
+    // than let the disclosure patterns miss it and default No.
+    { slug: "usWorkAuth", pattern: /lawful\s+authorization\s+to\s+work\s+in\s+the\s+united\s+states/i, required: true },
+];
+/**
+ * If `label` is a known carrier-specific question, return its slug and the
+ * rep's stored answer — or `answer: null` when we hold none. Returns null when
+ * the label isn't a carrier-specific question at all.
+ *
+ * Callers MUST treat `answer: null` on a `required` question as "cannot
+ * proceed", never as "No".
+ */
+export function carrierQuestionForLabel(label, carrierAnswers) {
+    for (const { slug, pattern, required } of CARRIER_QUESTION_PATTERNS) {
+        if (!pattern.test(label))
+            continue;
+        const raw = (carrierAnswers?.[slug] ?? "").toString().trim().toLowerCase();
+        const answer = raw === "yes" || raw === "y" || raw === "true"
+            ? "Y"
+            : raw === "no" || raw === "n" || raw === "false"
+                ? "N"
+                : null;
+        return { slug, required, answer };
+    }
+    return null;
+}
+export function pickYnForLabel(label, disclosures, carrierAnswers) {
+    // Carrier-specific questions answer from the rep's own stored answer.
+    // A known question with NO stored answer falls through to the normal
+    // path only so this function keeps its "Y"|"N" contract — the REAL
+    // protection is the caller's unanswered-required guard, which blocks
+    // the sign before any of these reach the form.
+    const cq = carrierQuestionForLabel(label, carrierAnswers);
+    if (cq?.answer)
+        return cq.answer;
     // Carrier sub-opt-in defaults YES (rep wants the appointment included) —
     // EXCEPT issuers we're not contracted with (e.g. the Pioneer entities
     // bundled under American Amicable), which must be NO so we stop opting
@@ -208,16 +304,37 @@ export function pickYnForLabel(label, disclosures) {
  * change there must change here too.
  */
 export function disclosureKeyForLabel(label, disclosures) {
+    return disclosureKeysForLabel(label, disclosures)[0] ?? null;
+}
+/**
+ * Every disclosure key this label covers AND the rep flagged true.
+ *
+ * Why plural: carriers routinely fold several of our separate
+ * disclosures into ONE prompt. "Have you ever had an insurance or
+ * securities license denied, suspended, cancelled or revoked?" is a
+ * single question that discloses BOTH q4_license_denied and
+ * q5_license_revoked. `pickYnForLabel` already answers such a question
+ * "Yes" correctly (it returns Y on the first true match), but the
+ * coverage audit only ever recorded ONE key — so the second stayed in
+ * `unplaced`, the run reported a disclosure that "matched no question",
+ * and a correctly-answered carrier was routed to a human anyway. Sean
+ * Way and Shekethia Claiborne both stalled on exactly this 2026-08-04.
+ *
+ * Returning every matching key fixes the audit WITHOUT changing a single
+ * answer — the form is filled identically; we just stop raising a false
+ * alarm about it.
+ */
+export function disclosureKeysForLabel(label, disclosures) {
     if (!disclosures)
-        return null;
+        return [];
     if (ISSUING_COMPANY_PATTERN.test(label))
-        return null;
+        return [];
     if (PRODUCT_OPT_IN_PATTERN.test(label))
-        return null;
+        return [];
     if (/(?:\bfile|\bfiled|\bfiling)\b.{0,40}1033|1033\s*(?:form|waiver)/i.test(label))
-        return null;
+        return [];
     if (/securities\s+or\s+investment(?:\s+related)?\s+regulation/i.test(label)) {
-        return disclosures.q3_securities_violation ? "q3_securities_violation" : null;
+        return disclosures.q3_securities_violation ? ["q3_securities_violation"] : [];
     }
     // Lockstep with pickYnForLabel's bankruptcy split: back-fill personal from
     // the legacy flag, then peel firm (Q15b) + pending (Q15c) off before the
@@ -228,16 +345,18 @@ export function disclosureKeyForLabel(label, disclosures) {
     };
     if (/(?:firm|brokerage)\b[\s\S]{0,80}bankrupt/i.test(label) &&
         !/personal/i.test(label)) {
-        return d.q7_firm_bankruptcy ? "q7_firm_bankruptcy" : null;
+        return d.q7_firm_bankruptcy ? ["q7_firm_bankruptcy"] : [];
     }
     if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
-        return d.q7_bankruptcy_pending ? "q7_bankruptcy_pending" : null;
+        return d.q7_bankruptcy_pending ? ["q7_bankruptcy_pending"] : [];
     }
+    // ALL matches, not just the first — see the doc comment above.
+    const keys = [];
     for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
-        if (pattern.test(label) && d[key])
-            return key;
+        if (pattern.test(label) && d[key] && !keys.includes(key))
+            keys.push(key);
     }
-    return null;
+    return keys;
 }
 /**
  * Step-4 Carrier-Questions explanation-modal filler.
@@ -328,13 +447,65 @@ async function fillCarrierQuestionExplanations(ctx, input, idx) {
                     /* no date field on this modal — fine */
                 }
             }
+            // 1b) DATE-FIRST modal shape. Captured live from Sean Way's Foresters
+            //     card 2026-08-06: the modal opens with ONLY an "Occurrence Date"
+            //     input, its datepicker toggle, CANCEL and CREATE — no textarea and
+            //     no SELECT button at all. The description/attachment step only
+            //     appears after the date is committed with CREATE. The old code
+            //     looked for a textarea immediately, found none, and gave up with
+            //     descFilled=false/attached=false while holding the rep's letter —
+            //     which is what stranded every disclosure-Yes rep at Producer.
+            //
+            //     So: if there's no textarea yet but there IS a CREATE, commit the
+            //     date and re-look. Cheap, and a no-op on the older single-step
+            //     modal shape (which has a textarea from the start).
+            // The modal is a DOCUMENT CHOOSER, not a form. Captured live from
+            // Jhovanny Jimenez's card 2026-08-06, its controls are:
+            //   [UPLOAD NEW DOCUMENT] [CREATE EXPLANATION] [SELECT FROM ...]
+            //   [CANCEL] [CREATE]
+            // There is no textarea until "CREATE EXPLANATION" is clicked — that is
+            // what opens the text editor. The old code looked for a textarea
+            // immediately, found none, and gave up while holding the rep's letter.
+            //
+            // Scope by FIRST visible dialog, not `.last()`. The previous `.last()`
+            // resolved to a different (empty) container, which is why `attached`
+            // came back false even though a "SELECT FROM ..." button is plainly
+            // present in the DOM — the locator was searching the wrong dialog.
+            const liveDlg = () => page.locator("mat-dialog-container:visible").first();
+            if ((await liveDlg().locator("textarea").count().catch(() => 0)) === 0) {
+                const createExpl = liveDlg()
+                    .locator('button:has-text("CREATE EXPLANATION")')
+                    .first();
+                if ((await createExpl.count().catch(() => 0)) > 0) {
+                    await createExpl.click({ timeout: 4000 }).catch(() => undefined);
+                    await page.waitForTimeout(2500);
+                    const dom = await page
+                        .evaluate(() => {
+                        const d = document.querySelector("mat-dialog-container");
+                        if (!d)
+                            return "(dialog closed)";
+                        return Array.from(d.querySelectorAll("input, textarea, button, mat-select, [contenteditable]"))
+                            .slice(0, 20)
+                            .map((e) => ({
+                            tag: e.tagName,
+                            txt: (e.textContent || "").trim().slice(0, 22),
+                            ph: e.getAttribute("placeholder"),
+                        }));
+                    })
+                        .catch(() => null);
+                    logger.info({ idx, afterCreateExplanation: dom }, "[Rep step4] opened CREATE EXPLANATION editor");
+                }
+            }
             // 2) Explanation text → the Description textarea. Playwright .fill()
             //    drives Angular's form control properly; a raw value-set is
             //    dropped by ngModel, so DONE would save an empty description and
             //    the red card would persist (verified Jimenez 2026-06-02).
+            //    Re-resolve the dialog: on the date-first shape CREATE may have
+            //    swapped the dialog contents (or opened a second one).
             let descFilled = false;
             try {
-                const ta = dialog.locator("textarea").first();
+                const liveDialog = page.locator("mat-dialog-container:visible").first();
+                const ta = liveDialog.locator("textarea").first();
                 if (await ta.count()) {
                     await ta.fill(pick.explanation);
                     descFilled = true;
@@ -351,7 +522,14 @@ async function fillCarrierQuestionExplanations(ctx, input, idx) {
             //    belt-and-braces and harmless when the list is empty.
             let attached = false;
             try {
-                const sel = dialog.locator('button:has-text("SELECT")').first();
+                // Real label is "library_books SELECT FROM ..." — scope to the FIRST
+                // visible dialog (see the CREATE EXPLANATION note above; `.last()`
+                // resolved to an empty container and silently found nothing).
+                const sel = page
+                    .locator("mat-dialog-container:visible")
+                    .first()
+                    .locator('button:has-text("SELECT FROM"), button:has-text("SELECT")')
+                    .first();
                 if (await sel.count()) {
                     await sel.click({ timeout: 4000 }).catch(() => undefined);
                     await page.waitForTimeout(700);
@@ -387,7 +565,34 @@ async function fillCarrierQuestionExplanations(ctx, input, idx) {
             }
             else {
                 unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)");
-                logger.warn({ idx, saved, descFilled, attached, q: questionText.slice(0, 80) }, "[Rep step4] explanation modal not satisfied — capturing + closing");
+                // Dump the modal's actual control inventory. descFilled/attached
+                // both false means our selectors (`textarea`, `button:has-text
+                // ("SELECT")`) matched NOTHING — i.e. SureLC's modal isn't shaped
+                // the way this code assumes, and we saved an empty explanation
+                // while holding the rep's letter in `pool`. The screenshot below
+                // is written to a tmp evidence dir that does not survive the
+                // container, so it has never been available when diagnosing this.
+                // Logging the inventory puts the one fact needed to fix the
+                // selectors into the durable log instead (2026-08-05: Ana was
+                // right that nothing was missing — pool had 7 entries and the bot
+                // still reported the card unsatisfiable).
+                const modalControls = await page
+                    .evaluate(() => {
+                    const d = document.querySelector("mat-dialog-container");
+                    if (!d)
+                        return null;
+                    return Array.from(d.querySelectorAll("input, textarea, button, mat-select, [contenteditable]"))
+                        .slice(0, 25)
+                        .map((e) => ({
+                        tag: e.tagName,
+                        cls: (e.className || "").toString().slice(0, 40),
+                        txt: (e.textContent || "").trim().slice(0, 24),
+                        ph: e.getAttribute("placeholder"),
+                        fcn: e.getAttribute("formcontrolname"),
+                    }));
+                })
+                    .catch(() => null);
+                logger.warn({ idx, saved, descFilled, attached, q: questionText.slice(0, 80), modalControls }, "[Rep step4] explanation modal not satisfied — capturing + closing");
                 await snapshot(ctx, `rep-carrier${idx}-add-modal-p${pass}-unfilled`);
                 await page
                     .evaluate(() => {
@@ -708,6 +913,72 @@ export async function repReview(browser, input, parentLogger, jobId) {
         await ctxBrowser.close().catch(() => { });
     }
 }
+// Fill SureLC's rep SSN/DOB auth gate and click LOGIN. Assumes the
+// auth-ssn-input gate is already present on the page. Mirrors the inline
+// Step-0 auth fill; used by the Step-6 OAuth-bounce recovery to
+// re-authenticate IN PLACE when SureLC drops the ar-review session
+// mid-wizard (that bounce re-renders this same SSN/DOB gate). Returns
+// {ok:false, reason} if a required field/button is missing.
+async function fillRepAuthGate(ctx, ssnLast6, dob) {
+    const { page } = ctx;
+    const ssnFocused = await page
+        .evaluate(() => {
+        const el = document.querySelector("auth-ssn-input input.hidden, auth-ssn-input input:not([readonly])");
+        if (!el)
+            return false;
+        el.focus();
+        return true;
+    })
+        .catch(() => false);
+    if (!ssnFocused) {
+        const host = await page.$("auth-ssn-input");
+        await host?.click().catch(() => undefined);
+    }
+    await page.waitForTimeout(300);
+    await page.keyboard.type(ssnLast6, { delay: 100 });
+    await page.waitForTimeout(500);
+    const dobSlashed = dob.replace(/-/g, "/");
+    const dobInput = await page.$('auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])');
+    if (!dobInput)
+        return { ok: false, reason: "DOB field not found at re-auth" };
+    try {
+        await dobInput.fill(dobSlashed, { force: true, timeout: 10_000 });
+    }
+    catch {
+        await page.evaluate((val) => {
+            const el = document.querySelector('auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])');
+            if (!el)
+                return;
+            const proto = Object.getPrototypeOf(el);
+            const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            setter?.call(el, val);
+            el.dispatchEvent(new Event("input", { bubbles: true }));
+            el.dispatchEvent(new Event("change", { bubbles: true }));
+            el.dispatchEvent(new Event("blur", { bubbles: true }));
+        }, dobSlashed);
+    }
+    await page.keyboard.press("Tab").catch(() => undefined);
+    await page.waitForTimeout(500);
+    const authBtn = await firstVisible(page, [
+        'button:has-text("LOGIN")',
+        'button:has-text("Login")',
+        'button:has-text("Sign In")',
+        'button:has-text("Authenticate")',
+        'button:has-text("Verify")',
+        'button:has-text("Continue")',
+        'button:has-text("Submit")',
+        'button[type="submit"]',
+        'button.mat-flat-button.mat-primary',
+    ]);
+    if (!authBtn)
+        return { ok: false, reason: "LOGIN button not found at re-auth" };
+    await Promise.all([
+        page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => { }),
+        authBtn.click(),
+    ]);
+    await settle(page, 3000);
+    return { ok: true };
+}
 async function reviewOneCarrier(ctx, idx, input) {
     const { page, logger } = ctx;
     // Fast-path: if this appointment was already signed in a prior run,
@@ -826,7 +1097,7 @@ async function reviewOneCarrier(ctx, idx, input) {
     // visible question becomes Y; everything else stays N. With no
     // disclosures passed (legacy callers), every question defaults to N
     // — the same behavior as before.
-    const step4Filled = await fillRadiosByLabelLookup(page, "yn", input.disclosures);
+    const step4Filled = await fillRadiosByLabelLookup(page, "yn", input.disclosures, input.carrierAnswers);
     logger.info({ ...step4Filled }, "[Rep step4] carrier questions answered from disclosures");
     // Some carriers (e.g. Occidental Life) require additional text
     // inputs on this same step — cellPhone, placeOfBirth, residentCounty.
@@ -855,8 +1126,31 @@ async function reviewOneCarrier(ctx, idx, input) {
     // Step 5 — Questionnaire: SureLC uses value="true" / value="false"
     // here. Same disclosure-aware fill — true matches any flagged
     // disclosure, false everywhere else.
-    const step5Filled = await fillRadiosByLabelLookup(page, "tf", input.disclosures);
+    const step5Filled = await fillRadiosByLabelLookup(page, "tf", input.disclosures, input.carrierAnswers);
     logger.info({ ...step5Filled }, "[Rep step5] questionnaire answered from disclosures");
+    // Carrier-question guard — a carrier-specific question we hold no answer
+    // for must NEVER be auto-filled. pickYnForLabel's default is "N", so
+    // without this the bot would tell NLG the rep is not a legal resident of
+    // the US and has no lawful work authorisation — both false, both denying
+    // the rep's own attestation, and both fatal to the contract. Verified
+    // against the real wording 2026-08-06 before this guard existed.
+    {
+        const unanswered = [
+            ...step4Filled.unansweredCarrierQuestions,
+            ...step5Filled.unansweredCarrierQuestions,
+        ];
+        if (unanswered.length > 0) {
+            logger.warn({ idx, unanswered }, "[Rep] carrier-specific question(s) with no stored answer — routing to human, not signing");
+            return {
+                ok: false,
+                reason: `This carrier asks question(s) we have no answer for: ` +
+                    `${unanswered.join("; ")}. The bot will not guess on a carrier form — ` +
+                    `answering "No" by default would be a false statement about the rep. ` +
+                    `Collect these at onboarding (carrier_questions) or have a human complete ` +
+                    `this carrier's questionnaire. Do NOT auto-sign.`,
+            };
+        }
+    }
     // Compliance guard — every TRUE disclosure must have landed on a
     // recognized question across Step 4 + Step 5. A true flag that matched
     // NO label means this carrier words that question outside our patterns,
@@ -949,24 +1243,53 @@ async function reviewOneCarrier(ctx, idx, input) {
     await snapshot(ctx, `rep-carrier${idx}-step6-review-loading`);
     let pdfReady = await waitForPdfViewer(page);
     if (!pdfReady) {
-        // SureLC's OAuth has been dropping the session mid-signing lately: the
-        // review page bounces to accounts.surancebay.com/oauth/authorize during
-        // the PDF wait, so the viewer "never loads" (surfaced as the generic PDF
-        // error with an OAuth URL in the diag). Reloading the CURRENT signing page
-        // re-establishes the session in place (keeps this carrier's wizard
-        // context, unlike re-navigating to the review URL) — retry the wait once
-        // before giving up.
+        // The ar-review OAuth session drops mid-wizard, so the signing page
+        // bounces to accounts.surancebay.com/oauth/authorize during the PDF wait
+        // and the viewer "never loads" (surfaced as the generic PDF error with an
+        // OAuth URL in the diag). This is the real cause of the recurring "PDF
+        // viewer did not load" — a BOT bug, not SureLC instability: that OAuth
+        // page re-renders the rep SSN/DOB gate, and the previous recovery just
+        // reload()'d it, which re-lands on the login gate WITHOUT re-entering
+        // credentials, so the PDF never appears. Correct recovery: re-authenticate
+        // in place (fill SSN/DOB + LOGIN), let OAuth redirect back to the
+        // appointment (SureLC persists wizard progress server-side, so it resumes
+        // at the furthest step), then retry the PDF wait.
         const bounceUrl = String(page._lastPdfDiag?.url || page.url());
         if (/accounts\.surancebay\.com\/oauth|\/oauth\/authorize/i.test(bounceUrl)) {
-            logger.warn({ bounceUrl }, "[Rep step6] PDF wait bounced to OAuth — reloading to re-establish session, retrying once");
+            logger.warn({ bounceUrl }, "[Rep step6] PDF wait bounced to OAuth — re-authenticating rep in place, retrying once");
+            // Wait for the SSN/DOB gate to mount on the OAuth authorize page.
             await page
-                .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
-                .catch(() => undefined);
-            await page
-                .waitForLoadState("networkidle", { timeout: 20_000 })
+                .waitForSelector('auth-ssn-input, input.mat-mdc-input-element', {
+                timeout: 30_000,
+            })
                 .catch(() => undefined);
             await settle(page, 2500);
-            pdfReady = await waitForPdfViewer(page);
+            if (await page.$("auth-ssn-input")) {
+                const reauth = await fillRepAuthGate(ctx, input.ssnLast6, input.dob);
+                if (reauth.ok) {
+                    // OAuth redirected back into the appointment. Re-accept the policy
+                    // gate if it's shown again, then retry the PDF wait — SureLC resumes
+                    // the wizard at the furthest persisted step (i.e. review & sign).
+                    await acceptPoliciesIfShown(page).catch(() => undefined);
+                    await settle(page, 2500);
+                    pdfReady = await waitForPdfViewer(page);
+                }
+                else {
+                    logger.warn({ reason: reauth.reason }, "[Rep step6] re-auth after OAuth bounce failed");
+                }
+            }
+            else {
+                // No SSN/DOB gate rendered (empty OAuth shell) — fall back to the old
+                // reload so we at least retry rather than bailing outright.
+                await page
+                    .reload({ waitUntil: "domcontentloaded", timeout: 60_000 })
+                    .catch(() => undefined);
+                await page
+                    .waitForLoadState("networkidle", { timeout: 20_000 })
+                    .catch(() => undefined);
+                await settle(page, 2500);
+                pdfReady = await waitForPdfViewer(page);
+            }
         }
     }
     if (!pdfReady) {
@@ -1443,7 +1766,7 @@ async function clickSignConsentDialog(ctx) {
  * step — admins can see at a glance whether any disclosures triggered
  * a Yes.
  */
-async function fillRadiosByLabelLookup(page, scheme, disclosures) {
+async function fillRadiosByLabelLookup(page, scheme, disclosures, carrierAnswers) {
     const yesValue = scheme === "yn" ? "Y" : "true";
     const noValue = scheme === "yn" ? "N" : "false";
     // Wait for at least one mat-radio-group to render. Without this,
@@ -1488,9 +1811,20 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
     // committed). The caller diffs this against the rep's true flags to
     // catch a disclosure that matched no on-screen question.
     const placed = new Set();
+    const unansweredCarrierQuestions = [];
     for (const { name, label, values } of groups) {
-        const ans = pickYnForLabel(label, disclosures);
-        const placedKey = ans === "Y" ? disclosureKeyForLabel(label, disclosures) : null;
+        // Record a required carrier-specific question we cannot answer BEFORE
+        // filling anything — pickYnForLabel would otherwise write "N", which on
+        // e.g. "Are you a legal resident of the United States?" is a false
+        // statement about the rep.
+        const cqMatch = carrierQuestionForLabel(label, carrierAnswers);
+        if (cqMatch && cqMatch.required && !cqMatch.answer) {
+            unansweredCarrierQuestions.push(`${cqMatch.slug}: ${label.slice(0, 90)}`);
+        }
+        const ans = pickYnForLabel(label, disclosures, carrierAnswers);
+        // ALL disclosure keys this one question covers (carriers bundle
+        // several of ours into a single prompt) — see disclosureKeysForLabel.
+        const placedKeysForLabel = ans === "Y" ? disclosureKeysForLabel(label, disclosures) : [];
         // Per-group value detection: a single wizard step can MIX schemes —
         // carrier Y/N questions alongside background-disclosure questions
         // rendered with value="true"/"false" on the SAME step (American
@@ -1560,8 +1894,8 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
         if (clicked) {
             if (ans === "Y") {
                 yes++;
-                if (placedKey)
-                    placed.add(placedKey);
+                for (const k of placedKeysForLabel)
+                    placed.add(k);
             }
             else
                 no++;
@@ -1572,6 +1906,7 @@ async function fillRadiosByLabelLookup(page, scheme, disclosures) {
         yes,
         no,
         placedKeys: [...placed],
+        unansweredCarrierQuestions,
         // Raw question labels seen on this step — surfaced so the caller can
         // log exactly how a carrier worded a question that matched no
         // disclosure pattern (e.g. an IRS/tax question phrased outside the
