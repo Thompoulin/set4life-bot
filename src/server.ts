@@ -575,7 +575,27 @@ app.post("/resend-rep-emails", async (req, res) => {
  *   - residentState: state to use (defaults to producer's resident state
  *     fetched from SureLC license API)
  *
- * Returns: { ok, count, created: [{ carrier, status }] }
+ *   - fallbackProducerEmail: the agent's platform-generated mailbox
+ *     (…@agent.set4lifeagency.com). Last resort for producerEmailUsed
+ *     when SureLC's own producer record has no email yet. Every agent
+ *     is provisioned a mailbox at signup, so the caller ALWAYS knows a
+ *     deliverable address even when SureLC does not — see the count
+ *     contract below for why that matters.
+ *
+ * Returns: { ok, count, created: [{ carrier, status }], skipped: [...] }
+ *
+ * COUNT CONTRACT (2026-08-14): `count` is the number of appointment
+ * requests ACTUALLY CREATED (HTTP 2xx), never the number attempted.
+ * Carriers skipped by the producerEmailUsed guard go in `skipped`, not
+ * `created`, and `ok` is false when nothing was created.
+ *
+ * This used to push {status: 0} into `created` for every skipped carrier
+ * and return `ok: true, count: created.length`. Pablo Ballesteros
+ * (producer 8167262) had all 7 carriers skipped on 2026-08-13 because
+ * his SureLC producer record carried no email — and the caller recorded
+ * a SUCCESS event reading "created 7 appointments". He sat with zero
+ * real appointment-requests for a day while every surface said his
+ * contracting had been submitted.
  */
 const createAppointmentRequestsSchema = z.object({
   producerId: z.string().min(1),
@@ -583,6 +603,7 @@ const createAppointmentRequestsSchema = z.object({
   adminCreds: adminCredsSchema,
   gaId: z.number().int().positive().optional(),
   residentState: z.string().length(2).optional(),
+  fallbackProducerEmail: z.string().email().optional(),
 })
 app.post("/create-appointment-requests", async (req, res) => {
   const auth = req.headers.authorization || ""
@@ -593,7 +614,8 @@ app.post("/create-appointment-requests", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
   }
-  const { producerId, templateProducerId, adminCreds, residentState } = parsed.data
+  const { producerId, templateProducerId, adminCreds, residentState, fallbackProducerEmail } =
+    parsed.data
   const gaId = parsed.data.gaId ?? 1322
   try {
     const { chromium } = await import("playwright")
@@ -691,6 +713,7 @@ app.post("/create-appointment-requests", async (req, res) => {
       )
 
       const created: Array<{ carrier: string; status: number }> = []
+      const skipped: Array<{ carrier: string; reason: string }> = []
       for (const t of targets) {
         const newAppt = {
           ...t,
@@ -714,11 +737,19 @@ app.post("/create-appointment-requests", async (req, res) => {
           // address — never the template's. Falling through to null
           // (the old bug) produces editable BGA-stage requests with no
           // way to send the producer-review email.
+          // fallbackProducerEmail (the platform-generated
+          // …@agent.set4lifeagency.com mailbox) is the final rung. Every
+          // agent gets one provisioned at signup, so if SureLC's producer
+          // record is still empty we always have a deliverable address —
+          // there is no legitimate reason to skip a carrier for want of an
+          // email. Kept LAST so a real SureLC-side address always wins.
           producerEmailUsed:
             repSample?.producerEmailUsed ||
             repSample?.producerEffectiveEmail ||
             producerEffectiveEmail ||
-            producerEmail,
+            producerEmail ||
+            fallbackProducerEmail ||
+            null,
           producerEffectivePhone: repSample?.producerEffectivePhone || producerPhone,
           carrierStatus: "ProducerReview",
           stage: "Producer",
@@ -743,9 +774,16 @@ app.post("/create-appointment-requests", async (req, res) => {
         if (!newAppt.producerEmailUsed) {
           logger.warn(
             { producerId, carrier: t.carrierName },
-            "[create-appointment-requests] skipping carrier — producerEmailUsed unresolved",
+            "[create-appointment-requests] skipping carrier — producerEmailUsed unresolved (no SureLC email and no fallbackProducerEmail supplied)",
           )
-          created.push({ carrier: t.carrierName, status: 0 })
+          // NOT pushed into `created` — see the count contract above. A
+          // skipped carrier is a non-event, and reporting it as created is
+          // what stranded Pablo Ballesteros with zero appointment-requests
+          // behind a "created 7 appointments" success line.
+          skipped.push({
+            carrier: t.carrierName,
+            reason: "producerEmailUsed unresolved",
+          })
           continue
         }
 
@@ -756,12 +794,18 @@ app.post("/create-appointment-requests", async (req, res) => {
         })
         created.push({ carrier: t.carrierName, status: r.status })
       }
+      // Only 2xx is a real appointment-request. A non-2xx POST is a
+      // failure, not a creation — counting it would reproduce the same
+      // false-success in a different shape.
+      const reallyCreated = created.filter((c) => c.status >= 200 && c.status < 300)
       return res.json({
-        ok: true,
+        ok: reallyCreated.length > 0,
         producerId,
         residentStateUsed: state,
-        count: created.length,
+        count: reallyCreated.length,
+        attempted: created.length,
         created,
+        skipped,
       })
     } finally {
       await browser.close().catch(() => undefined)
