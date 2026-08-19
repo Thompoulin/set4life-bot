@@ -487,6 +487,49 @@ async function enterProducerProfile(
     throw new Error(`Could not reach producer list to enter profile (${navList.finalUrl})`)
   }
   await settle(page, 800)
+
+  // AG Grid is VIRTUALIZED — only rows currently in the viewport render, so on
+  // the full unsearched list a producer below the fold is invisible to the
+  // row-id selector below and the wait always times out. As the agency's
+  // producer list grew this stopped being an edge case: on 2026-08-19 it was
+  // failing 10+ producers, 27 consecutive runs on Darryl Talley (1137361) and
+  // 25 on Anthony Vonner (16545302), each bailing with "Producer row ... did
+  // not render in AG Grid" and blocking every carrier contract behind it.
+  //
+  // addProducer.ts::changeAffiliation already hit this exact wall (Gabriel
+  // Fernandez, producer 8890402, failed 6 days straight on a FALSE "could not
+  // set affiliation") and already solved it by filtering the grid through the
+  // search box. That fix was never carried over to this function. Same bug,
+  // same page, same remedy — kept deliberately identical so the two stay in
+  // step.
+  //
+  // The box matches on id ("Search by name, SSN, email, phone, id"). Use the
+  // BOX, not a `?search=` deep URL — a deep URL bounces straight to OAuth, and
+  // so does navigating directly to /bga/producers/{id}, which is why this
+  // function goes through the list and clicks the row at all.
+  try {
+    const searchBox = await firstVisible(page, [
+      'input[placeholder*="Search by name"]',
+      'input[placeholder*="Search"]',
+    ])
+    if (searchBox) {
+      await (searchBox as any).click()
+      await (searchBox as any).press("Control+A").catch(() => {})
+      await (searchBox as any).press("Delete").catch(() => {})
+      await (searchBox as any).type(String(producerId), { delay: 20 })
+      await (searchBox as any).press("Enter").catch(() => {})
+      await settle(page)
+      await page.waitForTimeout(800)
+    } else {
+      logger.warn({ producerId }, "enterProducerProfile: search box not found — falling back to full-list scan")
+    }
+  } catch (err: any) {
+    logger.warn(
+      { producerId, err: err?.message },
+      "enterProducerProfile: producer search failed — falling back to full-list scan",
+    )
+  }
+
   await page
     .waitForSelector(`[role="row"][row-id="${producerId}"]`, { timeout: 15_000 })
     .catch(() => {
