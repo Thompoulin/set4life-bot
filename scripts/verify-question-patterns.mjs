@@ -80,6 +80,21 @@ for (const m of body[0].matchAll(/^\s{4}(\w+):\s*"((?:[^"\\]|\\.)*)",/gm)) {
   patterns[m[1]] = m[2].replace(/\\\\/g, "\\");
 }
 
+// The same wording is encoded TWICE: getSlugQuestionPattern (used to locate and
+// click the radio) and QUESTION_KEYWORD_MAP (used to build the question
+// inventory). On 2026-08-19 only the first was fixed and the second kept the
+// broken patterns — the duplication is exactly the kind of thing that drifts, so
+// check both and require them to agree.
+const kwBlock = src.match(/const QUESTION_KEYWORD_MAP[\s\S]*?\n\]\n/);
+if (!kwBlock) {
+  console.error("FAIL: could not locate QUESTION_KEYWORD_MAP in fillProfile.ts");
+  process.exit(1);
+}
+const keywordPatterns = {};
+for (const m of kwBlock[0].matchAll(/\{\s*slug:\s*"(\w+)",\s*match:\s*\(t\)\s*=>\s*\/((?:[^/\\]|\\.)+)\/i\.test\(t\)/g)) {
+  keywordPatterns[m[1]] = m[2];
+}
+
 let failures = 0;
 for (const [slug, expectedQ] of Object.entries(EXPECTED)) {
   const raw = patterns[slug];
@@ -114,9 +129,34 @@ for (const [slug, expectedQ] of Object.entries(EXPECTED)) {
   }
 }
 
+// Cross-table: every slug we pin must resolve to the same question in BOTH maps.
+for (const [slug, expectedQ] of Object.entries(EXPECTED)) {
+  const kw = keywordPatterns[slug];
+  if (!kw) {
+    console.error(`FAIL ${slug}: absent from QUESTION_KEYWORD_MAP`);
+    failures++;
+    continue;
+  }
+  let re;
+  try {
+    re = new RegExp(kw, "i");
+  } catch (err) {
+    console.error(`FAIL ${slug}: invalid QUESTION_KEYWORD_MAP regex /${kw}/`);
+    failures++;
+    continue;
+  }
+  const hits = Object.entries(QUESTIONS).filter(([, t]) => re.test(t)).map(([k]) => k);
+  if (hits.length !== 1 || hits[0] !== expectedQ) {
+    console.error(
+      `FAIL ${slug}: QUESTION_KEYWORD_MAP /${kw}/ matches [${hits.join(", ") || "nothing"}], expected ${expectedQ}`,
+    );
+    failures++;
+  }
+}
+
 console.log(
   failures === 0
-    ? `\nPASS — ${Object.keys(EXPECTED).length} slugs each match exactly one intended question.`
+    ? `\nPASS — ${Object.keys(EXPECTED).length} slugs match exactly one intended question in BOTH tables.`
     : `\nFAIL — ${failures} problem(s).`,
 );
 process.exit(failures === 0 ? 0 : 1);
