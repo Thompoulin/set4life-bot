@@ -527,46 +527,45 @@ async function enterProducerProfile(
   }
   await settle(page, 800)
 
-  // AG Grid is VIRTUALIZED — only rows currently in the viewport render, so on
-  // the full unsearched list a producer below the fold is invisible to the
-  // row-id selector below and the wait always times out. As the agency's
-  // producer list grew this stopped being an edge case: on 2026-08-19 it was
-  // failing 10+ producers, 27 consecutive runs on Darryl Talley (1137361) and
-  // 25 on Anthony Vonner (16545302), each bailing with "Producer row ... did
-  // not render in AG Grid" and blocking every carrier contract behind it.
+  // AG Grid here is VIRTUALIZED with pagination DISABLED (the ag-paging-panel
+  // is ag-hidden), so the DOM holds only the rows inside the current scroll
+  // window — 109 of them in the 2026-08-19 capture. A producer outside that
+  // window is invisible to the row-id selector below no matter how long we
+  // wait, which is why this failed 27 consecutive runs for producer 1137361,
+  // 25 for 16545302, and every run for 10567033.
   //
-  // addProducer.ts::changeAffiliation already hit this exact wall (Gabriel
-  // Fernandez, producer 8890402, failed 6 days straight on a FALSE "could not
-  // set affiliation") and already solved it by filtering the grid through the
-  // search box. That fix was never carried over to this function. Same bug,
-  // same page, same remedy — kept deliberately identical so the two stay in
-  // step.
+  // Two earlier attempts at this are worth recording so nobody repeats them:
+  //   * Typing into a "search box" — copied from addProducer.ts, which has
+  //     carried the same block since Gabriel Fernandez. There IS no producer
+  //     search box on this page. The only input matching placeholder*="Search"
+  //     is AG Grid's column chooser (aria-label="Filter Columns Input"), and
+  //     it lives in a collapsed tool panel, so firstVisible never returns it.
+  //     Verified against the captured HTML: that block has never once worked.
+  //   * Forcing navigation to the list first — the page was already on
+  //     /bga/producers with 223 ag-rows present. Navigation was never the
+  //     problem.
   //
-  // The box matches on id ("Search by name, SSN, email, phone, id"). Use the
-  // BOX, not a `?search=` deep URL — a deep URL bounces straight to OAuth, and
-  // so does navigating directly to /bga/producers/{id}, which is why this
-  // function goes through the list and clicks the row at all.
-  try {
-    const searchBox = await firstVisible(page, [
-      'input[placeholder*="Search by name"]',
-      'input[placeholder*="Search"]',
-    ])
-    if (searchBox) {
-      await (searchBox as any).click()
-      await (searchBox as any).press("Control+A").catch(() => {})
-      await (searchBox as any).press("Delete").catch(() => {})
-      await (searchBox as any).type(String(producerId), { delay: 20 })
-      await (searchBox as any).press("Enter").catch(() => {})
-      await settle(page)
-      await page.waitForTimeout(800)
-    } else {
-      logger.warn({ producerId }, "enterProducerProfile: search box not found — falling back to full-list scan")
+  // What actually works is scrolling the grid until the row virtualizes in.
+  const gridViewport = await firstVisible(page, [
+    ".ag-body-viewport",
+    ".ag-center-cols-viewport",
+  ])
+  if (gridViewport) {
+    for (let i = 0; i < 40; i++) {
+      const found = await page.$(`[role="row"][row-id="${producerId}"]`)
+      if (found) break
+      const atEnd = await (gridViewport as any)
+        .evaluate((el: any) => {
+          const before = el.scrollTop
+          el.scrollTop = before + el.clientHeight * 0.85
+          return el.scrollTop === before
+        })
+        .catch(() => true)
+      await page.waitForTimeout(220)
+      if (atEnd) break
     }
-  } catch (err: any) {
-    logger.warn(
-      { producerId, err: err?.message },
-      "enterProducerProfile: producer search failed — falling back to full-list scan",
-    )
+  } else {
+    logger.warn({ producerId }, "enterProducerProfile: grid viewport not found — cannot scroll to row")
   }
 
   await page
