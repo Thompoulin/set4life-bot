@@ -477,6 +477,45 @@ async function enterProducerProfile(
     /* malformed URL */
   }
 
+  // Get OFF any other producer's route before asking for the list.
+  //
+  // gotoBga treats sub-routes of the target as "already there":
+  //     if (here.startsWith(`${targetPathOnly}/`)) return { ok: true }
+  // With targetPathOnly = "/bga/producers", a URL like
+  // /bga/producers/8890402/dba matches that prefix, so gotoBga reports
+  // success WITHOUT navigating. enterProducerProfile runs immediately after
+  // changeAffiliation, which leaves the page parked on a producer sub-route —
+  // so the bot believed it was on the producer list while actually sitting on
+  // someone else's profile. No list means no search box and no grid rows,
+  // which is why BOTH the search step here and the identical one in
+  // changeAffiliation logged "search box not found" before failing with
+  // "Producer row ... did not render in AG Grid" (2026-08-19: 27 consecutive
+  // failures on producer 1137361, 25 on 16545302).
+  //
+  // Clicking the real "Producers" nav link is how gotoBga's own Attempt 0
+  // navigates, and it is what keeps the SPA's in-memory auth alive — a hard
+  // load or pushState to /bga/producers bounces to /oauth/authorize.
+  try {
+    const here = new URL(page.url()).pathname
+    if (/^\/bga\/producers\/[^/]+/.test(here)) {
+      logger.info(
+        { producerId, here },
+        "enterProducerProfile: parked on another producer's route — clicking Producers nav to reach the list",
+      )
+      const navLink = await firstVisible(page, [
+        'a[href$="/producers"]',
+        '[routerlink*="producers"]',
+        'a[href*="/bga/producers"]',
+      ])
+      if (navLink) {
+        await (navLink as any).click({ timeout: 4_000 }).catch(() => {})
+        await settle(page, 1_000)
+      }
+    }
+  } catch {
+    /* malformed URL — fall through to gotoBga */
+  }
+
   // Navigate to the producer list (in-SPA if possible).
   const navList = await gotoBga(
     page,
