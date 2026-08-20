@@ -39,6 +39,10 @@ const producerSchema = z.object({
 const profileSchema = z.object({
   residentAddress: z
     .object({
+      // Enter the address even when the Profile tab shows no
+      // "Resident address is not valid" alert. Set by the main app when
+      // SureLC's own API reports no address on the producer.
+      forceFill: z.boolean().optional(),
       addressLine1: z.string().min(1),
       addressLine2: z.string().optional(),
       city: z.string().min(1),
@@ -112,6 +116,10 @@ const profileSchema = z.object({
     .optional(),
   training: z
     .object({
+      // Upload the AML certificate even when a date is rendered in the
+      // AML row. Set by the main app when SureLC's own API reports no
+      // AML course on the producer.
+      forceFill: z.boolean().optional(),
       amlCompletionDate: z.string().optional(),
       amlCertificateUrl: z.string().url().optional(),
       amlProvider: z.string().optional(),
@@ -121,6 +129,10 @@ const profileSchema = z.object({
     .optional(),
   eno: z
     .object({
+      // Add the policy even when the tab renders "Individual E&O Policy"
+      // and the word "Active". Set by the main app when SureLC's own API
+      // reports no active E&O on the producer.
+      forceFill: z.boolean().optional(),
       provider: z.string().optional(),
       policyNumber: z.string().optional(),
       effectiveDate: z.string().optional(),

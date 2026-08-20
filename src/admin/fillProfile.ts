@@ -38,6 +38,10 @@ import {
 export interface ProfileFillInput {
   producerId: string
   residentAddress?: {
+    /** Do the work even if the page's own detector says it is already
+     *  done. Set by the main app only when SureLC's read API reports the
+     *  area empty, so it can never duplicate an existing record. */
+    forceFill?: boolean
     addressLine1: string
     addressLine2?: string
     city: string
@@ -93,6 +97,10 @@ export interface ProfileFillInput {
     }>
   }
   training?: {
+    /** Do the work even if the page's own detector says it is already
+     *  done. Set by the main app only when SureLC's read API reports the
+     *  area empty, so it can never duplicate an existing record. */
+    forceFill?: boolean
     amlCompletionDate?: string // YYYY-MM-DD or MM-DD-YYYY
     amlCertificateUrl?: string
     /** Provider/vendor (LIMRA, WebCE, etc.) used to fill SureLC's
@@ -105,6 +113,10 @@ export interface ProfileFillInput {
     ltcRiderCompleted?: boolean // false for Set4Life
   }
   eno?: {
+    /** Do the work even if the page's own detector says it is already
+     *  done. Set by the main app only when SureLC's read API reports the
+     *  area empty, so it can never duplicate an existing record. */
+    forceFill?: boolean
     provider?: string
     policyNumber?: string
     effectiveDate?: string
@@ -781,8 +793,13 @@ async function fillProfileTab(
       /Resident address is not valid/i.test(els[0]?.innerText || ""),
     )
     .catch(() => false)
-  if (!hasInvalidAlertPre) {
+  if (!hasInvalidAlertPre && !input?.forceFill) {
     return { ok: true, alreadyDone: true, details: { skipped: "no resident-address alert" } }
+  }
+  if (!hasInvalidAlertPre && input?.forceFill) {
+    logger.info(
+      "[Profile] caller says SureLC holds no resident address — entering it even though the tab shows no alert",
+    )
   }
 
   // Confirmed via Josue's snapshot: the NIPR sync button only
@@ -2068,9 +2085,15 @@ async function fillTraining(
     await page.waitForTimeout(1_000)
     amlRowText = await readAmlRow()
   }
-  if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText)) {
+  if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText) && !input?.forceFill) {
     logger.info({ amlRowExcerpt: amlRowText.slice(0, 120) }, "[Training] AML already on file (date detected) — skipping upload")
     return { ok: true, alreadyDone: true, details: { detected: "amlRowHasDate" } }
+  }
+  if (input?.forceFill) {
+    logger.info(
+      { amlRowExcerpt: amlRowText.slice(0, 120) },
+      "[Training] caller says SureLC has no AML course — ignoring the row detector and uploading",
+    )
   }
 
   // The AML row lives inside a custom Angular component <sb-aml-course>.
@@ -2435,6 +2458,18 @@ async function fillEnoDate(
   return false
 }
 
+/**
+ * `forceFill` — the caller has read SureLC's own API and knows the area is
+ * missing. The detectors below judge by rendered page text and have been
+ * wrong in one direction for months: on 2026-08-20 nineteen producers all
+ * logged `eno: detected activePolicy`, `training: detected amlRowHasDate`
+ * and `profile: skipped "no resident-address alert"` while SureLC held
+ * `eno: []`, `courses: []` and `addresses: []` for them. The bot then said
+ * "All 7 tabs OK", Fastlane refused to render SELECT, and no carrier
+ * request was ever created. When the caller passes forceFill we skip the
+ * detector and do the work; the caller only ever sets it when the API says
+ * the area is empty, so this cannot produce a duplicate.
+ */
 async function fillEno(
   ctx: TabContext,
   producerId: string,
@@ -2496,7 +2531,12 @@ async function fillEno(
     .catch(() => "")
   const hasActivePolicy = /Individual E&O Policy/i.test(eoText) && /\bActive\b/.test(eoText)
   const hasCertAttached = /E&O certificate is attached/i.test(eoText)
-  if (hasActivePolicy || hasCertAttached) {
+  if (input.forceFill) {
+    logger.info(
+      { hasActivePolicy, hasCertAttached },
+      "[E&O] caller says SureLC has no active policy — ignoring the page detector and adding one",
+    )
+  } else if (hasActivePolicy || hasCertAttached) {
     logger.info({ hasActivePolicy, hasCertAttached }, "[E&O] active policy already on file — skipping ADD")
     return { ok: true, alreadyDone: true, details: { detected: hasActivePolicy ? "activePolicy" : "certAttached" } }
   }
@@ -2505,7 +2545,7 @@ async function fillEno(
   // <mat-row>s in older builds. Keep the row count check as a
   // secondary signal in case the text-based detector ever drifts.
   const existingRows = await page.$$("mat-row")
-  if (existingRows.length > 0) {
+  if (existingRows.length > 0 && !input.forceFill) {
     logger.info(
       { count: existingRows.length },
       "[E&O] producer already has policy row(s) — skipping ADD",
