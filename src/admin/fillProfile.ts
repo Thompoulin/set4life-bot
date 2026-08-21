@@ -48,6 +48,13 @@ export interface ProfileFillInput {
     city: string
     state: string // 2-letter abbreviation
     postalCode: string
+    /**
+     * "Living here since" (ISO YYYY-MM-DD) — the residence dialog's `From`
+     * field. SureLC keeps SAVE disabled until it is set, so without it the
+     * whole Profile tab fails no matter how correct the address is. Never
+     * guessed: the main app only sends it once a human has actually said it.
+     */
+    residentSince?: string
   }
   dba?: {
     businessType?: "License Only" | "Business Only"
@@ -918,6 +925,54 @@ async function fillProfileTab(
     // State input is a text typeahead (mat-form-field with mat-icon
     // suffix), not a mat-select — fill the visible input directly.
     await fillIfEmpty(page, "State", input.state).catch(() => false)
+  }
+
+  // "From" — when the rep started living at this address. SureLC's residence
+  // dialog will not enable SAVE without it, and NEITHER branch above touches
+  // it: USE THIS ADDRESS copies the five address fields off the Business /
+  // Mailing record and leaves the date blank, and the label-fill fallback
+  // never knew the field existed. So every run reported
+  // `From=(empty)` and cancelled the dialog — Paula Landino 2026-08-21, and
+  // the same line in every other address-dialog failure.
+  //
+  // The date is never invented here. The main app sends it only after a
+  // human answered (ContractingBlockerGate, or an admin on their behalf);
+  // absent, we leave the field alone and the dialog fails exactly as before,
+  // which is the honest outcome.
+  if (input.residentSince) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(input.residentSince)
+    if (m) {
+      const mmddyyyy = `${m[2]}/${m[3]}/${m[1]}`
+      const filled = await fillSbDate(
+        page,
+        ["From", "From*"],
+        mmddyyyy,
+        logger,
+        "mat-dialog-container, .cdk-overlay-pane",
+      )
+      if (!filled) {
+        // Last resort: a plain labelled input. Worse than the datepicker
+        // path (the directive may not commit it) but strictly better than
+        // leaving the field empty, and it costs nothing when it misses.
+        const viaLabel = await fillIfEmpty(page, "From", mmddyyyy).catch(
+          () => "failed" as const,
+        )
+        logger.warn(
+          { residentSince: input.residentSince, viaLabel },
+          "[Profile] From datepicker fill missed — fell back to label fill",
+        )
+      } else {
+        logger.info(
+          { residentSince: input.residentSince },
+          "[Profile] filled residence From date",
+        )
+      }
+    } else {
+      logger.warn(
+        { residentSince: input.residentSince },
+        "[Profile] residentSince is not ISO YYYY-MM-DD — leaving From empty",
+      )
+    }
   }
 
   await snapshot(ctx, "tab-profile-edit-dialog-filled")
@@ -2771,7 +2826,7 @@ async function fillTraining(
     // Use the same Material datepicker DOM-fill pattern that worked
     // for E&O — plain fillByLabel doesn't propagate to Material's
     // FormControl reliably.
-    await fillEnoDate(page, ["Completion Date", "Completion", "AML Date"], mmddyyyy, logger)
+    await fillSbDate(page, ["Completion Date", "Completion", "AML Date"], mmddyyyy, logger)
   }
   // LTC rider — Set4Life agents don't sell LTC.
   if (input.ltcRiderCompleted === false) {
@@ -2843,11 +2898,18 @@ async function fillTraining(
  * MatDatepickerInput directive has a CHANGE event listener that
  * parses the string and patches the parent form control.
  */
-async function fillEnoDate(
+async function fillSbDate(
   page: Page,
   labels: string[],
   value: string,
   logger: import("pino").Logger,
+  /**
+   * Optional CSS scope. Pass it when the field lives in a modal: the label
+   * search is document-wide, and "From" is a common enough label that an
+   * unscoped match can land on the page BEHIND the dialog and silently fill
+   * the wrong control. Comma-separated selectors are tried in order.
+   */
+  scopeSelector?: string,
 ): Promise<boolean> {
   if (!value) return false
   // Convert MM/DD/YYYY → YYYY-MM-DD for the native input format
@@ -2856,22 +2918,39 @@ async function fillEnoDate(
 
   for (const label of labels) {
     const result = await page.evaluate(
-      ({ labelText, mmddYyyy, iso }) => {
-        const matLabels = Array.from(document.querySelectorAll("mat-label"))
-        const lbl = matLabels.find((l) => (l.textContent || "").trim() === labelText)
+      ({ labelText, mmddYyyy, iso, scopeSel }) => {
+        let root: ParentNode = document
+        if (scopeSel) {
+          const scoped = scopeSel
+            .split(",")
+            .map((sel) => document.querySelector(sel.trim()))
+            .find(Boolean)
+          if (!scoped) return { ok: false, reason: "scope-not-found" }
+          root = scoped
+        }
+        const matLabels = Array.from(root.querySelectorAll("mat-label"))
+        const lbl = matLabels.find((l) => {
+          const t = (l.textContent || "").trim()
+          return t === labelText || t === `${labelText}*`
+        })
         if (!lbl) return { ok: false, reason: "label-not-found" }
         const ff = lbl.closest("mat-form-field")
         if (!ff) return { ok: false, reason: "no-form-field-ancestor" }
 
-        // The visible (typeable) input
-        const visible = ff.querySelector(
-          'input[matinput][data-cy="date-input"]',
-        ) as HTMLInputElement | null
-        // The hidden mat-datepicker-input that owns the FormControl binding
+        // The visible (typeable) input. The data-cy hook is SureLC's
+        // <sb-date-input>; the residence dialog's From field is a plain
+        // matInput on the same mat-form-field, so fall back to that rather
+        // than reporting inputs-not-found on a field that is right there.
+        const visible = (ff.querySelector('input[matinput][data-cy="date-input"]') ||
+          ff.querySelector("input[matinput]") ||
+          ff.querySelector("input")) as HTMLInputElement | null
+        // The hidden mat-datepicker-input that owns the FormControl binding.
+        // Absent on a plain (non-datepicker) date field — that is fine, the
+        // visible input then owns the binding itself.
         const hidden = ff.querySelector(
-          'input.mat-datepicker-input',
+          "input.mat-datepicker-input",
         ) as HTMLInputElement | null
-        if (!visible || !hidden) return { ok: false, reason: "inputs-not-found" }
+        if (!visible) return { ok: false, reason: "inputs-not-found" }
 
         const setNativeValue = (el: HTMLInputElement, v: string) => {
           const proto = Object.getPrototypeOf(el)
@@ -2886,20 +2965,22 @@ async function fillEnoDate(
         visible.dispatchEvent(new Event("change", { bubbles: true }))
         visible.dispatchEvent(new Event("blur", { bubbles: true }))
 
-        setNativeValue(hidden, iso)
-        hidden.dispatchEvent(new Event("input", { bubbles: true }))
-        hidden.dispatchEvent(new Event("change", { bubbles: true }))
-        hidden.dispatchEvent(new Event("blur", { bubbles: true }))
+        if (hidden) {
+          setNativeValue(hidden, iso)
+          hidden.dispatchEvent(new Event("input", { bubbles: true }))
+          hidden.dispatchEvent(new Event("change", { bubbles: true }))
+          hidden.dispatchEvent(new Event("blur", { bubbles: true }))
+        }
 
-        return { ok: true, visibleVal: visible.value, hiddenVal: hidden.value }
+        return { ok: true, visibleVal: visible.value, hiddenVal: hidden?.value ?? null }
       },
-      { labelText: label, mmddYyyy: value, iso: isoValue },
+      { labelText: label, mmddYyyy: value, iso: isoValue, scopeSel: scopeSelector ?? null },
     )
     if (result.ok) {
-      logger.info({ label, value, isoValue, ...result }, "[E&O] datepicker filled via DOM")
+      logger.info({ label, value, isoValue, ...result }, "[Profile] datepicker filled via DOM")
       return true
     }
-    logger.warn({ label, ...result }, "[E&O] datepicker DOM fill miss — trying next label")
+    logger.warn({ label, ...result }, "[Profile] datepicker DOM fill miss — trying next label")
   }
   return false
 }
@@ -3357,8 +3438,8 @@ async function fillEno(
   // Date inputs need their value flushed through the Material
   // datepicker's input + change events for the form's reactive
   // validator to accept them.
-  await fillEnoDate(page, ["Start Date", "Effective"], effectiveValue, logger)
-  await fillEnoDate(page, ["Expiration Date", "Expiration"], expirationValue, logger)
+  await fillSbDate(page, ["Start Date", "Effective"], effectiveValue, logger)
+  await fillSbDate(page, ["Expiration Date", "Expiration"], expirationValue, logger)
   // Carrier: only fill IF it's empty. Our extracted carrier name
   // ("BIBERK" / "Berkshire Hathaway") may not match the canonical
   // value SureLC's autocomplete already applied; only pass it

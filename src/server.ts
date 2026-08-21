@@ -48,6 +48,17 @@ const profileSchema = z.object({
       city: z.string().min(1),
       state: z.string().min(2).max(2),
       postalCode: z.string().min(5),
+      // "Living here since" — the From field on SureLC's residence dialog.
+      // SAVE stays disabled without it, and Zod strips unknown keys, so
+      // until this line existed the main app sent the date and the bot
+      // dropped it on the floor: every rep who answered the residency
+      // question still failed the Profile tab with From=(empty).
+      // ISO YYYY-MM-DD; the main app has already expanded month-precision
+      // answers to day 01 (its convention, matching SureLC's own records).
+      residentSince: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional(),
     })
     .optional(),
   dba: z
