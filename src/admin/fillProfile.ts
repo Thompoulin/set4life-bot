@@ -2877,6 +2877,39 @@ async function fillEno(
     ).catch(() => false)
   }
 
+  // Was the E&O tab ever FLAGGED? This decides whether "the warning
+  // cleared" is evidence of anything.
+  //
+  // waitForTabClear waits for the warning icon to become detached, and
+  // `state: "detached"` resolves immediately for a selector that never
+  // matched. So on a tab SureLC does not flag, it returns true the instant
+  // it is called — and the poll below breaks out on its FIRST iteration and
+  // returns `{ ok: true, autoSaved: true }` having uploaded nothing and
+  // saved nothing. Paula Landino 2026-08-21: E&O reported "filled by bot"
+  // in seven seconds; SureLC held no policy afterwards.
+  //
+  // Same inference `isTabComplete` was neutered for on 2026-05-06
+  // ("warning icon absent ⇒ complete" — catastrophic false positives). It
+  // survived here because here it is a success return rather than a skip.
+  //
+  // Deliberately NOT fixed inside waitForTabClear: FINRA, DBA and Questions
+  // use its result directly as their pass/fail, so making it stricter would
+  // turn every already-clean tab into a reported failure. The flawed
+  // inference is only load-bearing here.
+  const enoWarningPresent = await page
+    .waitForSelector(
+      'a.navbar-tab[href$="/eno"] mat-icon.navbar-tab-icon--warning',
+      { state: "attached", timeout: 1_500 },
+    )
+    .then(() => true)
+    .catch(() => false)
+  if (!enoWarningPresent) {
+    logger.info(
+      "[E&O] tab carries no warning icon — 'warning cleared' proves nothing here, so the policy will be filled and saved explicitly",
+    )
+  }
+
+
   // ─── Phase 2: wait for SureLC to finish its 3-stage processing ─────
   //
   // After the file is attached, SureLC runs three sequential server-side
@@ -2904,7 +2937,10 @@ async function fillEno(
   let parseDone = false
   let retriedStuckUpload = false
   while (Date.now() - start < PARSE_BUDGET_MS) {
-    cleared = await waitForTabClear(page, "eno", POLL_MS)
+    cleared = enoWarningPresent
+      ? await waitForTabClear(page, "eno", POLL_MS)
+      : false
+    if (!enoWarningPresent) await page.waitForTimeout(POLL_MS)
     if (cleared) {
       parseDone = true
       break
@@ -2975,9 +3011,11 @@ async function fillEno(
       "[E&O] parse budget exhausted — falling through to manual fill from our own record",
     )
   }
-  if (cleared) {
-    // Tab warning already gone — SureLC saved the policy on its own
-    // (e.g. parser produced a complete record). No further action needed.
+  if (cleared && enoWarningPresent) {
+    // Tab warning went from present to gone — SureLC saved the policy on
+    // its own (e.g. parser produced a complete record). The
+    // enoWarningPresent half is what makes this evidence rather than an
+    // instant true on a selector that never matched; see the note above.
     return {
       ok: true,
       details: { autoSaved: true, warningCleared: true, policyNumber, carrier, caseLimit, totalLimit, effective, expiration, extracted },
