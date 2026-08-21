@@ -24,6 +24,7 @@ import type { Page } from "playwright"
 import {
   firstVisible,
   fillByLabel,
+  inputByLabel,
   fillForce,
   fillIfEmpty,
   gotoBga,
@@ -1028,40 +1029,103 @@ async function fillDba(
     "License Only",
   ).catch(() => false)
 
-  // Soliciting For — autocomplete dropdown.
-  const solicit = await firstVisible(page, [
-    'input[name*="soliciting" i]',
-    'input[placeholder*="soliciting" i]',
-    'select[name*="soliciting" i]',
-  ])
-  if (solicit) {
-    try {
-      const tag = await (solicit as any).evaluate((el: HTMLElement) => el.tagName)
-      if (tag === "SELECT") {
-        await (solicit as any).selectOption({ label: input.solicitingFor })
-      } else {
-        await (solicit as any).fill(input.solicitingFor)
-        await page.waitForTimeout(400)
-        const opt = await page.$(`text="${input.solicitingFor}"`)
-        if (opt) await opt.click()
+  // ─── Soliciting For ─────────────────────────────────────────────
+  //
+  // This is the single largest contracting blocker on prod: 7 of the 10
+  // producers whose Fastlane issue we could actually read on 2026-08-20
+  // said `"Soliciting for" information is missing`, while this tab had
+  // reported "filled by bot" for every one of them.
+  //
+  // Two reasons it lied. The selectors below looked for name= and
+  // placeholder= attributes, and SureLC's Material inputs carry neither —
+  // the search box in fastlane.ts documents exactly this ("Material's input
+  // has no placeholder/type/aria-label — just a <mat-label>Search</mat-label>
+  // sibling"). So `solicit` was null. And when it was null the code simply
+  // fell through: no fill, no error, nothing recorded. Then waitForTabClear
+  // returned instantly on a tab with no warning icon and the whole thing
+  // reported success.
+  //
+  // Use the same Material-aware label path the rest of the file uses, and
+  // READ THE VALUE BACK afterwards. This field is the one thing this tab
+  // exists to set; if it is not there when we finish, that is a failure.
+  let solicitFilled = await fillByLabel(
+    page,
+    "Soliciting For",
+    input.solicitingFor,
+  ).catch(() => false)
+  if (!solicitFilled) {
+    solicitFilled = await fillByLabel(page, "Soliciting", input.solicitingFor).catch(
+      () => false,
+    )
+  }
+  if (solicitFilled) {
+    // Autocomplete: commit the highlighted option so Angular records a
+    // selection rather than loose text.
+    await page.waitForTimeout(400)
+    const opt = await page.$(`mat-option:has-text("${input.solicitingFor}")`)
+    if (opt) await opt.click().catch(() => undefined)
+    else {
+      const legacy = await page.$(`text="${input.solicitingFor}"`)
+      if (legacy) await legacy.click().catch(() => undefined)
+    }
+  } else {
+    // Legacy attribute-based selectors, kept as a fallback in case an
+    // older SureLC build is ever served.
+    const solicit = await firstVisible(page, [
+      'input[name*="soliciting" i]',
+      'input[placeholder*="soliciting" i]',
+      'select[name*="soliciting" i]',
+    ])
+    if (solicit) {
+      try {
+        const tag = await (solicit as any).evaluate((el: HTMLElement) => el.tagName)
+        if (tag === "SELECT") {
+          await (solicit as any).selectOption({ label: input.solicitingFor })
+        } else {
+          await (solicit as any).fill(input.solicitingFor)
+          await page.waitForTimeout(400)
+          const opt = await page.$(`text="${input.solicitingFor}"`)
+          if (opt) await opt.click()
+        }
+        solicitFilled = true
+      } catch {
+        /* verified below either way */
       }
-    } catch {
-      /* ignore */
     }
   }
 
   // SureLC auto-persists DBA changes on dropdown/blur — no Save
   // button exists on this tab. Verified live 2026-05-05.
   await settle(page, 800)
+
+  // Read it back. This is the check that was missing.
+  const solicitValue = await (async () => {
+    const el = await inputByLabel(page, "Soliciting For").catch(() => null)
+    if (el) return (await el.inputValue().catch(() => "")) || ""
+    const body = await page.$$eval("body", (els) => els[0]?.innerText || "").catch(() => "")
+    return new RegExp(input.solicitingFor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(body)
+      ? input.solicitingFor
+      : ""
+  })()
+  const solicitOk = solicitValue.trim().length > 0
+  if (!solicitOk) {
+    await snapshot(ctx, "tab-dba-soliciting-missing")
+    return {
+      ok: false,
+      reason:
+        `DBA "Soliciting For" is still empty after the fill — this is what Fastlane ` +
+        `reports as '"Soliciting for" information is missing'. Wanted ` +
+        `"${input.solicitingFor}". ${await describeUploadablePage(page)}`,
+      details: { solicitFilled, solicitValue },
+    }
+  }
+
   const cleared = await waitForTabClear(page, "dba", 5_000)
   await snapshot(ctx, "tab-dba-after")
-  return cleared
-    ? { ok: true, details: { autoSaved: true, warningCleared: cleared } }
-    : {
-        ok: false,
-        reason: `DBA tab did not verify complete after fill. ${await describeUploadablePage(page)}`,
-        details: { autoSaved: true, warningCleared: cleared },
-      }
+  return {
+    ok: true,
+    details: { autoSaved: true, warningCleared: cleared, solicitingFor: solicitValue },
+  }
 }
 
 // ─── Questions ────────────────────────────────────────────────────────
