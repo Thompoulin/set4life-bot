@@ -949,6 +949,35 @@ async function fillProfileTab(
       )
       .catch(() => [] as string[])
     await snapshot(ctx, "tab-profile-save-disabled")
+    // Close the dialog before giving up. Walking away from it dirty leaves
+    // SureLC's unsaved-changes guard armed, and every LATER tab then opens
+    // behind a "YES, LEAVE / NO, STAY ON PAGE" modal it cannot dismiss.
+    // Adolfo Rodriguez and Evelyn Turizo Escola, 2026-08-21: both failed the
+    // DBA tab with `visible buttons: YES, LEAVE | NO, STAY ON PAGE` — the
+    // Solicitor For field was there and reachable, just behind this modal.
+    // Paula Landino's DBA tab reported `visible buttons: (none)` and filled
+    // fine. Discarding is right here: SAVE is disabled, so there is nothing
+    // committable to lose.
+    const cancelBtn = await firstVisible(page, [
+      'mat-dialog-container button:has-text("CANCEL")',
+      'mat-dialog-container button:has-text("Cancel")',
+      '.cdk-overlay-pane button:has-text("CANCEL")',
+      'mat-dialog-container button[aria-label="Close"]',
+    ])
+    if (cancelBtn) {
+      await (cancelBtn as any).click().catch(() => undefined)
+      await settle(page, 800)
+      const confirmLeave = await firstVisible(page, [
+        'button:has-text("YES, LEAVE")',
+        'button:has-text("Yes, leave")',
+        'mat-dialog-container button:has-text("YES")',
+      ])
+      if (confirmLeave) {
+        await (confirmLeave as any).click().catch(() => undefined)
+        await settle(page, 600)
+      }
+      logger.info("[Profile] discarded the un-saveable address dialog")
+    }
     return {
       ok: false,
       reason:
@@ -3913,6 +3942,27 @@ async function goToTab(
     throw new Error(`SureLC navigation failed for ${slug}: ${nav.finalUrl}`)
   }
   await settle(page, 1200)
+
+  // SureLC guards navigation away from a dirty form with a
+  // "YES, LEAVE / NO, STAY ON PAGE" modal. If an earlier tab left one armed,
+  // it sits over THIS tab and every selector below finds the modal instead
+  // of the form — which is how Adolfo Rodriguez and Evelyn Turizo Escola
+  // failed the DBA tab on 2026-08-21 while the field they needed was
+  // perfectly present. Answer it and carry on; we only arrive here after the
+  // previous tab has already reported its own result, so anything unsaved
+  // was unsaveable.
+  const leaveGuard = await firstVisible(page, [
+    'button:has-text("YES, LEAVE")',
+    'button:has-text("Yes, leave")',
+  ])
+  if (leaveGuard) {
+    logger.warn(
+      { slug },
+      "[goToTab] unsaved-changes guard was blocking this tab — dismissing it",
+    )
+    await (leaveGuard as any).click().catch(() => undefined)
+    await settle(page, 1000)
+  }
 
   await assertOnProducerTab(page, producerId, slug)
 
