@@ -1128,8 +1128,56 @@ async function fillDba(
   //   Select your DBA type: Individual, Busine[select] | Solicitor For[input]
   //
   // "Solicitor" first, since that is what the DOM says.
+  // SureLC does not store this as the name we pass. A producer who HAS it
+  // set reads back as:
+  //
+  //     "SET 4 LIFE AGENCY LLC - POULIN, THOMAS "
+  //
+  // We send "Thomas Poulin", which matches no option in the autocomplete, so
+  // nothing commits and the field stays empty. Paula Landino and Evencio Leon
+  // only appeared to work because theirs was ALREADY populated and the
+  // read-back found the existing value — the fill itself has never worked.
+  // Adolfo Rodriguez and Evelyn Turizo Escola, whose field really is empty,
+  // failed on 2026-08-21 for exactly this.
+  //
+  // Same shape as the Fastlane producer-name bug: our format for a value
+  // SureLC holds in its own. So type a PREFIX that will match, then pick the
+  // option by its parts rather than by an exact string.
+  const wantParts = input.solicitingFor
+    .split(/[\s,]+/)
+    .map((w) => w.trim().toUpperCase())
+    .filter((w) => w.length > 1)
+  const typeCandidates = [
+    // Surname first — the option is rendered "…- POULIN, THOMAS".
+    ...wantParts.slice().reverse(),
+    input.solicitingFor,
+  ]
+
+  /** Pick the rendered option that mentions every part of the wanted name. */
+  const pickMatchingOption = async (): Promise<string | null> =>
+    page
+      .evaluate((parts) => {
+        const norm = (e: Element) =>
+          ((e as HTMLElement).innerText || "")
+            .normalize("NFD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .replace(/\s+/g, " ")
+            .trim()
+            .toUpperCase()
+        const opts = Array.from(document.querySelectorAll("mat-option"))
+        const hit = opts.find((o) => {
+          const t = norm(o)
+          return (parts as string[]).every((w) => t.includes(w))
+        })
+        if (!hit) return null
+        const text = norm(hit)
+        ;(hit as HTMLElement).click()
+        return text
+      }, wantParts)
+      .catch(() => null)
+
   let solicitFilled = false
-  for (const label of [
+  outer: for (const label of [
     "Solicitor For",
     "Solicitor for",
     "Solicitor",
@@ -1137,15 +1185,21 @@ async function fillDba(
     "Soliciting for",
     "Soliciting",
   ]) {
-    // mat-select / native <select> first.
-    if (await selectByLabel(page, label, input.solicitingFor).catch(() => false)) {
-      solicitFilled = true
-      break
-    }
-    // Then a text input / autocomplete.
-    if (await fillByLabel(page, label, input.solicitingFor).catch(() => false)) {
-      solicitFilled = true
-      break
+    for (const typed of typeCandidates) {
+      // mat-select / native <select> — exact-label match still worth a try.
+      if (await selectByLabel(page, label, input.solicitingFor).catch(() => false)) {
+        solicitFilled = true
+        break outer
+      }
+      // Autocomplete: type a prefix, then choose by parts.
+      if (!(await fillByLabel(page, label, typed).catch(() => false))) continue
+      await page.waitForTimeout(600)
+      const picked = await pickMatchingOption()
+      if (picked) {
+        ctx.logger.info({ typed, picked }, "[DBA] selected Solicitor For option")
+        solicitFilled = true
+        break outer
+      }
     }
   }
   if (solicitFilled) {
@@ -1212,11 +1266,12 @@ async function fillDba(
         if (t.trim()) return t
       }
     }
-    // Last resort: is the name simply present on the tab at all?
+    // Last resort: does the tab mention every part of the name anywhere?
+    // Matching the whole string would fail on SureLC's own rendering
+    // ("SET 4 LIFE AGENCY LLC - POULIN, THOMAS").
     const body = await page.$$eval("body", (els) => els[0]?.innerText || "").catch(() => "")
-    return new RegExp(input.solicitingFor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(body)
-      ? input.solicitingFor
-      : ""
+    const up = body.toUpperCase()
+    return wantParts.every((w) => up.includes(w)) ? input.solicitingFor : ""
   })()
   const solicitOk = solicitValue.trim().length > 0
   if (!solicitOk) {
