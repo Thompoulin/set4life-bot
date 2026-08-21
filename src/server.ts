@@ -280,6 +280,10 @@ const repReviewSchema = z.object({
         explanation: z.string().optional(),
         docUrl: z.string().optional(),
         fileName: z.string().optional(),
+        // The agency's standing description for a card the carrier demands
+        // prose on however the rep answered. Exact-match only — see the
+        // picker in rep/review.ts.
+        agencyDefault: z.boolean().optional(),
       }),
     )
     .optional(),

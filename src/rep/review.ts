@@ -187,6 +187,17 @@ export interface RepReviewInput {
     /** Fetchable URL of a supporting doc to attach (e.g. DISCHARGE.pdf). */
     docUrl?: string
     fileName?: string
+    /**
+     * The AGENCY's standing description for this card, not the rep's letter.
+     *
+     * Set4Life supplies these for cards a carrier demands prose on however the
+     * question was answered (NLG's US work-authorization attestation). They are
+     * matched by question text ONLY: the fallbacks below deliberately reach for
+     * "any entry with an explanation", which is right for a rep's one shared
+     * criminal-history letter and very wrong for a standing agency sentence —
+     * it would be typed into whatever unrelated card happened to be open.
+     */
+    agencyDefault?: boolean
   }>
 }
 
@@ -636,12 +647,16 @@ async function fillCarrierQuestionExplanations(
       .catch(() => "")
 
     const qn = norm(questionText)
+    // Exact-ish first: any entry whose question text this card contains.
+    // Then the loose fallbacks, over the rep's OWN letters only — an agency
+    // default must never be used for a card it was not written for.
+    const repEntries = pool.filter((e) => !e.agencyDefault)
     const pick =
       pool.find(
         (e) => e.questionText && qn.includes(norm(e.questionText).slice(0, 28)),
       ) ||
-      pool.find((e) => e.explanation) ||
-      pool[0]
+      repEntries.find((e) => e.explanation) ||
+      repEntries[0]
 
     if (!pick || !pick.explanation) {
       unsatisfied.push(questionText.slice(0, 120) || "(unnamed card)")
