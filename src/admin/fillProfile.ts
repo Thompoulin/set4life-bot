@@ -596,15 +596,24 @@ async function enterProducerProfile(
   // single-click first (matches what Thomas does in the Loom — "click
   // on this guy"); fall back to dblclick if the URL doesn't transition
   // (the blue banner says "double click on name" — both nav paths exist).
-  const nameLink =
-    (await page.$(
-      `[role="row"][row-id="${producerId}"] [col-id="name"] sb-text-link span.main-text`,
-    )) ||
-    (await page.$(
-      `[role="row"][row-id="${producerId}"] [col-id="name"] bga-producer-name-render`,
-    ))
+  //
+  // WAIT for the link, do not glance at it. The row shell above is rendered
+  // by AG Grid; the name cell is a custom Angular component that hydrates a
+  // moment later, so a bare page.$() races it. Invisible at 3 concurrent
+  // browsers, reproducible at 6: on 2026-08-21 three of six parallel runs
+  // died on "Name link not found" — Carlos Rios, Luis de Jesus Munoz,
+  // Tatiana Muñoz — with the row itself present. Same one-shot-lookup
+  // mistake as the AML file input and the E&O fallback.
+  const nameLinkSel =
+    `[role="row"][row-id="${producerId}"] [col-id="name"] sb-text-link span.main-text, ` +
+    `[role="row"][row-id="${producerId}"] [col-id="name"] bga-producer-name-render`
+  const nameLink = await page
+    .waitForSelector(nameLinkSel, { state: "attached", timeout: 20_000 })
+    .catch(() => null)
   if (!nameLink) {
-    throw new Error(`Name link not found for row ${producerId}`)
+    throw new Error(
+      `Name link not found for row ${producerId} (row rendered, name cell did not within 20s)`,
+    )
   }
   const startedAt = page.url()
   await nameLink.click()
