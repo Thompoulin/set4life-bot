@@ -1053,8 +1053,25 @@ async function fillDba(
   // if "Soliciting For" is a mat-select it can never be found by that path
   // — which is the most likely reason the label attempt ALSO came back
   // empty on Paula's 2026-08-21 run after the attribute selectors failed.
+  //
+  // The field is labelled "Solicitor For" on the form. Fastlane's complaint
+  // calls it '"Soliciting for" information is missing', and every attempt
+  // here — the original name= selectors, then three "Soliciting" spellings —
+  // chased the wording in the ERROR rather than the wording on the PAGE.
+  // Paula Landino's 2026-08-21 run finally printed the tab's own controls:
+  //
+  //   Select your DBA type: Individual, Busine[select] | Solicitor For[input]
+  //
+  // "Solicitor" first, since that is what the DOM says.
   let solicitFilled = false
-  for (const label of ["Soliciting For", "Soliciting for", "Soliciting"]) {
+  for (const label of [
+    "Solicitor For",
+    "Solicitor for",
+    "Solicitor",
+    "Soliciting For",
+    "Soliciting for",
+    "Soliciting",
+  ]) {
     // mat-select / native <select> first.
     if (await selectByLabel(page, label, input.solicitingFor).catch(() => false)) {
       solicitFilled = true
@@ -1108,7 +1125,14 @@ async function fillDba(
 
   // Read it back. This is the check that was missing.
   const solicitValue = await (async () => {
-    for (const label of ["Soliciting For", "Soliciting for", "Soliciting"]) {
+    for (const label of [
+      "Solicitor For",
+      "Solicitor for",
+      "Solicitor",
+      "Soliciting For",
+      "Soliciting for",
+      "Soliciting",
+    ]) {
       const el = await inputByLabel(page, label).catch(() => null)
       const v = el ? (await el.inputValue().catch(() => "")) || "" : ""
       if (v.trim()) return v
@@ -1135,7 +1159,7 @@ async function fillDba(
     return {
       ok: false,
       reason:
-        `DBA "Soliciting For" is still empty after the fill — this is what Fastlane ` +
+        `DBA "Solicitor For" is still empty after the fill — this is what Fastlane ` +
         `reports as '"Soliciting for" information is missing'. Wanted ` +
         `"${input.solicitingFor}". Labelled controls on the tab: ${
           (
