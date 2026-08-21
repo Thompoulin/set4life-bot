@@ -2219,15 +2219,28 @@ async function fillTraining(
   // query-param value — the same way every other control in this file is
   // located, and it survives SureLC renaming the param.
   if (!amlSectionReady) {
+    // The sub-tabs are named, and none of them says "AML". The failure
+    // message from Paula's 2026-08-21 run listed them verbatim:
+    //
+    //   … TRAINING | E&O | SIGNATURE | DOCUMENTS | CONTRACTING REQUESTS |
+    //   CERTIFICATIONS | COURSE HISTORY | PST CARRIER COURSES
+    //
+    // Anti-Money Laundering is a CATEGORY inside CERTIFICATIONS, so search
+    // for the AML text first (in case a build ever surfaces it directly)
+    // and then fall back to the sub-tab that actually holds it.
     const amlSubTab = await firstVisible(page, [
       '[role="tab"]:has-text("Anti-Money Laundering")',
       '[role="tab"]:has-text("AML")',
       'a:has-text("Anti-Money Laundering")',
       'button:has-text("Anti-Money Laundering")',
       'mat-tab-header [role="tab"]:has-text("Anti")',
+      '[role="tab"]:has-text("CERTIFICATIONS")',
+      '[role="tab"]:has-text("Certifications")',
+      'a:has-text("CERTIFICATIONS")',
+      '.mat-mdc-tab:has-text("CERTIFICATIONS")',
     ])
     if (amlSubTab) {
-      logger.info("[Training] AML section absent — clicking the AML sub-tab")
+      logger.info("[Training] AML section absent — clicking the AML / Certifications sub-tab")
       await (amlSubTab as any).click().catch(() => undefined)
       await settle(page, 1_500)
       amlSectionReady = await page
