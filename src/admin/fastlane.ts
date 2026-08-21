@@ -128,20 +128,62 @@ const CARRIER_ALIASES: Record<
   },
 }
 
-/** Expand a DB carrier name into all label fragments we should try on-screen. */
-function expandCarrierNames(carrierName: string): string[] {
+/**
+ * Expand a DB carrier name into all label fragments we should try on-screen.
+ *
+ * Our `carriers.name` values carry decoration that SureLC's Fastlane list
+ * does not: "National Life Group (NLG) (Independent)", "Banner Life
+ * (Quility)", "SBLI (Quility Term)", "Transamerica Life Ins Co (Brokerage)".
+ * Fastlane renders the plain legal name.
+ *
+ * The alias table below is keyed on the SHORT code ("nlg", "uhl"), which
+ * only ever matched when the DB happened to store the short code too. For a
+ * decorated long name the key is "national life group nlg independent",
+ * CARRIER_ALIASES has no such entry, and the only candidate tried was the
+ * raw decorated string — which cannot match anything on screen. That is why
+ * NLG accounted for 10 of the 56 contracts still unsubmitted on 2026-08-21,
+ * one per rep, on reps whose runs otherwise succeeded. Thomas spotted it
+ * from the other end: "je crois que faut juste cocher independent".
+ *
+ * So try, in order: the raw name; the name with parenthetical/trailing
+ * qualifiers stripped; and any alias whose key or names appear as whole
+ * words inside the normalised name.
+ */
+export function expandCarrierNames(carrierName: string): string[] {
   const raw = (carrierName || "").trim()
   if (!raw) return []
   const key = normalizeCarrier(raw)
   const out: string[] = [raw]
-  const alias = CARRIER_ALIASES[key] || CARRIER_ALIASES[raw.toLowerCase()]
-  if (alias) {
-    for (const n of alias.names) {
-      if (!out.some((x) => normalizeCarrier(x) === normalizeCarrier(n))) {
-        out.push(n)
-      }
+  const push = (n: string) => {
+    const v = (n || "").trim()
+    if (v.length > 1 && !out.some((x) => normalizeCarrier(x) === normalizeCarrier(v))) {
+      out.push(v)
     }
   }
+
+  // Undecorated form: drop "(…)" groups and anything after a " - ".
+  const undecorated = raw.replace(/\([^)]*\)/g, " ").replace(/\s+/g, " ").trim()
+  push(undecorated)
+  const beforeDash = undecorated.split(/\s+-\s+/)[0]
+  push(beforeDash)
+
+  // Alias by exact key (unchanged), then by whole-word containment so a
+  // decorated name still finds its short code.
+  const tokens = new Set(key.split(" "))
+  const alias =
+    CARRIER_ALIASES[key] ||
+    CARRIER_ALIASES[raw.toLowerCase()] ||
+    Object.entries(CARRIER_ALIASES).find(
+      ([k, v]) =>
+        tokens.has(k) ||
+        k.split(" ").every((w) => tokens.has(w)) ||
+        v.names.some((n) =>
+          normalizeCarrier(n)
+            .split(" ")
+            .every((w) => tokens.has(w)),
+        ),
+    )?.[1]
+  if (alias) for (const n of alias.names) push(n)
   return out
 }
 
