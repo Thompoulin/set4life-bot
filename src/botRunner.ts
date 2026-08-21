@@ -416,11 +416,55 @@ export async function runActivation(
         // half-baked appointment-request rows that BGAs then have
         // to manually clean up). Fail fast with a clear message
         // listing exactly which tabs blocked the gate.
-        const incompleteTabs = adminPhase.profile
-          ? Object.entries(adminPhase.profile)
-              .filter(([, r]) => !r.ok && !r.alreadyDone)
-              .map(([name, r]) => `${name} (${r.reason || "incomplete"})`)
+        // Which tabs actually gate CONTRACTING, as opposed to mattering
+        // for compliance later?
+        //
+        // Measured 2026-08-21, and it is not what this gate assumed. Edgar
+        // Aponte's seven carrier requests went through and are sitting at
+        // "under review" while SureLC holds, for him, `eno: null`,
+        // `courses: []` and `addresses: []` — no E&O, no AML course, no
+        // resident address. Fastlane does not care about any of the three.
+        //
+        // What Fastlane DOES refuse on, in its own words, from the ten
+        // producers whose issue text we could read that day:
+        //     error "Soliciting for" information is missing   (7)
+        //     error Missing Active Resident Licenses          (2)
+        //     error Gender is required                        (1)
+        // — i.e. DBA, and two things that are not tabs at all.
+        //
+        // Blocking on eno / training / profile-address therefore stops
+        // contracting for reps SureLC would have accepted, which is the
+        // opposite of what this gate is for. It stays hard for the tabs
+        // that genuinely block (dba) and for signature, which the
+        // 2026-05-27 note shows produces orphan unsigned appointment
+        // requests when bypassed. The rest are reported and carried.
+        const CONTRACTING_BLOCKING_TABS = new Set([
+          "dba",
+          "questions",
+          "finra",
+          "signature",
+        ])
+        const allIncomplete = adminPhase.profile
+          ? Object.entries(adminPhase.profile).filter(
+              ([, r]) => !r.ok && !r.alreadyDone,
+            )
           : []
+        const carriedTabs = allIncomplete
+          .filter(([name]) => !CONTRACTING_BLOCKING_TABS.has(name))
+          .map(([name, r]) => `${name} (${r.reason || "incomplete"})`)
+        if (carriedTabs.length > 0) {
+          await progress.report({
+            step: "phaseA_profile_not_blocking",
+            status: "info",
+            message:
+              `Proceeding to contracting despite ${carriedTabs.length} incomplete ` +
+              `tab(s) that SureLC does not gate contracting on — these still need ` +
+              `fixing for compliance: ${carriedTabs.join("; ")}`,
+          })
+        }
+        const incompleteTabs = allIncomplete
+          .filter(([name]) => CONTRACTING_BLOCKING_TABS.has(name))
+          .map(([name, r]) => `${name} (${r.reason || "incomplete"})`)
         if (incompleteTabs.length > 0) {
           const finishGate = await progress.startStep(
             "phaseA_contracting",

@@ -1048,15 +1048,23 @@ async function fillDba(
   // Use the same Material-aware label path the rest of the file uses, and
   // READ THE VALUE BACK afterwards. This field is the one thing this tab
   // exists to set; if it is not there when we finish, that is a failure.
-  let solicitFilled = await fillByLabel(
-    page,
-    "Soliciting For",
-    input.solicitingFor,
-  ).catch(() => false)
-  if (!solicitFilled) {
-    solicitFilled = await fillByLabel(page, "Soliciting", input.solicitingFor).catch(
-      () => false,
-    )
+  // Try every shape this control could be, because we do not know which it
+  // is. inputByLabel (behind fillByLabel) only ever returns an <input>, so
+  // if "Soliciting For" is a mat-select it can never be found by that path
+  // — which is the most likely reason the label attempt ALSO came back
+  // empty on Paula's 2026-08-21 run after the attribute selectors failed.
+  let solicitFilled = false
+  for (const label of ["Soliciting For", "Soliciting for", "Soliciting"]) {
+    // mat-select / native <select> first.
+    if (await selectByLabel(page, label, input.solicitingFor).catch(() => false)) {
+      solicitFilled = true
+      break
+    }
+    // Then a text input / autocomplete.
+    if (await fillByLabel(page, label, input.solicitingFor).catch(() => false)) {
+      solicitFilled = true
+      break
+    }
   }
   if (solicitFilled) {
     // Autocomplete: commit the highlighted option so Angular records a
@@ -1100,8 +1108,22 @@ async function fillDba(
 
   // Read it back. This is the check that was missing.
   const solicitValue = await (async () => {
-    const el = await inputByLabel(page, "Soliciting For").catch(() => null)
-    if (el) return (await el.inputValue().catch(() => "")) || ""
+    for (const label of ["Soliciting For", "Soliciting for", "Soliciting"]) {
+      const el = await inputByLabel(page, label).catch(() => null)
+      const v = el ? (await el.inputValue().catch(() => "")) || "" : ""
+      if (v.trim()) return v
+      // mat-select renders its chosen value as text, not as an input value.
+      const sel = await page
+        .$(`mat-label:has-text("${label}") >> xpath=ancestor::*[self::mat-form-field][1] >> mat-select`)
+        .catch(() => null)
+      if (sel) {
+        const t = await sel
+          .evaluate((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
+          .catch(() => "")
+        if (t.trim()) return t
+      }
+    }
+    // Last resort: is the name simply present on the tab at all?
     const body = await page.$$eval("body", (els) => els[0]?.innerText || "").catch(() => "")
     return new RegExp(input.solicitingFor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(body)
       ? input.solicitingFor
@@ -1115,7 +1137,29 @@ async function fillDba(
       reason:
         `DBA "Soliciting For" is still empty after the fill — this is what Fastlane ` +
         `reports as '"Soliciting for" information is missing'. Wanted ` +
-        `"${input.solicitingFor}". ${await describeUploadablePage(page)}`,
+        `"${input.solicitingFor}". Labelled controls on the tab: ${
+          (
+            await page
+              .$$eval("mat-form-field, label", (els) =>
+                els
+                  .slice(0, 20)
+                  .map((e) => {
+                    const l =
+                      (e.querySelector("mat-label") as HTMLElement)?.innerText ||
+                      (e as HTMLElement).innerText ||
+                      ""
+                    const kind = e.querySelector("mat-select")
+                      ? "select"
+                      : e.querySelector("input")
+                        ? "input"
+                        : "?"
+                    return `${l.replace(/\s+/g, " ").trim().slice(0, 40)}[${kind}]`
+                  })
+                  .filter((t) => t.length > 3),
+              )
+              .catch(() => [] as string[])
+          ).join(" | ") || "(none found)"
+        }. ${await describeUploadablePage(page)}`,
       details: { solicitFilled, solicitValue },
     }
   }
