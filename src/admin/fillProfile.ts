@@ -2138,10 +2138,55 @@ async function fillTraining(
     "sb-aml-course",
     'mat-expansion-panel:has(mat-panel-title:has-text("Anti-Money Laundering"))',
   ].join(", ")
-  const amlSectionReady = await page
+  let amlSectionReady = await page
     .waitForSelector(AML_SECTION, { state: "attached", timeout: 20_000 })
     .then(() => true)
     .catch(() => false)
+
+  // Paula Landino 2026-08-21, second run: the section genuinely was not
+  // there. The diagnostic showed SureLC had put us on
+  // `/training?tab=` — an EMPTY sub-tab param — and the only controls on
+  // the page were CE-vendor buttons (LIMRA, WebCE, ExamFX, A.D. Banker …)
+  // and state chips, with `file inputs in DOM: 0`. That is the Continuing
+  // Education sub-view, not AML. `goToTab` asks for `/training` and
+  // SureLC decides which sub-tab to land on.
+  //
+  // Find the sub-tab by its visible name rather than guessing at the
+  // query-param value — the same way every other control in this file is
+  // located, and it survives SureLC renaming the param.
+  if (!amlSectionReady) {
+    const amlSubTab = await firstVisible(page, [
+      '[role="tab"]:has-text("Anti-Money Laundering")',
+      '[role="tab"]:has-text("AML")',
+      'a:has-text("Anti-Money Laundering")',
+      'button:has-text("Anti-Money Laundering")',
+      'mat-tab-header [role="tab"]:has-text("Anti")',
+    ])
+    if (amlSubTab) {
+      logger.info("[Training] AML section absent — clicking the AML sub-tab")
+      await (amlSubTab as any).click().catch(() => undefined)
+      await settle(page, 1_500)
+      amlSectionReady = await page
+        .waitForSelector(AML_SECTION, { state: "attached", timeout: 15_000 })
+        .then(() => true)
+        .catch(() => false)
+    } else {
+      // Name what IS on the page so the next run narrows it further,
+      // rather than repeating "never rendered" forever.
+      const subTabs = await page
+        .$$eval('[role="tab"], mat-tab-header a, .mat-mdc-tab', (els) =>
+          els
+            .map((e) => (e as HTMLElement).innerText?.replace(/\s+/g, " ").trim())
+            .filter((t): t is string => !!t && t.length < 60)
+            .slice(0, 15),
+        )
+        .catch(() => [] as string[])
+      logger.warn(
+        { subTabs },
+        "[Training] no AML sub-tab found by name — reporting what is on the page",
+      )
+    }
+  }
   if (!amlSectionReady) {
     // Say so, rather than charging into an upload against a blank tab and
     // blaming SureLC for the result.
@@ -2150,7 +2195,19 @@ async function fillTraining(
       ok: false,
       reason:
         "Training tab never rendered the Anti-Money Laundering section " +
-        `(waited 20s after the certificates XHR). ${await describeUploadablePage(page)}`,
+        "(waited 20s, then looked for an AML sub-tab by name and found none). " +
+        `Sub-tabs on the page: ${
+          (
+            await page
+              .$$eval('[role="tab"], mat-tab-header a, .mat-mdc-tab', (els) =>
+                els
+                  .map((e) => (e as HTMLElement).innerText?.replace(/\s+/g, " ").trim())
+                  .filter((t): t is string => !!t && t.length < 60)
+                  .slice(0, 15),
+              )
+              .catch(() => [] as string[])
+          ).join(" | ") || "(none found)"
+        }. ${await describeUploadablePage(page)}`,
       details: { amlSectionReady: false },
     }
   }
