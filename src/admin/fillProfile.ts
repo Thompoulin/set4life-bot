@@ -906,6 +906,56 @@ async function fillProfileTab(
       reason: "Edit Address dialog opened but SAVE button not found",
     }
   }
+  // SureLC keeps SAVE disabled until its own form validation is happy, so a
+  // plain click sits in Playwright's actionability retry for the full 30s
+  // and then reports `elementHandle.click: Timeout 30000ms exceeded …
+  // element is not enabled` — which says nothing about WHICH field it is
+  // unhappy about. Paula Landino 2026-08-21 burned 30s on exactly that and
+  // the run reported it as a click failure.
+  //
+  // Give Angular a moment to settle its validators, then, if SAVE is still
+  // disabled, read the dialog's own fields back and say what is actually
+  // empty or invalid. We cannot fix a field we cannot see; we can stop
+  // pretending the button was the problem.
+  const saveEnabled = await page
+    .waitForFunction(
+      (el) => !(el as HTMLButtonElement).disabled,
+      dialogSaveBtn as any,
+      { timeout: 8_000 },
+    )
+    .then(() => true)
+    .catch(() => false)
+  if (!saveEnabled) {
+    const fields = await page
+      .$$eval(
+        "mat-dialog-container mat-form-field, .cdk-overlay-pane mat-form-field",
+        (els) =>
+          els.slice(0, 12).map((el) => {
+            const label =
+              (el.querySelector("mat-label") as HTMLElement)?.innerText?.trim() ||
+              (el.querySelector("label") as HTMLElement)?.innerText?.trim() ||
+              "(unlabelled)"
+            const ctrl = el.querySelector("input, textarea, select") as
+              | HTMLInputElement
+              | null
+            const err = (el.querySelector("mat-error") as HTMLElement)?.innerText
+              ?.replace(/\s+/g, " ")
+              .trim()
+            return `${label}=${ctrl?.value ? JSON.stringify(ctrl.value) : "(empty)"}${
+              err ? ` [${err}]` : ""
+            }`
+          }),
+      )
+      .catch(() => [] as string[])
+    await snapshot(ctx, "tab-profile-save-disabled")
+    return {
+      ok: false,
+      reason:
+        "Address dialog SAVE stayed disabled — SureLC's validation is not satisfied. " +
+        `Dialog fields: ${fields.join(" | ") || "(could not read)"}`,
+      details: { saveDisabled: true, fields },
+    }
+  }
   try {
     await (dialogSaveBtn as any).click()
     await settle(page, 2_500)
@@ -2064,6 +2114,47 @@ async function fillTraining(
       ),
     )
   await settle(page, 1_200)
+
+  // "Proceeding anyway" was doing real damage, because waitForResponse only
+  // catches a response that arrives AFTER it is registered — an XHR already
+  // in flight from the navigation is missed entirely, and then we read a tab
+  // that has not rendered. Agustin Quinones (2026-08-07) is in the comment
+  // above; Paula Landino hit the same thing on 2026-08-21 and the timings
+  // say it plainly:
+  //
+  //   +0.0s  gotoBga: in-app nav-link click succeeded
+  //  +11.8s  certificates XHR did not return in 10s — proceeding anyway
+  //  +13.0s  caller says SureLC has no AML course — uploading
+  //  +13.1s  file input not found          ← 101ms later
+  //
+  // Nothing was on the page yet. Every selector below — the Upload button,
+  // ADD CERTIFICATION, the file input — missed for the same reason, and the
+  // tab reported "AML upload did not attach a file" as though SureLC had
+  // refused us.
+  //
+  // So wait for the thing we actually need: the AML section, rendered. The
+  // XHR is a proxy for it and an unreliable one.
+  const AML_SECTION = [
+    "sb-aml-course",
+    'mat-expansion-panel:has(mat-panel-title:has-text("Anti-Money Laundering"))',
+  ].join(", ")
+  const amlSectionReady = await page
+    .waitForSelector(AML_SECTION, { state: "attached", timeout: 20_000 })
+    .then(() => true)
+    .catch(() => false)
+  if (!amlSectionReady) {
+    // Say so, rather than charging into an upload against a blank tab and
+    // blaming SureLC for the result.
+    logger.warn("[Training] AML section never rendered — not attempting upload")
+    return {
+      ok: false,
+      reason:
+        "Training tab never rendered the Anti-Money Laundering section " +
+        `(waited 20s after the certificates XHR). ${await describeUploadablePage(page)}`,
+      details: { amlSectionReady: false },
+    }
+  }
+  await settle(page, 600)
 
   const readAmlRow = async () =>
     page

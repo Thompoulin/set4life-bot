@@ -323,7 +323,20 @@ export async function uploadRemoteFile(
   logger: any,
 ): Promise<boolean> {
   try {
-    const input = await page.$(fileInputSelector)
+    // Wait for the input rather than glancing once. Every caller reaches
+    // here as a FALLBACK after a filechooser attempt failed, which on an
+    // Angular tab usually means the section had not rendered yet — so a
+    // one-shot page.$() is guaranteed to miss for exactly the reason we
+    // are here. Paula Landino 2026-08-21: the AML fallback ran 101ms after
+    // the bot gave up on the tab and logged "file input not found", which
+    // read as SureLC refusing the upload.
+    //
+    // 'attached', not 'visible' — Angular Material keeps its real
+    // <input type=file> hidden behind a styled button, so a visibility
+    // wait would time out on a perfectly usable input.
+    const input = await page
+      .waitForSelector(fileInputSelector, { state: "attached", timeout: 10_000 })
+      .catch(() => null)
     if (!input) {
       logger.warn({ selector: fileInputSelector }, "file input not found")
       return false
