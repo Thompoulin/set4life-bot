@@ -748,19 +748,40 @@ async function fillFinra(
 
   // FINRA tab auto-persists on radio click — no Save button exists.
   await settle(page, 600)
-  const cleared = await waitForTabClear(page, "finra", 5_000)
+  // "never-flagged" is not evidence — see waitForTabClearDetailed. SureLC
+  // does not put a warning on every tab, so its absence tells us nothing
+  // about whether our change was accepted. We did the work and nothing
+  // threw, so carry on; but say which of the two it was, so a run that
+  // "passed" on no signal at all is visible in the timeline rather than
+  // indistinguishable from a verified one.
+  const clearState = await waitForTabClearDetailed(page, "finra", 5_000)
   await snapshot(ctx, "tab-finra-after")
-  logger.info({ clicked, cleared, isFinra }, "[FINRA] tab complete")
-  return cleared
-    ? {
-        ok: true,
-        details: { buttonsClicked: clicked, autoSaved: true, warningCleared: cleared, isFinra },
-      }
-    : {
-        ok: false,
-        reason: `FINRA tab did not verify complete after selecting No/No. ${await describeUploadablePage(page)}`,
-        details: { buttonsClicked: clicked, autoSaved: true, warningCleared: cleared, isFinra },
-      }
+  logger.info({ clicked, clearState, isFinra }, "[FINRA] tab complete")
+  // Deliberate handling of each state:
+  //  cleared        the warning went away — verified.
+  //  never-flagged  SureLC never flagged this tab, so there is nothing to
+  //                 watch clear. We selected the radios and nothing threw;
+  //                 treat as done but record verified:false so the timeline
+  //                 does not present a guess as a verification.
+  //  still-flagged  the warning is still up — genuinely not complete.
+  //  no-navbar      we are not on the profile; cannot judge.
+  if (clearState === "still-flagged" || clearState === "no-navbar") {
+    return {
+      ok: false,
+      reason: `FINRA tab did not verify complete after selecting No/No (${clearState}). ${await describeUploadablePage(page)}`,
+      details: { buttonsClicked: clicked, autoSaved: true, clearState, isFinra },
+    }
+  }
+  return {
+    ok: true,
+    details: {
+      buttonsClicked: clicked,
+      autoSaved: true,
+      clearState,
+      verified: clearState === "cleared",
+      isFinra,
+    },
+  }
 }
 
 // ─── Profile (resident address) ───────────────────────────────────────
@@ -1217,11 +1238,24 @@ async function fillDba(
     }
   }
 
-  const cleared = await waitForTabClear(page, "dba", 5_000)
+  // "never-flagged" is not evidence — see waitForTabClearDetailed. SureLC
+  // does not put a warning on every tab, so its absence tells us nothing
+  // about whether our change was accepted. We did the work and nothing
+  // threw, so carry on; but say which of the two it was, so a run that
+  // "passed" on no signal at all is visible in the timeline rather than
+  // indistinguishable from a verified one.
+  const clearState = await waitForTabClearDetailed(page, "dba", 5_000)
   await snapshot(ctx, "tab-dba-after")
   return {
     ok: true,
-    details: { autoSaved: true, warningCleared: cleared, solicitingFor: solicitValue },
+    details: {
+      autoSaved: true,
+      clearState,
+      // DBA does not rely on the icon at all — the Solicitor For read-back
+      // above is the real verification.
+      verified: true,
+      solicitingFor: solicitValue,
+    },
   }
 }
 
@@ -2116,15 +2150,26 @@ async function fillQuestions(
   // Questions tab auto-persists on radio click (verified 2026-05-05 —
   // no Save button exists). Wait for the warning icon to clear.
   await settle(page, 800)
-  const cleared = await waitForTabClear(page, "questions", 8_000)
+  // "never-flagged" is not evidence — see waitForTabClearDetailed. SureLC
+  // does not put a warning on every tab, so its absence tells us nothing
+  // about whether our change was accepted. We did the work and nothing
+  // threw, so carry on; but say which of the two it was, so a run that
+  // "passed" on no signal at all is visible in the timeline rather than
+  // indistinguishable from a verified one.
+  const clearState = await waitForTabClearDetailed(page, "questions", 8_000)
   await snapshot(ctx, "tab-questions-after")
-  return cleared
-    ? { ok: true, details: { autoSaved: true, warningCleared: cleared } }
-    : {
-        ok: false,
-        reason: `Questions tab did not verify complete after fill. ${await describeUploadablePage(page)}`,
-        details: { autoSaved: true, warningCleared: cleared },
-      }
+  // Same three-way decision as FINRA — see the note there.
+  if (clearState === "still-flagged" || clearState === "no-navbar") {
+    return {
+      ok: false,
+      reason: `Questions tab did not verify complete after fill (${clearState}). ${await describeUploadablePage(page)}`,
+      details: { autoSaved: true, clearState },
+    }
+  }
+  return {
+    ok: true,
+    details: { autoSaved: true, clearState, verified: clearState === "cleared" },
+  }
 }
 
 /**
@@ -3070,13 +3115,8 @@ async function fillEno(
   // use its result directly as their pass/fail, so making it stricter would
   // turn every already-clean tab into a reported failure. The flawed
   // inference is only load-bearing here.
-  const enoWarningPresent = await page
-    .waitForSelector(
-      'a.navbar-tab[href$="/eno"] mat-icon.navbar-tab-icon--warning',
-      { state: "attached", timeout: 1_500 },
-    )
-    .then(() => true)
-    .catch(() => false)
+  const enoWarningPresent =
+    (await waitForTabClearDetailed(page, "eno", 1_500)) !== "never-flagged"
   if (!enoWarningPresent) {
     logger.info(
       "[E&O] tab carries no warning icon — 'warning cleared' proves nothing here, so the policy will be filled and saved explicitly",
@@ -4050,6 +4090,67 @@ async function isTabComplete(page: Page, tabHref: string): Promise<boolean> {
  *  Save buttons exist on any tab), and the warning-icon-clearing is
  *  the only visible signal that "the server has accepted the change
  *  and the tab is now complete." Used in place of clickSave()/wait. */
+/**
+ * What the tab's warning icon actually tells us.
+ *
+ *   "cleared"      the warning WAS there and went away — real evidence the
+ *                  server accepted our change.
+ *   "never-flagged" there was no warning to begin with. This is NOT evidence
+ *                  of anything. SureLC does not flag every tab, so it means
+ *                  "no signal", and a caller that treats it as success is
+ *                  guessing.
+ *   "still-flagged" the warning is still there — the tab is not complete.
+ *   "no-navbar"    we are not on the producer profile at all.
+ *
+ * WHY A TRI-STATE. This function used to return a boolean, and
+ * `state: "detached"` resolves IMMEDIATELY for a selector that never
+ * matched — so on a tab SureLC does not flag it returned true the instant it
+ * was called. Every caller read that as "the server accepted my change".
+ *
+ * That single wrong inference produced five separate production bugs, and it
+ * is the same one `isTabComplete` was neutered for on 2026-05-06 ("warning
+ * icon absent ⇒ complete", after it declared all six tabs done on a profile
+ * that was 100% empty). On 2026-08-21 it was still returning a bare true for
+ * E&O — reporting a policy as saved by SureLC in seven seconds, with nothing
+ * uploaded — and it is what let the DBA tab report "filled by bot" for seven
+ * producers whose Solicitor For field was empty, which was the largest single
+ * contracting blocker on prod.
+ *
+ * Returning a boolean made the ambiguity inexpressible. Now a caller has to
+ * say out loud what it wants "never-flagged" to mean, and the compiler makes
+ * it choose.
+ */
+type TabClearResult = "cleared" | "never-flagged" | "still-flagged" | "no-navbar"
+
+async function waitForTabClearDetailed(
+  page: Page,
+  tabHref: string,
+  timeoutMs = 10_000,
+): Promise<TabClearResult> {
+  const tabSel = `a.navbar-tab[href$="/${tabHref}"]`
+  const navbarTab = await page.$(tabSel).catch(() => null)
+  if (!navbarTab) return "no-navbar"
+  const sel = `${tabSel} mat-icon.navbar-tab-icon--warning`
+  const wasFlagged = await page
+    .waitForSelector(sel, { state: "attached", timeout: 1_000 })
+    .then(() => true)
+    .catch(() => false)
+  if (!wasFlagged) return "never-flagged"
+  try {
+    await page.waitForSelector(sel, { state: "detached", timeout: timeoutMs })
+    return "cleared"
+  } catch {
+    return "still-flagged"
+  }
+}
+
+/**
+ * Legacy boolean wrapper. "never-flagged" counts as not-a-failure here so
+ * existing callers keep their behaviour, but prefer
+ * waitForTabClearDetailed in anything that decides ok/failed — and verify
+ * the tab's own field where one exists (see fillDba's Solicitor For
+ * read-back) rather than trusting an icon at all.
+ */
 async function waitForTabClear(
   page: Page,
   tabHref: string,
@@ -4064,16 +4165,8 @@ async function waitForTabClear(
   // sub-route. (Keyon 2026-05-09 — bot reported "filled by bot"
   // while sitting on Training > Select or Upload Certificate >
   // Add Manually.)
-  const tabSel = `a.navbar-tab[href$="/${tabHref}"]`
-  const navbarTab = await page.$(tabSel).catch(() => null)
-  if (!navbarTab) return false
-  const sel = `${tabSel} mat-icon.navbar-tab-icon--warning`
-  try {
-    await page.waitForSelector(sel, { state: "detached", timeout: timeoutMs })
-    return true
-  } catch {
-    return false
-  }
+  const r = await waitForTabClearDetailed(page, tabHref, timeoutMs)
+  return r === "cleared" || r === "never-flagged"
 }
 
 /** Compatibility shim — older callers still say isTabGreen. The check
