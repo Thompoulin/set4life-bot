@@ -228,14 +228,34 @@ export async function runFastlaneOneProducerManyCarriers(
       // as "LASTNAME, FIRSTNAME [MIDDLE/SUFFIX]", and the agent's
       // displayName from our side might not include middle initials
       // even when the cert/SureLC record does.
-      const lastName = input.producerDisplayName.split(",")[0]?.trim() || input.producerDisplayName
-      await (search as any).fill(lastName)
-      // Some Material search inputs need an explicit Enter to commit
-      // the filter, others debounce on input. Press Enter just in
-      // case + give a generous wait (3s) for the server-side filter.
-      await (search as any).press("Enter").catch(() => undefined)
-      await page.waitForTimeout(3_000)
-      logger.info({ filtered: lastName }, "[Fastlane] producer search filled")
+      // Try progressively broader terms and stop at the first that
+      // actually renders a card — see searchTermsForProducer.
+      const terms = searchTermsForProducer(input.producerDisplayName)
+      let usedTerm = terms[0]
+      let cardCount = 0
+      for (const term of terms) {
+        await (search as any).fill("")
+        await (search as any).fill(term)
+        // Some Material search inputs need an explicit Enter to commit
+        // the filter, others debounce on input. Press Enter just in
+        // case + give a generous wait (3s) for the server-side filter.
+        await (search as any).press("Enter").catch(() => undefined)
+        await page.waitForTimeout(3_000)
+        cardCount = (await page.$$("bga-producer-card")).length
+        usedTerm = term
+        logger.info(
+          { filtered: term, cardCount },
+          "[Fastlane] producer search filled",
+        )
+        if (cardCount > 0) break
+      }
+      if (cardCount === 0) {
+        logger.warn(
+          { tried: terms },
+          "[Fastlane] no producer card rendered for any search term",
+        )
+      }
+      void usedTerm
       await snapshot(ctx, "fastlane-02b-after-search")
     } catch (err: any) {
       logger.warn({ err: err?.message }, "[Fastlane] search fill failed")
@@ -279,6 +299,24 @@ export async function runFastlaneOneProducerManyCarriers(
       `bga-producer-card:has-text("${lastNameMatch}"):has-text("${firstNameMatch}")`,
     )
   }
+  if (!producerCard) {
+    // Compare on first tokens, accent-folded, in BOTH directions — the
+    // exact and substring attempts above cannot match "LANDINO, PAULA"
+    // against "LANDINO VALBUENA, PAULA CAROLINA". See cardMatchesProducer.
+    for (const card of await page.$$("bga-producer-card")) {
+      const text = await card
+        .evaluate((c) => (c.textContent || "").replace(/\s+/g, " ").trim())
+        .catch(() => "")
+      if (cardMatchesProducer(text, input.producerDisplayName)) {
+        logger.info(
+          { cardText: text.slice(0, 80) },
+          "[Fastlane] matched producer card on folded first-token names",
+        )
+        producerCard = card
+        break
+      }
+    }
+  }
   if (!producerCard && lastNameMatch) {
     // Last resort: search narrowed by lastName already; if exactly
     // one card is visible after the search filter, it's our producer.
@@ -303,9 +341,35 @@ export async function runFastlaneOneProducerManyCarriers(
       `.viewport__item:has-text("${lastNameMatch}"):has-text("${firstNameMatch}") button:has-text("SELECT")`,
     )
   }
+  if (!selectBtn && !producerCard) {
+    // No card at all is NOT the same thing as a flagged producer, and
+    // saying so sent three months of these to the wrong place. Report what
+    // is actually true: the producer is not in the list we can see.
+    const rendered = await page
+      .$$eval("bga-producer-card", (els) =>
+        els
+          .slice(0, 10)
+          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60)),
+      )
+      .catch(() => [] as string[])
+    await snapshot(ctx, "fastlane-02c-no-producer-card")
+    logger.warn(
+      { rendered, want: input.producerDisplayName },
+      "[Fastlane] producer card not found — not a flagged producer",
+    )
+    return {
+      ok: false,
+      reason:
+        `Producer "${input.producerDisplayName}" was not found in Fastlane's list. ` +
+        `This is a name mismatch on our side, not a SureLC problem — SureLC often ` +
+        `holds only the paternal surname. Cards rendered after the search: ` +
+        `${rendered.length ? rendered.join(" | ") : "(none)"}.`,
+    }
+  }
   if (!selectBtn) {
-    // No SELECT button — Fastlane has flagged the producer as having
-    // unresolved issues. Click the "N issues" popover trigger to
+    // Card IS there but carries no SELECT button — Fastlane has flagged the
+    // producer as having unresolved issues. Click the "N issues" popover
+    // trigger to
     // reveal the actual issue text in the CDK overlay, then surface
     // it in the failure reason so the operator (or future bot logic)
     // knows what to fix.
@@ -1078,6 +1142,76 @@ async function clickNextSafe(ctx: TabContext): Promise<void> {
  *   "[eno] Policy expired | [signature] Required"
  * or "" if nothing flagged anywhere.
  */
+/**
+ * ─── Finding the producer in Fastlane's list ────────────────────────
+ *
+ * Fastlane's list is virtualised, so the bot narrows it with the Search box
+ * before looking for a card. It searched on our WHOLE last name, and for a
+ * double surname that returns nothing at all: Paula is "LANDINO VALBUENA"
+ * on our side and simply "Landino" in SureLC, so "LANDINO VALBUENA" matched
+ * no producer, no card rendered, and the code below concluded the producer
+ * had been flagged with issues. It had not. There was no card to flag.
+ *
+ * Ten of the twenty producers stuck on "SELECT button not found" since
+ * 2026-08-01 are this, and the pattern is unmistakable once listed:
+ *
+ *   LANDINO VALBUENA · LEON TEMPONI · MARASCIA PITARRESI ·
+ *   MOLERO DE MONTERO · TURIZO ESCOLA · DE JESUS MUNOZ ·
+ *   Betancurt Castano          ← paternal + maternal surname
+ *   AVENDAÑO · Muñoz␣          ← non-ASCII, and a trailing space
+ *
+ * Edgar Aponte contracts fine because ours ("Aponte") is a PREFIX of
+ * SureLC's ("Aponte Hernandez"). The mismatch only bites when our name is
+ * the longer one — which is most of a Spanish-speaking field.
+ *
+ * So search on the narrowest thing that is a prefix of both spellings: the
+ * first token of the surname, folded to ASCII. Broader match, and the card
+ * matching below still has to agree before we click anything.
+ */
+export function searchTermsForProducer(displayName: string): string[] {
+  const lastName = (displayName.split(",")[0] || displayName).trim()
+  const terms: string[] = []
+  const push = (t: string) => {
+    const v = t.trim()
+    if (v.length >= 2 && !terms.includes(v)) terms.push(v)
+  }
+  push(lastName)
+  const firstToken = lastName.split(/\s+/)[0] || ""
+  push(firstToken)
+  // Accent-folded, for a search box that may not normalise: AVENDAÑO →
+  // AVENDANO, MUÑOZ → MUNOZ.
+  push(foldAscii(lastName))
+  push(foldAscii(firstToken))
+  return terms
+}
+
+/** Strip diacritics so "MUÑOZ" and "MUNOZ" compare equal. */
+export function foldAscii(s: string): string {
+  return s.normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+}
+
+/**
+ * Does this producer card belong to the agent we are looking for?
+ * Compared on FIRST TOKENS, accent-folded, in either direction — so
+ * "LANDINO, PAULA" matches "LANDINO VALBUENA, PAULA CAROLINA" and
+ * "APONTE HERNANDEZ, EDGAR" matches "APONTE, EDGAR".
+ */
+export function cardMatchesProducer(
+  cardText: string,
+  displayName: string,
+): boolean {
+  const norm = (v: string) => foldAscii(v).toUpperCase().replace(/\s+/g, " ").trim()
+  const parts = displayName.split(",")
+  const wantLast = norm(parts[0] || "").split(" ")[0]
+  const wantFirst = norm(parts[1] || "").split(" ")[0]
+  if (!wantLast) return false
+  const card = norm(cardText)
+  if (!card.includes(wantLast)) return false
+  // A first name is a strong extra signal, but only require it when we
+  // actually have one.
+  return wantFirst ? card.includes(wantFirst) : true
+}
+
 async function diagnoseProducerProfile(
   ctx: TabContext,
   producerId: string,
