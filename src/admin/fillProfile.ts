@@ -979,25 +979,32 @@ async function fillProfileTab(
     // Paula Landino's DBA tab reported `visible buttons: (none)` and filled
     // fine. Discarding is right here: SAVE is disabled, so there is nothing
     // committable to lose.
-    const cancelBtn = await firstVisible(page, [
-      'mat-dialog-container button:has-text("CANCEL")',
-      'mat-dialog-container button:has-text("Cancel")',
-      '.cdk-overlay-pane button:has-text("CANCEL")',
-      'mat-dialog-container button[aria-label="Close"]',
-    ])
-    if (cancelBtn) {
-      await (cancelBtn as any).click().catch(() => undefined)
+    const cancelled = await page
+      .evaluate(() => {
+        const scope =
+          document.querySelector("mat-dialog-container") ||
+          document.querySelector(".cdk-overlay-pane")
+        if (!scope) return false
+        const norm = (e: Element) =>
+          ((e as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().toUpperCase()
+        const btn = Array.from(scope.querySelectorAll("button")).find((b) => {
+          const t = norm(b)
+          return t === "CANCEL" || t === "CLOSE" || t === "DISCARD"
+        })
+        if (!btn) return false
+        ;(btn as HTMLElement).click()
+        return true
+      })
+      .catch(() => false)
+    if (cancelled) {
       await settle(page, 800)
-      const confirmLeave = await firstVisible(page, [
-        'button:has-text("YES, LEAVE")',
-        'button:has-text("Yes, leave")',
-        'mat-dialog-container button:has-text("YES")',
-      ])
-      if (confirmLeave) {
-        await (confirmLeave as any).click().catch(() => undefined)
-        await settle(page, 600)
-      }
+      await dismissLeaveGuard(page, logger)
+      await settle(page, 600)
       logger.info("[Profile] discarded the un-saveable address dialog")
+    } else {
+      logger.warn(
+        "[Profile] could not find a CANCEL on the address dialog — the unsaved-changes guard may block later tabs",
+      )
     }
     return {
       ok: false,
@@ -1051,6 +1058,14 @@ async function fillDba(
 ): Promise<TabResult> {
   const { page } = ctx
   await goToTab(page, producerId, "dba", ctx.logger)
+  // Belt and braces: the guard can also appear AFTER arrival, when Angular
+  // finishes tearing down the previous route. Adolfo Rodriguez and Evelyn
+  // Turizo Escola both reported `visible buttons: YES, LEAVE | NO, STAY ON
+  // PAGE` on this tab with every field present behind it.
+  if (await dismissLeaveGuard(page, ctx.logger)) {
+    await settle(page, 800)
+    await goToTab(page, producerId, "dba", ctx.logger)
+  }
   await snapshot(ctx, "tab-dba-before")
 
   // If the affiliation template applied, fields are greyed and pre-
@@ -3960,6 +3975,44 @@ async function positionCropBoxOverSignatureLine(
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
+/**
+ * Dismiss SureLC's "you have unsaved changes" guard, if it is up.
+ *
+ * Selector-based attempts at this failed silently. The diagnostic could see
+ * the buttons — `visible buttons: YES, LEAVE | NO, STAY ON PAGE` — while
+ * `button:has-text("YES, LEAVE")` matched nothing, because that text is
+ * normalised for display (`\s+` collapsed) and the real DOM node is not
+ * necessarily "YES, LEAVE" exactly: a newline, a double space or an nbsp
+ * between the words is enough to miss.
+ *
+ * So do not pattern-match the punctuation. Read every button's text, apply
+ * the same normalisation the diagnostic does, and click the one that says
+ * LEAVE. Returns true if a guard was dismissed.
+ */
+async function dismissLeaveGuard(
+  page: Page,
+  logger: import("pino").Logger,
+): Promise<boolean> {
+  const clicked = await page
+    .evaluate(() => {
+      const norm = (e: Element) =>
+        ((e as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().toUpperCase()
+      const buttons = Array.from(document.querySelectorAll("button"))
+      // "LEAVE" and not "STAY" — the confirm dialog offers both, and we want
+      // to abandon the change we could not save, not sit on the page.
+      const leave = buttons.find((b) => {
+        const t = norm(b)
+        return t.includes("LEAVE") && !t.includes("STAY")
+      })
+      if (!leave) return false
+      ;(leave as HTMLElement).click()
+      return true
+    })
+    .catch(() => false)
+  if (clicked) logger.warn("[guard] dismissed an unsaved-changes dialog")
+  return clicked
+}
+
 async function goToTab(
   page: Page,
   producerId: string,
@@ -3991,16 +4044,11 @@ async function goToTab(
   // perfectly present. Answer it and carry on; we only arrive here after the
   // previous tab has already reported its own result, so anything unsaved
   // was unsaveable.
-  const leaveGuard = await firstVisible(page, [
-    'button:has-text("YES, LEAVE")',
-    'button:has-text("Yes, leave")',
-  ])
-  if (leaveGuard) {
-    logger.warn(
-      { slug },
-      "[goToTab] unsaved-changes guard was blocking this tab — dismissing it",
-    )
-    await (leaveGuard as any).click().catch(() => undefined)
+  if (await dismissLeaveGuard(page, logger)) {
+    logger.warn({ slug }, "[goToTab] unsaved-changes guard was blocking this tab")
+    await settle(page, 1000)
+    // The guard swallowed our navigation — go again now the way is clear.
+    await gotoBga(page, url, logger).catch(() => undefined)
     await settle(page, 1000)
   }
 
