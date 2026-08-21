@@ -2474,9 +2474,28 @@ async function fillTraining(
   //
   // So wait for the thing we actually need: the AML section, rendered. The
   // XHR is a proxy for it and an unreliable one.
+  // Read off the live DOM 2026-08-21 (evidence capture, producer 16545302):
+  //
+  //   <sb-aml id="aml"> … <div class="panel__title">
+  //     <div class="header">Anti-Money Laundering</div>
+  //     <div class="valid-course"> … SuranceBay, LLC. 08/07/2026 …
+  //
+  // NEITHER old selector could match that. `sb-aml-course` does not exist
+  // any more — the component is `sb-aml` — and the panel heading is a plain
+  // `div.panel__title`, not a `mat-panel-title`, so the expansion-panel
+  // fallback missed too. The section was on the page the entire time, fully
+  // rendered, with the course already on file for that producer; the bot just
+  // could not see it, and reported "Training tab never rendered the
+  // Anti-Money Laundering section" for 135 reps in seven days.
+  //
+  // Keep the old names: costs nothing, and an older SureLC build in front of
+  // some other tenant would still work.
   const AML_SECTION = [
+    "sb-aml",
     "sb-aml-course",
+    '[id="aml"]',
     'mat-expansion-panel:has(mat-panel-title:has-text("Anti-Money Laundering"))',
+    '.panel__title:has-text("Anti-Money Laundering")',
   ].join(", ")
   let amlSectionReady = await page
     .waitForSelector(AML_SECTION, { state: "attached", timeout: 20_000 })
@@ -2720,6 +2739,8 @@ async function fillTraining(
   await snapshot(ctx, "tab-training-aml-row")
 
   let amlUploadBtn = await firstVisible(page, [
+    'sb-aml button.actions__button:has-text("Upload")',
+    'sb-aml button:has-text("Upload")',
     'sb-aml-course button.actions__button:has-text("Upload")',
     'sb-aml-course button:has-text("Upload")',
     // Fallback if the custom element name ever changes.
@@ -2740,6 +2761,7 @@ async function fillTraining(
       'mat-expansion-panel:has(mat-panel-title:has-text("Anti-Money Laundering")) button:has-text("ADD CERTIFICATION")',
       'mat-expansion-panel:has(mat-panel-title:has-text("Anti-Money Laundering")) button:has-text("Add Certification")',
       // SureLC sometimes wraps the AML category in <sb-aml-course>
+      'sb-aml button:has-text("ADD CERTIFICATION")',
       'sb-aml-course button:has-text("ADD CERTIFICATION")',
       // Fallback: any element near the literal text "Anti-Money
       // Laundering" + "NO CURRENT TRAINING ON FILE"
