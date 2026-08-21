@@ -2523,20 +2523,89 @@ async function fillTraining(
         .waitForSelector(AML_SECTION, { state: "attached", timeout: 15_000 })
         .then(() => true)
         .catch(() => false)
-    } else {
-      // Name what IS on the page so the next run narrows it further,
-      // rather than repeating "never rendered" forever.
-      const subTabs = await page
-        .$$eval('[role="tab"], mat-tab-header a, .mat-mdc-tab', (els) =>
-          els
-            .map((e) => (e as HTMLElement).innerText?.replace(/\s+/g, " ").trim())
-            .filter((t): t is string => !!t && t.length < 60)
-            .slice(0, 15),
-        )
-        .catch(() => [] as string[])
+    }
+
+    // firstVisible gates on Playwright's isVisible(). The 2026-08-21 failures
+    // prove that gate is the problem, not the page: the very next thing the
+    // old code did was $$eval the SAME selector set and print
+    // "… | CERTIFICATIONS | COURSE HISTORY | …". The tab is in the DOM and
+    // named exactly what we search for, and firstVisible still returned null
+    // for 135 reps in seven days.
+    //
+    // So do what this file already does whenever Playwright's actionability
+    // model disagrees with the DOM (see the guard-dismissal read, 81ce269):
+    // match on the element's own text and click it directly. A DOM click
+    // reaches a tab that isVisible() has ruled out, and costs nothing when
+    // the earlier path already worked.
+    if (!amlSectionReady) {
+      const clicked = await page
+        .evaluate(() => {
+          const norm = (e: Element) =>
+            ((e as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().toUpperCase()
+          const candidates = Array.from(
+            document.querySelectorAll(
+              '[role="tab"], mat-tab-header a, .mat-mdc-tab, .mat-tab-label, li a, button',
+            ),
+          )
+          // Most specific first: a tab that names AML outright, then the
+          // Certifications tab that holds the AML category.
+          for (const want of ["ANTI-MONEY LAUNDERING", "AML", "CERTIFICATIONS"]) {
+            const hit = candidates.find((e) => {
+              const t = norm(e)
+              // Exact-ish: the tab label IS the word, not a paragraph
+              // mentioning it. Long containers otherwise swallow the match.
+              return t === want || (t.length <= 40 && t.includes(want))
+            })
+            if (hit) {
+              ;(hit as HTMLElement).click()
+              return want
+            }
+          }
+          return null
+        })
+        .catch(() => null)
+      if (clicked) {
+        logger.info({ clicked }, "[Training] clicked the AML sub-tab via DOM text match")
+        await settle(page, 1_500)
+        amlSectionReady = await page
+          .waitForSelector(AML_SECTION, { state: "attached", timeout: 15_000 })
+          .then(() => true)
+          .catch(() => false)
+      }
+    }
+
+    if (!amlSectionReady) {
+      // Say what is ACTUALLY on the page, in full. The old diagnostic sliced
+      // the list to 15 entries and 15 is exactly what came back every time —
+      // so it was truncating, and an AML tab sitting at position 16 would
+      // never have been named. Report every candidate with whether Playwright
+      // considered it visible, which is the distinction that matters here.
+      const inventory = await page
+        .evaluate(() => {
+          const els = Array.from(
+            document.querySelectorAll(
+              '[role="tab"], mat-tab-header a, .mat-mdc-tab, .mat-tab-label',
+            ),
+          )
+          return {
+            search: location.search,
+            tabs: els.map((e) => {
+              const r = (e as HTMLElement).getBoundingClientRect()
+              const cs = getComputedStyle(e as HTMLElement)
+              return {
+                text: ((e as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().slice(0, 60),
+                tag: e.tagName.toLowerCase(),
+                boxed: r.width > 0 && r.height > 0,
+                display: cs.display,
+                visibility: cs.visibility,
+              }
+            }),
+          }
+        })
+        .catch(() => null)
       logger.warn(
-        { subTabs },
-        "[Training] no AML sub-tab found by name — reporting what is on the page",
+        { inventory },
+        "[Training] no AML sub-tab reachable — full tab inventory with visibility",
       )
     }
   }
@@ -2552,14 +2621,33 @@ async function fillTraining(
         `Sub-tabs on the page: ${
           (
             await page
-              .$$eval('[role="tab"], mat-tab-header a, .mat-mdc-tab', (els) =>
-                els
-                  .map((e) => (e as HTMLElement).innerText?.replace(/\s+/g, " ").trim())
-                  .filter((t): t is string => !!t && t.length < 60)
-                  .slice(0, 15),
-              )
+              .evaluate(() => {
+                // No slice. The old one cut at 15 and returned exactly 15
+                // every time, so it was hiding whatever came after — an AML
+                // tab in position 16 could never have been named. Each entry
+                // carries whether it had a box, because "in the DOM but
+                // Playwright says invisible" is the distinction that has been
+                // costing 135 reps a week.
+                const els = Array.from(
+                  document.querySelectorAll(
+                    '[role="tab"], mat-tab-header a, .mat-mdc-tab, .mat-tab-label',
+                  ),
+                )
+                return els
+                  .map((e) => {
+                    const t = ((e as HTMLElement).innerText || "")
+                      .replace(/\s+/g, " ")
+                      .trim()
+                    if (!t || t.length >= 60) return null
+                    const r = (e as HTMLElement).getBoundingClientRect()
+                    return r.width > 0 && r.height > 0 ? t : `${t}(hidden)`
+                  })
+                  .filter((t): t is string => !!t)
+              })
               .catch(() => [] as string[])
           ).join(" | ") || "(none found)"
+        }. url-search: ${
+          (await page.evaluate(() => location.search).catch(() => "")) || "(empty)"
         }. ${await describeUploadablePage(page)}`,
       details: { amlSectionReady: false },
     }
