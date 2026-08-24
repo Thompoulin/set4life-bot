@@ -2693,14 +2693,62 @@ async function fillTraining(
     await page.waitForTimeout(1_000)
     amlRowText = await readAmlRow()
   }
-  if (/\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText) && !input?.forceFill) {
-    logger.info({ amlRowExcerpt: amlRowText.slice(0, 120) }, "[Training] AML already on file (date detected) — skipping upload")
-    return { ok: true, alreadyDone: true, details: { detected: "amlRowHasDate" } }
+  const amlRowHasDate = /\b\d{2}\/\d{2}\/\d{4}\b/.test(amlRowText)
+  if (amlRowHasDate) {
+    // POSITIVE EVIDENCE WINS OVER AN API THAT REPORTS ABSENCE.
+    //
+    // forceFill is set by the server when SureLC's readiness API answers
+    // "No AML course on record". That flag exists because the tab detectors
+    // used to claim "already done" from page appearance while SureLC held
+    // nothing — absence of evidence read as evidence of completion.
+    //
+    // AML is the case where the same reasoning runs BACKWARDS. Verified in
+    // the live BGA portal 2026-08-24, producer 10293012 (Jose Fernandez):
+    //
+    //   <sb-aml id="aml"> … <div class="valid-course">
+    //     <div class="valid-course__name">KAPLAN FINANCIAL</div>
+    //     <div class="valid-course__date">07/08/2025</div>
+    //
+    // while /producers/10293012/courses answered "No AML course on record".
+    // SureLC's own UI and SureLC's own API disagree about the same producer.
+    // The API returns COURSES; this AML sits under CERTIFICATIONS, a
+    // different tab entirely.
+    //
+    // Trusting the API there cost a 100% failure rate on this tab — 137 reps
+    // a day, every run, since 2026-08-21. And the forced upload could never
+    // have worked: when the course is already on file SureLC renders no file
+    // input at all (`file inputs in DOM: 0`), so the bot uploaded nothing and
+    // reported "AML upload did not attach a file" forever.
+    //
+    // A rendered vendor + completion date is POSITIVE evidence. An API
+    // reporting nothing is ABSENCE of evidence. Positive wins — and when the
+    // two disagree, say so loudly rather than silently picking one.
+    if (input?.forceFill) {
+      logger.warn(
+        { amlRowExcerpt: amlRowText.slice(0, 160) },
+        "[Training] DISAGREEMENT: readiness API says no AML course, but the page shows one " +
+          "with a date. Trusting the page and skipping the upload — an upload cannot " +
+          "succeed here anyway (SureLC renders no file input when the course is on file).",
+      )
+    } else {
+      logger.info(
+        { amlRowExcerpt: amlRowText.slice(0, 120) },
+        "[Training] AML already on file (date detected) — skipping upload",
+      )
+    }
+    return {
+      ok: true,
+      alreadyDone: true,
+      details: {
+        detected: "amlRowHasDate",
+        readinessDisagreed: !!input?.forceFill,
+      },
+    }
   }
   if (input?.forceFill) {
     logger.info(
       { amlRowExcerpt: amlRowText.slice(0, 120) },
-      "[Training] caller says SureLC has no AML course — ignoring the row detector and uploading",
+      "[Training] caller says SureLC has no AML course and the page shows none either — uploading",
     )
   }
 
