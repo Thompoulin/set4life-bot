@@ -912,6 +912,43 @@ async function fillProfileTab(
     } catch (err: any) {
       logger.warn({ err: err?.message }, "[Profile] USE THIS ADDRESS click threw")
     }
+    // USE THIS ADDRESS copies whatever is on the Business/Mailing record —
+    // INCLUDING its gaps. It is a shortcut, not a source of truth, and it
+    // silently overwrote a complete address we already held with an
+    // incomplete one.
+    //
+    // Senelia Vargas Chavarria (producer 11294683) failed here every day
+    // from 2026-08-22 to 08-25. Her diagnostic:
+    //
+    //   Street=(empty) [is required] | Zip="33189" | City="MIAMI" | State="FL"
+    //
+    // Read that against what the app actually sent for her — "20772 SW 82nd
+    // Ave", Cutler Bay, FL 33189. The city does not even match: MIAMI came
+    // off SureLC's stale Mailing record, not from us. Every field in that
+    // dialog was copied from a record whose street line was blank, so SAVE
+    // could never enable, and the four fields that DID populate made it look
+    // like our payload had landed with one bad selector.
+    //
+    // So: check what the copy produced, and fill from our payload anything
+    // it left empty. fillIfEmpty never overwrites a populated field, so a
+    // good copy is untouched and this costs one read per field.
+    const repaired: string[] = []
+    const repair = async (label: string, value: string | undefined) => {
+      if (!value) return
+      const r = await fillIfEmpty(page, label, value).catch(() => "failed" as const)
+      if (r === "filled") repaired.push(label)
+    }
+    await repair("Street", input.addressLine1)
+    await repair("Line 2", input.addressLine2)
+    await repair("City", input.city)
+    await repair("Zip", input.postalCode)
+    await repair("State", input.state)
+    if (repaired.length > 0) {
+      logger.warn(
+        { repaired },
+        "[Profile] USE THIS ADDRESS left required fields empty — filled them from our payload",
+      )
+    }
   } else {
     // Fallback to label-fill if USE THIS ADDRESS isn't present
     // (e.g. Business + Mailing also empty on a fresh producer).
