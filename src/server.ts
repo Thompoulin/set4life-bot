@@ -631,6 +631,20 @@ const createAppointmentRequestsSchema = z.object({
   gaId: z.number().int().positive().optional(),
   residentState: z.string().length(2).optional(),
   fallbackProducerEmail: z.string().email().optional(),
+  /**
+   * Carrier names the caller does NOT want filed, however the template rep is
+   * configured. This endpoint copies its carrier set from `templateProducerId`
+   * rather than being told which carriers to file, so without this there is no
+   * way for the platform to hold a single carrier back — deactivating it on
+   * our side does nothing here.
+   *
+   * Added 2026-08-26: Ana discarded every NLG request in SureLC while agency
+   * contracting is reworked, and this path would have recreated them from the
+   * template on the next nightly sweep. Matched case-insensitively on a
+   * trimmed substring, because our carrier names and SureLC's are not written
+   * identically ("National Life Group (NLG) (Independent)" vs "National Life").
+   */
+  excludeCarriers: z.array(z.string().min(1)).max(50).optional(),
 })
 app.post("/create-appointment-requests", async (req, res) => {
   const auth = req.headers.authorization || ""
@@ -641,8 +655,17 @@ app.post("/create-appointment-requests", async (req, res) => {
   if (!parsed.success) {
     return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
   }
-  const { producerId, templateProducerId, adminCreds, residentState, fallbackProducerEmail } =
-    parsed.data
+  const {
+    producerId,
+    templateProducerId,
+    adminCreds,
+    residentState,
+    fallbackProducerEmail,
+    excludeCarriers,
+  } = parsed.data
+  const excluded = (excludeCarriers ?? [])
+    .map((c) => c.trim().toLowerCase())
+    .filter(Boolean)
   const gaId = parsed.data.gaId ?? 1322
   try {
     const { chromium } = await import("playwright")
@@ -742,6 +765,20 @@ app.post("/create-appointment-requests", async (req, res) => {
       const created: Array<{ carrier: string; status: number }> = []
       const skipped: Array<{ carrier: string; reason: string }> = []
       for (const t of targets) {
+        // Caller-held carriers. Reported as `skipped`, never `created` — the
+        // count contract above is explicit that a carrier we did not file is
+        // a non-event, and calling it created is what stranded Pablo
+        // Ballesteros behind a "created 7 appointments" success line.
+        const carrierLc = (t.carrierName || "").trim().toLowerCase()
+        if (excluded.some((e) => carrierLc.includes(e) || e.includes(carrierLc))) {
+          logger.info(
+            { producerId, carrier: t.carrierName },
+            "[create-appointment-requests] skipping carrier — excluded by caller",
+          )
+          skipped.push({ carrier: t.carrierName, reason: "excluded by caller" })
+          continue
+        }
+
         const newAppt = {
           ...t,
           appointmentRequestId: undefined,
