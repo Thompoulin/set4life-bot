@@ -1709,6 +1709,33 @@ async function reviewOneCarrier(
         reason: `appointment_withdrawn: the appointment-request was discarded by the agency before signing. The follow-up email the bot followed points at the withdrawn record; SureLC will issue a fresh email for the new appointment-request created by the most recent Phase A run. URL: ${url}`,
       }
     }
+    // Already countersigned — the signing is DONE, so there is no PDF viewer
+    // to load and never will be. Without this the run falls through to the
+    // generic "PDF viewer did not load after retries" and reports a failure
+    // for work that completed perfectly.
+    //
+    // Measured on prod 2026-08-27, 14 days: 84 of 157 "PDF viewer" failures
+    // across 23 agents were this — a majority. Those agents' contracts sit at
+    // approved (81) and pending_carrier (67); exactly one is still stuck. So
+    // the contracts were fine and only the reporting was wrong, which made the
+    // signing step look far more broken than it is and buried the 58 genuine
+    // auth failures underneath the noise.
+    //
+    // Skipped, not failed — same treatment as withdrawn above, because the
+    // caller counts `skipped` separately and explicitly does not treat it as a
+    // failure.
+    const isCountersigned =
+      /\/countersigned(\/|$|\?)/i.test(url) ||
+      /\bcountersigned\b/i.test(String((diag as any)?.title || "")) ||
+      /this (request|appointment) has been countersigned/i.test(bodyExcerpt)
+    if (isCountersigned) {
+      return {
+        ok: false,
+        skipped: true,
+        skipReason: "already_countersigned",
+        reason: `already_countersigned: this appointment-request was already signed and countersigned, so there is nothing left to sign. URL: ${url}`,
+      }
+    }
     const isWizardBlock =
       url.includes("/wizard/welcome") ||
       url.includes("/wizard/profile") ||
