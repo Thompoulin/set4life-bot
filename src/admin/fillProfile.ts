@@ -1152,6 +1152,59 @@ async function fillProfileTab(
 
 // ─── DBA ──────────────────────────────────────────────────────────────
 
+/**
+ * Wait for an Angular tab panel to actually render its form before touching it.
+ *
+ * SureLC build 1.123.637 (live 2026-08-31; 1.123.617 the day before) puts the
+ * DBA tab behind an <sb-page-loader> that shows "Loading DBA profile ...".
+ * Every strategy in fillDba is label-driven — inputByLabel, selectByLabel,
+ * mat-select text — so running them against the spinner matches nothing and
+ * the read-back reports the field as empty. The failure surfaces as
+ *
+ *     DBA "Solicitor For" is still empty after the fill
+ *
+ * which reads like a value-matching problem and is not one: there is no field
+ * on the page yet. Twelve snapshots captured during the 04:00 sweep on
+ * 2026-08-31 all show the spinner and ZERO inputs. Every bot_run that night
+ * failed this way, on bot code unchanged since 2026-08-27.
+ *
+ * Same lesson as uploadRemoteFile: wait for the element instead of glancing
+ * once. Both waits swallow their timeout — if the panel genuinely never
+ * renders we fall through to the existing reporting rather than throwing, so
+ * this can only turn a guaranteed failure into a chance of success.
+ */
+async function waitForTabPanelReady(
+  page: Page,
+  logger: TabContext["logger"],
+  tabLabel: string,
+): Promise<void> {
+  // The loader's own text node. `detached` resolves immediately when the
+  // element was never there, so this is free on builds that don't use it.
+  await page
+    .waitForSelector("sb-page-loader .pane__spinner-text", {
+      state: "detached",
+      timeout: 25_000,
+    })
+    .catch(() => null)
+
+  // Positive confirmation that the form itself exists. `attached`, not
+  // `visible` — Angular Material keeps controls in the DOM behind styled
+  // wrappers, and a visibility wait times out on a perfectly usable field.
+  const field = await page
+    .waitForSelector("mat-form-field, input, mat-select", {
+      state: "attached",
+      timeout: 25_000,
+    })
+    .catch(() => null)
+
+  if (!field) {
+    logger.warn(
+      { tab: tabLabel },
+      "tab panel never rendered a form control — continuing, the fill will report what it finds",
+    )
+  }
+}
+
 async function fillDba(
   ctx: TabContext,
   producerId: string,
@@ -1167,6 +1220,9 @@ async function fillDba(
     await settle(page, 800)
     await goToTab(page, producerId, "dba", ctx.logger)
   }
+  // Must come before the green-check test and before any fill: on
+  // 1.123.637 the panel arrives empty and fills in asynchronously.
+  await waitForTabPanelReady(page, ctx.logger, "DBA")
   await snapshot(ctx, "tab-dba-before")
 
   // If the affiliation template applied, fields are greyed and pre-
