@@ -1,0 +1,17 @@
+# Dependencies — restored with `npm install` / `pnpm install`.
+node_modules/
+
+# Build output — the Dockerfile runs `npx tsc` to produce this at image
+# build time (it copies only src/, package.json and tsconfig.json), so a
+# committed dist/ is never used by a deploy.
+dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and OS noise
+*.log
+npm-debug.log*
+.DS_Store
