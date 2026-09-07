@@ -1736,6 +1736,31 @@ async function reviewOneCarrier(
         reason: `already_countersigned: this appointment-request was already signed and countersigned, so there is nothing left to sign. URL: ${url}`,
       }
     }
+    // Still sitting on SureLC's rep identity gate — the last-6-SSN + DOB
+    // sign-in that guards ar-review. We got here either because step 0 never
+    // got past it or because the OAuth bounce recovery above re-filled it and
+    // SureLC sent us straight back. Both mean the credentials we hold do not
+    // match the producer record SureLC holds, and no amount of waiting will
+    // render a PDF.
+    //
+    // Reported separately for the same reason `appointment_withdrawn` and
+    // `already_countersigned` are: the generic "PDF viewer did not load" sent
+    // admins hunting a rendering bug that does not exist, and — because it
+    // matched none of the server's auth-rejection patterns — it also left the
+    // orchestrator's own recovery disarmed. That recovery refetches SSN/DOB
+    // from SureLC's API and retries; it needs this reason to fire. Verified
+    // 2026-09-07 across 15 agents / 81 runs; 14 of them had a DOB that
+    // disagreed with SureLC (Marcela Jaramillo Correa: ours 1976-05-11,
+    // SureLC's 1976-11-05).
+    const isIdentityGate =
+      /accounts\.surancebay\.com\/oauth|\/oauth\/authorize/i.test(url) &&
+      /verify your identity|Last 6 digits of your SSN/i.test(bodyExcerpt)
+    if (isIdentityGate) {
+      return {
+        ok: false,
+        reason: `SSN/DOB rejected at the rep identity gate: SureLC is still asking to verify identity (last 6 of SSN + date of birth), so the credentials supplied do not match the producer record SureLC holds. No carrier can be signed until they agree — check the producer's DOB and SSN in SureLC against ours. Diag: ${diagSummary}`,
+      }
+    }
     const isWizardBlock =
       url.includes("/wizard/welcome") ||
       url.includes("/wizard/profile") ||
