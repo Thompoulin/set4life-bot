@@ -526,6 +526,67 @@ export async function runFastlaneOneProducerManyCarriers(
             : "(could not capture issue tooltip nor profile-scan)"),
     }
   }
+  // ⚠ VERIFY WE PICKED THE RIGHT HUMAN BEFORE WE FILE ANYTHING FOR THEM.
+  //
+  // Every match above is on the NAME — exact, then substring, then
+  // accent-folded first tokens, then "if only one card rendered, take it".
+  // The numeric producerId was passed in all along and used only for
+  // diagnostics, so nothing ever checked that the card we are about to click
+  // is the producer we were asked for.
+  //
+  // That filed 120 duplicate appointment requests onto the WRONG PERSON
+  // between 2026-09-01 and 09-07. Carlos Alexander Murray (producer 16679568)
+  // was re-run 16 times; "MURRAY, CARLOS ALEXANDER" folds equal to
+  // "MURRAY II, CARLOS ALEXANDER", so every run clicked his SON (12026084)
+  // and filed 8 carriers against him. The son's own bot never ran once. The
+  // father's contracting has still never been filed at all — which is why he
+  // stayed permanently top of the retry queue, re-firing every ~6.5 hours.
+  //
+  // The card carries the producer id in its own markup, so this is cheap and
+  // exact. Fail CLOSED: if we cannot confirm the id, do not file. A run that
+  // stops is a ticket; a run that files on the wrong person is 120 rows in
+  // someone else's record and a compliance clean-up nobody can automate.
+  if (input.producerId) {
+    const cardId = await (producerCard ?? selectBtn)
+      .evaluate((el: Element) => {
+        // Walk up to the card, then look for the producer id in any attribute
+        // or in a /producers/<id> href it renders.
+        const card = el.closest("bga-producer-card") ?? el.closest(".viewport__item") ?? el
+        const hay = [
+          card.getAttribute?.("id") ?? "",
+          card.getAttribute?.("data-producer-id") ?? "",
+          (card as HTMLElement).innerHTML || "",
+        ].join(" ")
+        const href = hay.match(/producers?\/(\d{4,})/)
+        if (href) return href[1]
+        const bare = hay.match(/\b(\d{6,})\b/)
+        return bare ? bare[1] : ""
+      })
+      .catch(() => "")
+    if (cardId && cardId !== String(input.producerId)) {
+      await snapshot(ctx, "fastlane-02a-wrong-producer")
+      logger.error(
+        { want: input.producerId, got: cardId, name: input.producerDisplayName },
+        "[Fastlane] REFUSING to select — card is a different producer",
+      )
+      return {
+        ok: false,
+        reason:
+          `Refused to file: the producer card matched by name is producer ${cardId}, ` +
+          `but this agent is producer ${input.producerId}. "${input.producerDisplayName}" ` +
+          `matches more than one producer in SureLC, so the name is not enough to ` +
+          `identify them. Filing here would have created appointment requests on ` +
+          `someone else's record. Fix the name or file this producer by hand.`,
+      }
+    }
+    if (!cardId) {
+      logger.warn(
+        { want: input.producerId, name: input.producerDisplayName },
+        "[Fastlane] could not read a producer id off the card — proceeding on the name match alone",
+      )
+    }
+  }
+
   logger.info({ producer: input.producerDisplayName }, "[Fastlane] clicking SELECT on producer card")
   await selectBtn.click().catch(() => undefined)
   await settle(page, 1500)
