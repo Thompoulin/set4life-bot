@@ -328,37 +328,69 @@ export async function runFastlaneOneProducerManyCarriers(
   // try exact match first (Sydney etc. work as before), then a
   // fuzzy match (card text contains lastName AND firstName as
   // separate substrings), then any single rendered card.
-  let producerCard = await page.$(
-    `bga-producer-card:has-text("${input.producerDisplayName}")`,
-  )
+  //
+  // ⚠ EVERY strategy below must yield exactly ONE card, or we file nothing.
+  //
+  // `:has-text()` is a SUBSTRING match, and page.$ returns the FIRST hit. That
+  // is the whole bug. SureLC renders these two, verbatim from the evidence
+  // HTML of the 2026-09-08 02:08 run:
+  //
+  //     MURRAY, CARLOS ALEXANDER, II     <- the son  (12026084)
+  //     MURRAY, CARLOS ALEXANDER, SR     <- the father (16679568)
+  //
+  // We search "MURRAY, CARLOS ALEXANDER" for the father. It is a substring of
+  // BOTH — so even the strictest strategy here matched both and silently took
+  // the first, which is the son. Sixteen consecutive runs, 120 appointment
+  // requests on the wrong man's record, every one reporting success.
+  //
+  // So candidates are gathered rather than short-circuited, and ambiguity is
+  // treated as the finding it is: a name that matches two producers cannot
+  // identify either of them. Refusing costs a ticket; guessing costs somebody
+  // else's compliance record and four days of a colleague deleting rows by
+  // hand.
   const dispParts = input.producerDisplayName.split(",")
   const lastNameMatch = (dispParts[0] || "").trim()
   const firstNameMatch = (dispParts[1] || "").trim()
-  if (!producerCard && lastNameMatch && firstNameMatch) {
-    // Fuzzy: card contains BOTH last AND first as substrings (handles
-    // "CASTRO DIAZ, JAVIER ANTONIO" matching last="CASTRO" + first="JAVIER").
-    producerCard = await page.$(
-      `bga-producer-card:has-text("${lastNameMatch}"):has-text("${firstNameMatch}")`,
-    )
+
+  const cardEls = await page.$$("bga-producer-card")
+  const cardTexts = await Promise.all(
+    cardEls.map((c) =>
+      c.evaluate((el) => (el.textContent || "").replace(/\s+/g, " ").trim()).catch(() => ""),
+    ),
+  )
+  const pick = (predicate: (t: string) => boolean) =>
+    cardTexts.map((t, i) => ({ t, i })).filter((x) => x.t && predicate(x.t))
+
+  // Same three strategies, same order, same semantics — now counted.
+  let hits = pick((t) => t.includes(input.producerDisplayName))
+  if (!hits.length && lastNameMatch && firstNameMatch) {
+    // "CASTRO DIAZ, JAVIER ANTONIO" for last="CASTRO" + first="JAVIER".
+    hits = pick((t) => t.includes(lastNameMatch) && t.includes(firstNameMatch))
   }
-  if (!producerCard) {
-    // Compare on first tokens, accent-folded, in BOTH directions — the
-    // exact and substring attempts above cannot match "LANDINO, PAULA"
-    // against "LANDINO VALBUENA, PAULA CAROLINA". See cardMatchesProducer.
-    for (const card of await page.$$("bga-producer-card")) {
-      const text = await card
-        .evaluate((c) => (c.textContent || "").replace(/\s+/g, " ").trim())
-        .catch(() => "")
-      if (cardMatchesProducer(text, input.producerDisplayName)) {
-        logger.info(
-          { cardText: text.slice(0, 80) },
-          "[Fastlane] matched producer card on folded first-token names",
-        )
-        producerCard = card
-        break
-      }
+  if (!hits.length) {
+    hits = pick((t) => cardMatchesProducer(t, input.producerDisplayName))
+  }
+
+  if (hits.length > 1) {
+    await snapshot(ctx, "fastlane-02a-ambiguous-producer")
+    const names = hits.map((h) => h.t.slice(0, 60))
+    logger.error(
+      { want: input.producerDisplayName, matched: names },
+      "[Fastlane] REFUSING — the name matches more than one producer card",
+    )
+    return {
+      ok: false,
+      reason:
+        `Refused to file: "${input.producerDisplayName}" matches ${hits.length} producers ` +
+        `in SureLC — ${names.join(" | ")}. The name cannot tell them apart, because ` +
+        `SureLC carries a suffix (SR, II, JR) that we do not store. Filing would put ` +
+        `this agent's carrier paperwork on somebody else's record. Give this agent a ` +
+        `last name that matches their SureLC card exactly, then re-run.`,
     }
   }
+
+  let producerCard = hits.length === 1 ? cardEls[hits[0].i] : null
+
   if (!producerCard && lastNameMatch) {
     // Last resort: search narrowed by lastName already; if exactly
     // one card is visible after the search filter, it's our producer.
