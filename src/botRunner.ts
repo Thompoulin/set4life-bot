@@ -615,10 +615,29 @@ export async function runActivation(
             // Producer display name in SureLC is `LASTNAME, FIRSTNAME`
             // (uppercase, comma-separated) — verified across all 8
             // producers in the agency list 2026-05-07.
-            const lastName = (input.producer.lastName || "").toUpperCase()
-            const firstName = (input.producer.firstName || "").toUpperCase()
+            //
+            // ...with a THIRD part when the producer has a generational
+            // suffix, which we store on the LAST NAME and SureLC puts at the
+            // END. Read off two real cards on 2026-09-08:
+            //
+            //   ours "MURRAY II, CARLOS ALEXANDER"  SureLC "MURRAY, CARLOS ALEXANDER, II"
+            //   ours "NICKSON JR, ALFRED ELAINE"    SureLC "NICKSON, ALFRED ELAINE, JR"
+            //
+            // Without this the name we search for matches NEITHER card exactly
+            // and BOTH loosely, which is how 120 appointment requests were
+            // filed onto Carlos Murray II instead of his father: `:has-text()`
+            // is a substring match and the first hit wins. Fastlane now refuses
+            // when two cards match, so this is what turns that refusal back
+            // into a successful, unambiguous filing.
+            const SUFFIXES = ["JR", "SR", "II", "III", "IV", "V"]
+            const rawLast = (input.producer.lastName || "").toUpperCase().trim()
+            const firstName = (input.producer.firstName || "").toUpperCase().trim()
+            const lastTokens = rawLast.split(/\s+/)
+            const tail = lastTokens[lastTokens.length - 1]?.replace(/\.$/, "") ?? ""
+            const suffix = lastTokens.length > 1 && SUFFIXES.includes(tail) ? tail : ""
+            const lastName = suffix ? lastTokens.slice(0, -1).join(" ") : rawLast
             const producerDisplayName = lastName && firstName
-              ? `${lastName}, ${firstName}`
+              ? `${lastName}, ${firstName}${suffix ? `, ${suffix}` : ""}`
               : input.producer.lastName || ""
             // Pass ONLY the agent's selected carriers to Fastlane so it
             // adds exactly those and never "ADD ALL" (owner directive).
