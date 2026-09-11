@@ -151,5 +151,58 @@ const L_INTERRUPT = "Have you ever had any interruptions in licensing?*"
   if (!ok3) failures++
   console.log(`${ok3 ? "PASS" : "FAIL"}  clean rep answers No to interruptions`)
 }
-console.log(failures === 0 ? "\nALL PASS (incl. q13)" : `\n${failures} FAILURE(S)`)
+// ── 7. The Q1 family: a felony must not answer its siblings ──────────
+// Verbatim from Carlos Murray Sr's SureLC profile Questions tab,
+// 2026-09-11. All eight sub-questions share "convicted ... plead guilty
+// or no contest", which the q1_felony pattern matches, so his felony was
+// answering "convicted of a MISDEMEANOR" and "convicted of a violation of
+// state insurance department regulation" Yes as well — false statements
+// about him, on a form a carrier reads, each demanding an explanation he
+// could never give.
+const Q1A_FELONY =
+  "Have you ever been convicted of or plead guilty or no contest to any Felony?"
+const Q1B_MISDEMEANOR =
+  "Have you ever been convicted of or plead guilty or no contest to any Misdemeanor?"
+const Q1D_STATE_INS =
+  "Have you ever been convicted of or plead guilty or no contest to a violation of state insurance department regulation or statute?"
+const Q1F_CHARGED_FELONY = "Have you ever been charged with any Felony?"
+const Q1G_CHARGED_MISD = "Have you ever been charged with any Misdemeanor?"
+// A combined prompt — understating a real disclosure is the worse failure,
+// so this one must still answer Yes off the felony flag alone.
+const L_COMBINED =
+  "Have you ever been convicted of or plead guilty to a felony or misdemeanor?"
+
+const FELONY_ONLY = {
+  q1_felony: true,
+  q2_misdemeanor: false,
+  q3_regulatory_action: false,
+  q3_securities_violation: false,
+}
+expectYn(Q1A_FELONY, FELONY_ONLY, "Y", "felony sub-question answers Yes")
+expectYn(Q1F_CHARGED_FELONY, FELONY_ONLY, "Y", "charged-with-a-felony answers Yes")
+expectYn(Q1B_MISDEMEANOR, FELONY_ONLY, "N", "a felony does NOT answer the misdemeanor question")
+expectYn(Q1G_CHARGED_MISD, FELONY_ONLY, "N", "a felony does NOT answer charged-with-a-misdemeanor")
+expectYn(Q1D_STATE_INS, FELONY_ONLY, "N", "a felony does NOT answer the state-insurance-regulation question")
+expectYn(L_COMBINED, FELONY_ONLY, "Y", "a COMBINED felony-or-misdemeanor prompt still answers Yes on the felony")
+expectYn(
+  Q1B_MISDEMEANOR,
+  { q1_felony: true, q2_misdemeanor: true },
+  "Y",
+  "a rep who disclosed a misdemeanor still answers Yes",
+)
+expectYn(
+  Q1D_STATE_INS,
+  { q1_felony: true, q3_regulatory_action: true },
+  "Y",
+  "a rep with a regulatory action still answers the state-insurance question Yes",
+)
+expectKeys(Q1B_MISDEMEANOR, FELONY_ONLY, [], "audit places nothing on misdemeanor for a felony-only rep")
+expectKeys(
+  Q1B_MISDEMEANOR,
+  { q1_felony: true, q2_misdemeanor: true },
+  ["q2_misdemeanor"],
+  "audit places q2 on the misdemeanor question",
+)
+
+console.log(failures === 0 ? "\nALL PASS (incl. q13 + the Q1 family)" : `\n${failures} FAILURE(S)`)
 process.exit(failures === 0 ? 0 : 1)

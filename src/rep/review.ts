@@ -486,6 +486,28 @@ export function pickYnForLabel(
   if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
     return d.q7_bankruptcy_pending ? "Y" : "N"
   }
+  // The eight sub-questions under Q1 ("charged or convicted of or plead
+  // guilty or no contest to any Felony, Misdemeanor, federal/state
+  // insurance and/or securities or investments regulations and statutes")
+  // all share the words "convicted ... plead guilty or no contest", and
+  // the q1_felony pattern matches every one of them. So a rep who
+  // disclosed a FELONY was also answering Yes to "convicted of any
+  // MISDEMEANOR" and to "convicted of a violation of state insurance
+  // department regulation" — a false statement about them, signed and
+  // filed with a carrier. Carlos Murray Sr, 2026-09-11: q2_misdemeanor
+  // and q3_regulatory_action both false, both answered Yes, and both
+  // then demanded an explanation nobody could give.
+  //
+  // A label that names one of those subjects and does NOT name a felony
+  // is that question, whatever wording it shares with the felony prompt.
+  // A COMBINED label ("convicted of a felony or misdemeanor") still falls
+  // through to the pattern list, where the felony flag rightly answers it
+  // Yes — understating a real disclosure is the worse failure.
+  if (!/felon/i.test(label)) {
+    if (/misdemeanor/i.test(label)) return d.q2_misdemeanor ? "Y" : "N"
+    if (/state\s+insurance\s+department\s+regulation|insurance\s+department\s+regulation\s+or\s+statute/i.test(label))
+      return d.q3_regulatory_action ? "Y" : "N"
+  }
   for (const { key, pattern } of DISCLOSURE_LABEL_PATTERNS) {
     if (pattern.test(label) && d[key]) return "Y"
   }
@@ -566,6 +588,12 @@ export function disclosureKeysForLabel(
   }
   if (/(?:is\s+the\s+)?bankruptcy\s+(?:is\s+)?pending|pending\s+bankruptcy/i.test(label)) {
     return d.q7_bankruptcy_pending ? ["q7_bankruptcy_pending"] : []
+  }
+  // Lockstep with pickYnForLabel's Q1-family split above.
+  if (!/felon/i.test(label)) {
+    if (/misdemeanor/i.test(label)) return d.q2_misdemeanor ? ["q2_misdemeanor"] : []
+    if (/state\s+insurance\s+department\s+regulation|insurance\s+department\s+regulation\s+or\s+statute/i.test(label))
+      return d.q3_regulatory_action ? ["q3_regulatory_action"] : []
   }
   // ALL matches, not just the first — see the doc comment above.
   const keys: string[] = []
