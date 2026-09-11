@@ -2165,17 +2165,25 @@ async function fillQuestionsV2(
         .catch(() => undefined)
       await page.waitForTimeout(500)
     }
-    // Try to SELECT an existing uploaded doc first — this is safer
-    // because it doesn't create new attachments (which can become
-    // orphans if CREATE later fails). If no existing docs are
-    // available, fall back to UPLOAD NEW DOCUMENT.
+    // The rep's OWN letter for THIS disclosure wins when we hold one.
+    //
+    // This used to prefer SELECT FROM UPLOADED, to avoid creating an
+    // attachment that orphans if CREATE then fails. But that picker
+    // clicks the FIRST item in the producer's bucket, whoever wrote it
+    // and whatever question it answers, so on Carlos Murray Sr
+    // (2026-09-11) the probation letter — heading and all, "Question:
+    // Have you ever been on probation?" — was attached to "Have you ever
+    // been charged with any Felony?". A duplicate in a document bucket is
+    // untidy; a letter that visibly answers a different question, sitting
+    // on a criminal disclosure a carrier will read, is not. Reuse is now
+    // the fallback for when we hold nothing of our own.
     const doc = ans.documents && ans.documents.length > 0 ? ans.documents[0] : null
     let uploadOk = false
-    // ── Path A: SELECT FROM UPLOADED DOCUMENTS (preferred) ────────
+    // ── Path A: SELECT FROM UPLOADED DOCUMENTS (only when we have none) ──
     try {
-      const selectBtn = await page.$(
-        'button:has-text("SELECT FROM UPLOADED DOCUMENTS")',
-      )
+      const selectBtn = doc
+        ? null
+        : await page.$('button:has-text("SELECT FROM UPLOADED DOCUMENTS")')
       if (selectBtn) {
         await (selectBtn as any).click().catch(() => undefined)
         await page.waitForTimeout(1200)
@@ -2246,7 +2254,7 @@ async function fillQuestionsV2(
         "[Questions/v2] this disclosure asks for named document categories",
       )
     }
-    // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
+    // ── Path B: UPLOAD NEW DOCUMENT (our own letter, preferred) ───
     if (!uploadOk && doc) {
       try {
         const path = await import("node:path")
