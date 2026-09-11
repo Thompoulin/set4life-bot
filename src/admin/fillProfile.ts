@@ -1639,6 +1639,23 @@ const getSlugQuestionPattern = (slug: string): string => {
  * navigation. Verified Gurira wasBankrupt 2026-05-29: simple click
  * → no network call, no save; pointer sequence → save persists +
  * validation drops to 0 issues.
+ *
+ * Second gotcha, and the reason every lookup here goes through
+ * `leafQuestions()`: an <sb-question> can CONTAIN other <sb-question>s.
+ * Q1 is an umbrella — "charged or convicted of ... any Felony,
+ * Misdemeanor, federal/state insurance and/or securities or investments
+ * regulations and statutes? Have you ever been on probation?" — that
+ * nests 1a..1h. A container's textContent is every child's text
+ * concatenated, and it comes FIRST in document order, so a plain
+ * querySelectorAll("sb-question") hands almost any sub-question's
+ * pattern the umbrella instead of the question it names. The code then
+ * reads the umbrella's radio and the umbrella's first descendant
+ * button, i.e. it answers Q1 and looks at 1a's ADD EXPLANATION — no
+ * matter which of the eight it was asked to fill. On Carlos Murray Sr
+ * (producer 16679568, 2026-09-09) that put Yes on 1b and 1d, which the
+ * rep answered No, left 1h No, which he answered Yes, and attached
+ * nothing to any of the four cards that demanded an explanation.
+ * Containers are never the target: only a leaf is a real question.
  */
 async function fillQuestionsV2(
   ctx: TabContext,
@@ -1659,6 +1676,7 @@ async function fillQuestionsV2(
   // or browser has been closed". Re-query DOM for each iteration.
   const initialSlugs = await page.evaluate(() => {
     return Array.from(document.querySelectorAll("sb-question"))
+      .filter((q) => !q.querySelector("sb-question"))
       .map((q) => (q.textContent || "").replace(/\s+/g, " ").trim())
   })
   const presentSlugs = new Set<string>()
@@ -1680,7 +1698,12 @@ async function fillQuestionsV2(
     if (!presentSlugs.has(slug) && !getSlugQuestionPattern(slug)) continue
     const clicked = await page
       .evaluate((slugMap) => {
-        const sbQs = Array.from(document.querySelectorAll("sb-question"))
+        // Leaves only — see the container note on fillQuestionsV2.
+        const leafQuestions = () =>
+          Array.from(document.querySelectorAll("sb-question")).filter(
+            (q) => !q.querySelector("sb-question"),
+          )
+        const sbQs = leafQuestions()
         for (const q of sbQs) {
           const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
           const wanted = slugMap.some((re: any) =>
@@ -1728,25 +1751,68 @@ async function fillQuestionsV2(
     await page
       .waitForSelector("sb-question", { timeout: 8_000 })
       .catch(() => undefined)
-    // Set Yes radio + check if ADD EXPLANATION is present. Use
-    // page.evaluate to find the question by text match — handles are
-    // not reusable across navigations.
-    const probeResult = await page.evaluate((slugRegexMap) => {
-      const sbQs = Array.from(document.querySelectorAll("sb-question"))
-      let target: Element | null = null
-      for (const q of sbQs) {
-        const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
-        const wanted = slugRegexMap.some((re: any) => new RegExp(re.pattern, re.flags).test(txt))
-        if (wanted) { target = q; break }
+    // Read the question's current state. Use page.evaluate to find it by
+    // text match — handles are not reusable across navigations.
+    const probe = () =>
+      page.evaluate((slugRegexMap) => {
+        // Leaves only — see the container note on fillQuestionsV2.
+        const leafQuestions = () =>
+          Array.from(document.querySelectorAll("sb-question")).filter(
+            (q) => !q.querySelector("sb-question"),
+          )
+        const sbQs = leafQuestions()
+        let target: Element | null = null
+        for (const q of sbQs) {
+          const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+          const wanted = slugRegexMap.some((re: any) => new RegExp(re.pattern, re.flags).test(txt))
+          if (wanted) { target = q; break }
+        }
+        if (!target) return { matched: false as const }
+        const yes = target.querySelector('input[type="radio"][value="true"]') as HTMLInputElement | null
+        const yesChecked = !!yes?.checked
+        const addBtn = Array.from(target.querySelectorAll("button")).find((b) =>
+          /ADD EXPLANATION/i.test(b.textContent || ""),
+        )
+        return { matched: true as const, yesChecked, hasAddBtn: !!addBtn }
+      }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+    let probeResult: { matched: boolean; yesChecked?: boolean; hasAddBtn?: boolean } =
+      await probe()
+    if (!probeResult.matched) {
+      // A sub-question only exists in the DOM while its umbrella is
+      // answered Yes. Q1's eight children vanish the moment Q1 reads No,
+      // so "not on screen" can mean "hidden", not "not asked". Open the
+      // umbrella that covers this slug and look once more; without this
+      // a rep whose only disclosure is a sub-question can never have it
+      // recorded.
+      const expanded = await page
+        .evaluate((slugMap) => {
+          const containers = Array.from(
+            document.querySelectorAll("sb-question"),
+          ).filter((q) => q.querySelector("sb-question"))
+          for (const q of containers) {
+            const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
+            const wanted = slugMap.some((re: any) =>
+              new RegExp(re.pattern, re.flags).test(txt),
+            )
+            if (!wanted) continue
+            const own = Array.from(
+              q.querySelectorAll('input[type="radio"][value="true"]'),
+            ).filter((r) => r.closest("sb-question") === q) as HTMLInputElement[]
+            if (own[0] && !own[0].checked) {
+              own[0].click()
+              return true
+            }
+            return false
+          }
+          return false
+        }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+        .catch(() => false)
+      if (expanded) {
+        logger.info({ slug }, "[Questions/v2] opened the umbrella hiding this question")
+        await page.waitForTimeout(1200)
+        probeResult = await probe()
       }
-      if (!target) return { matched: false }
-      const yes = target.querySelector('input[type="radio"][value="true"]') as HTMLInputElement | null
-      const yesChecked = !!yes?.checked
-      const addBtn = Array.from(target.querySelectorAll("button")).find((b) =>
-        /ADD EXPLANATION/i.test(b.textContent || ""),
-      )
-      return { matched: true, yesChecked, hasAddBtn: !!addBtn }
-    }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
+    }
     if (!probeResult.matched) {
       logger.warn({ slug }, "[Questions/v2] question disappeared from DOM")
       continue
@@ -1755,7 +1821,12 @@ async function fillQuestionsV2(
       // Click Yes
       await page
         .evaluate((slugMap) => {
-          const sbQs = Array.from(document.querySelectorAll("sb-question"))
+          // Leaves only — see the container note on fillQuestionsV2.
+          const leafQuestions = () =>
+            Array.from(document.querySelectorAll("sb-question")).filter(
+              (q) => !q.querySelector("sb-question"),
+            )
+          const sbQs = leafQuestions()
           for (const q of sbQs) {
             const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
             const wanted = slugMap.some((re: any) =>
@@ -1773,6 +1844,18 @@ async function fillQuestionsV2(
         .catch(() => undefined)
       await page.waitForTimeout(800)
       yesSet++
+      // The explanation card is rendered BY the Yes answer — it does not
+      // exist while the question reads No. Re-read the question instead
+      // of trusting the probe taken before the click, which by
+      // definition saw no ADD EXPLANATION and would have us log the
+      // question as already satisfied and walk away, leaving a Yes with
+      // an empty red "An explanation is required" card. Angular takes a
+      // moment to render the card, so give it a few looks.
+      for (let i = 0; i < 4 && !probeResult.hasAddBtn; i++) {
+        probeResult = await probe()
+        if (probeResult.hasAddBtn) break
+        await page.waitForTimeout(700)
+      }
     }
     if (!probeResult.hasAddBtn) {
       skipped++
@@ -1805,7 +1888,12 @@ async function fillQuestionsV2(
     // proper events.
     let navOk = false
     const addBtnFresh = await page.evaluateHandle((slugMap) => {
-      const sbQs = Array.from(document.querySelectorAll("sb-question"))
+      // Leaves only — see the container note on fillQuestionsV2.
+      const leafQuestions = () =>
+        Array.from(document.querySelectorAll("sb-question")).filter(
+          (q) => !q.querySelector("sb-question"),
+        )
+      const sbQs = leafQuestions()
       for (const q of sbQs) {
         const txt = (q.textContent || "").replace(/\s+/g, " ").trim()
         const wanted = slugMap.some((re: any) =>
