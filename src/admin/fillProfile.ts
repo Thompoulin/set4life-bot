@@ -1745,13 +1745,12 @@ async function expandDocumentCategories(page: Page): Promise<string[]> {
         if (header && header.getAttribute("aria-expanded") !== "true") header.click()
       })
       return panels.map((p) =>
-        (
-          p.querySelector(
-            "mat-panel-title, .mat-expansion-panel-header-title",
-          )?.textContent || ""
-        )
+        (p.textContent || "")
           .replace(/\s+/g, " ")
-          .trim(),
+          .replace(/^\s*error\s*/i, "")
+          .replace(/No documents attached.*$/i, "")
+          .trim()
+          .slice(0, 140),
       )
     })
     .catch(() => [] as string[])
@@ -2273,8 +2272,23 @@ async function fillQuestionsV2(
         "[Questions/v2] this disclosure asks for named document categories",
       )
     }
+    // A conviction wants a written statement AND the charging document
+    // AND the final judgment — court papers only the rep can give us.
+    // Holding fewer documents than SureLC names categories means this
+    // card cannot be completed by anyone today, so don't upload: CREATE
+    // would stay disabled and every re-run would leave another unlinked
+    // copy in the producer's bucket for someone to clean up. Say whose
+    // turn it is instead.
+    const owedDocuments =
+      categories.length > 1 && (ans.documents?.length ?? 0) < categories.length
+    if (owedDocuments) {
+      logger.warn(
+        { slug, categories, weHold: ans.documents?.length ?? 0 },
+        "[Questions/v2] the rep still owes documents for this disclosure — nobody can complete it until they arrive",
+      )
+    }
     // ── Path B: UPLOAD NEW DOCUMENT (our own letter, preferred) ───
-    if (!uploadOk && doc) {
+    if (!uploadOk && doc && !owedDocuments) {
       try {
         const path = await import("node:path")
         const fs = await import("node:fs/promises")
@@ -2296,7 +2310,25 @@ async function fillQuestionsV2(
           // Setting the file on the input directly is more reliable than
           // racing a filechooser off a button click, and it works on both
           // shapes of this route. Keep the button path as the fallback.
-          const fileInput = await page.$('input[type="file"]')
+          //
+          // On the category shape there is one file input per category,
+          // in panel order. Our letter of explanation is the written
+          // statement, which is the first category SureLC asks for; a
+          // document that names its slot goes to the category that
+          // matches it. Never guess past that — putting a letter under
+          // "Notice of Hearing" would misdescribe it to a carrier.
+          const fileInputs = await page.$$('input[type="file"]')
+          const slotWord: Record<string, RegExp> = {
+            statement: /written statement/i,
+            notice: /notice of hearing/i,
+            resolution: /resolution of the charges|final judgment/i,
+          }
+          let fileInput = fileInputs[0] ?? null
+          if (categories.length > 1) {
+            const want = slotWord[doc.slot || "statement"] ?? slotWord.statement
+            const idx = categories.findIndex((c) => want.test(c))
+            if (idx >= 0 && fileInputs[idx]) fileInput = fileInputs[idx]
+          }
           if (fileInput) {
             await (fileInput as any).setInputFiles(uploadPath)
           } else {
