@@ -1657,6 +1657,67 @@ const getSlugQuestionPattern = (slug: string): string => {
  * nothing to any of the four cards that demanded an explanation.
  * Containers are never the target: only a leaf is a real question.
  */
+/**
+ * Block until the Questions list has finished rendering: the number of
+ * leaf <sb-question> elements is non-zero and unchanged across two
+ * consecutive reads. Angular builds the list in stages, so "the selector
+ * resolved" is not "the list is there".
+ */
+async function waitForQuestionListToSettle(
+  page: Page,
+  timeoutMs = 8_000,
+): Promise<number> {
+  const countLeaves = () =>
+    page
+      .evaluate(
+        () =>
+          Array.from(document.querySelectorAll("sb-question")).filter(
+            (q) => !q.querySelector("sb-question"),
+          ).length,
+      )
+      .catch(() => 0)
+  const deadline = Date.now() + timeoutMs
+  let last = -1
+  while (Date.now() < deadline) {
+    const n = await countLeaves()
+    if (n > 0 && n === last) return n
+    last = n
+    await page.waitForTimeout(400)
+  }
+  return last
+}
+
+/**
+ * Block until the explanation route's own controls exist. The route is a
+ * separate SPA view that loads its buttons after navigation; the old flat
+ * 1.5s wait was enough on a warm page and not on a cold one, so the FIRST
+ * disclosure of a run would find no SELECT and no UPLOAD button, log "no
+ * doc attached" and cancel a modal it had every document for — which is
+ * how Carlos Murray Sr's felony letter was left unattached on 2026-09-11
+ * while the identical probation letter, two slugs later, uploaded fine.
+ */
+async function waitForExplanationControls(
+  page: Page,
+  timeoutMs = 10_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const ready = await page
+      .evaluate(() =>
+        Array.from(document.querySelectorAll("button")).some(
+          (b) =>
+            /SELECT FROM UPLOADED|UPLOAD NEW DOCUMENT|CREATE EXPLANATION DOCUMENT/i.test(
+              b.textContent || "",
+            ) && (b as HTMLElement).offsetWidth > 0,
+        ),
+      )
+      .catch(() => false)
+    if (ready) return true
+    await page.waitForTimeout(400)
+  }
+  return false
+}
+
 async function fillQuestionsV2(
   ctx: TabContext,
   input: ProfileFillInput["questions"],
@@ -1751,6 +1812,14 @@ async function fillQuestionsV2(
     await page
       .waitForSelector("sb-question", { timeout: 8_000 })
       .catch(() => undefined)
+    // sb-question being present is not the list being BUILT. Coming back
+    // from an explanation route, Angular renders the top-level questions
+    // first and the umbrella's eight children a beat later — so a probe
+    // fired the moment the first element appears reports every
+    // sub-question as gone. That is what lost chargedFelony on Carlos
+    // Murray Sr immediately after the probation CREATE. Wait for the leaf
+    // count to stop moving before reading anything.
+    await waitForQuestionListToSettle(page)
     // Read the question's current state. Use page.evaluate to find it by
     // text match — handles are not reusable across navigations.
     const probe = () =>
@@ -1915,8 +1984,15 @@ async function fillQuestionsV2(
       logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found")
       continue
     }
-    // Wait for the explanation page route to load
-    await page.waitForTimeout(1500)
+    // Wait for the explanation page route to load — for its CONTROLS, not
+    // for a fixed number of milliseconds.
+    const controlsReady = await waitForExplanationControls(page)
+    if (!controlsReady) {
+      logger.warn(
+        { slug },
+        "[Questions/v2] explanation route never rendered its document buttons",
+      )
+    }
     // Set Occurrence Date via direct value + events
     if (ans.occurrenceDate) {
       const isoMatch = ans.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
