@@ -1993,7 +1993,16 @@ async function fillQuestionsV2(
         const addBtn = Array.from(target.querySelectorAll("button")).find((b) =>
           /ADD EXPLANATION/i.test(b.textContent || ""),
         )
-        return { matched: true as const, yesChecked, hasAddBtn: !!addBtn }
+        // A SATISFIED card keeps an "Add Explanation" button so a person
+        // can add a second one — so the button's presence is not the
+        // question "does this still need us". Only the card's own red
+        // "An explanation is required for this question" says that. Going
+        // by the button alone makes every re-run stack another copy of
+        // the same letter onto a disclosure that was already complete.
+        const required = /An explanation is required/i.test(
+          (target.textContent || "").replace(/\s+/g, " "),
+        )
+        return { matched: true as const, yesChecked, hasAddBtn: !!addBtn && required }
       }, [{ pattern: getSlugQuestionPattern(slug), flags: "i" }])
     let probeResult: { matched: boolean; yesChecked?: boolean; hasAddBtn?: boolean } =
       await probe()
@@ -2079,7 +2088,10 @@ async function fillQuestionsV2(
     }
     if (!probeResult.hasAddBtn) {
       skipped++
-      logger.info({ slug }, "[Questions/v2] explanation already linked; skipping")
+      logger.info(
+        { slug },
+        "[Questions/v2] card does not ask for an explanation; nothing to do",
+      )
       continue
     }
     // Slug-share fallback: when our DB has no doc for this slug but
