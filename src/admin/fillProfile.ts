@@ -2153,15 +2153,12 @@ async function fillQuestionsV2(
       logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found")
       continue
     }
-    // Wait for the explanation page route to load — for its CONTROLS, not
-    // for a fixed number of milliseconds.
-    const controlsReady = await waitForExplanationControls(page)
-    if (!controlsReady) {
-      logger.warn(
-        { slug },
-        "[Questions/v2] explanation route never rendered its document buttons",
-      )
-    }
+    // The explanation route is a separate SPA view that paints after
+    // navigation; wait for its own date field rather than a fixed number
+    // of milliseconds before touching anything on it.
+    await page
+      .waitForSelector('input[placeholder="Occurrence Date"]', { timeout: 12_000 })
+      .catch(() => undefined)
     // Set Occurrence Date via direct value + events
     if (ans.occurrenceDate) {
       const isoMatch = ans.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
@@ -2266,6 +2263,15 @@ async function fillQuestionsV2(
     // report what they ask for: a category we hold no document for is a
     // document the rep still owes, not a bug to work around.
     const categories = await expandDocumentCategories(page)
+    // Wait for the route's CONTROLS, not a fixed number of milliseconds —
+    // and only after the category panels are open, since on that shape
+    // every upload button lives inside one.
+    if (!(await waitForExplanationControls(page))) {
+      logger.warn(
+        { slug },
+        "[Questions/v2] explanation route never rendered its document buttons",
+      )
+    }
     if (categories.length > 0) {
       logger.info(
         { slug, categories },
