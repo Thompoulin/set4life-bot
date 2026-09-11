@@ -76,6 +76,10 @@ export interface ProfileFillInput {
           url: string
           fileName?: string
           slot?: string // "statement" | "notice" | "resolution" for Q1a
+          // Sent by the backoffice. Load-bearing: SureLC's attachment
+          // service 500s on text/plain, so a letter arriving as text has
+          // to be wrapped before it is offered. See asUploadableFile.
+          contentType?: string
         }>
       }
     >
@@ -1718,6 +1722,153 @@ async function waitForExplanationControls(
   return false
 }
 
+/**
+ * Open every collapsed document-category panel and return their titles.
+ *
+ * A conviction disclosure asks for named CATEGORIES of document — a
+ * written statement, the Notice of Hearing, the final judgment — one
+ * collapsed expansion panel each. Angular does not render a collapsed
+ * panel's body, so the UPLOAD NEW DOCUMENT button inside it does not
+ * exist in the DOM at all until the header is clicked. Returns [] on the
+ * plain single-upload shape of the route.
+ */
+async function expandDocumentCategories(page: Page): Promise<string[]> {
+  const titles = await page
+    .evaluate(() => {
+      const panels = Array.from(
+        document.querySelectorAll("mat-expansion-panel, .mat-expansion-panel"),
+      )
+      panels.forEach((p) => {
+        const header = p.querySelector(
+          "mat-expansion-panel-header, .mat-expansion-panel-header",
+        ) as HTMLElement | null
+        if (header && header.getAttribute("aria-expanded") !== "true") header.click()
+      })
+      return panels.map((p) =>
+        (
+          p.querySelector(
+            "mat-panel-title, .mat-expansion-panel-header-title",
+          )?.textContent || ""
+        )
+          .replace(/\s+/g, " ")
+          .trim(),
+      )
+    })
+    .catch(() => [] as string[])
+  if (titles.length > 0) await page.waitForTimeout(1200)
+  return titles
+}
+
+/**
+ * SureLC's attachment service refuses a plain-text upload: POST
+ * /surecrm/attachments/{producer}/upload answers 500 and the page shows
+ * "Could not upload file: <name>". Our questionnaire writes the rep's
+ * letter of explanation as text/plain, so EVERY letter we have ever held
+ * was rejected at the door — which is the real reason no disclosure card
+ * has ever had a document on it. Verified on Carlos Murray Sr's
+ * probation letter 2026-09-11: the same words as .txt → 500, as .pdf →
+ * 200 and CREATE goes live.
+ *
+ * Chromium is already here, so wrap the text in a one-page PDF rather
+ * than taking a dependency. Anything that is not text passes straight
+ * through untouched.
+ */
+async function asUploadableFile(
+  page: Page,
+  localPath: string,
+  contentType: string | undefined,
+  logger: import("pino").Logger,
+): Promise<string> {
+  const isText =
+    /^text\//i.test(contentType || "") || /\.(txt|text)$/i.test(localPath)
+  if (!isText) return localPath
+  try {
+    const fs = await import("node:fs/promises")
+    const body = await fs.readFile(localPath, "utf8")
+    const escaped = body
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+    const pdfPath = localPath.replace(/\.(txt|text)$/i, "") + ".pdf"
+    const scratch = await page.context().newPage()
+    try {
+      await scratch.setContent(
+        `<html><body style="font:12pt/1.5 Helvetica,Arial,sans-serif;margin:48px">` +
+          `<pre style="white-space:pre-wrap;font:inherit">${escaped}</pre></body></html>`,
+        { waitUntil: "load" },
+      )
+      await scratch.pdf({ path: pdfPath, format: "Letter", printBackground: true })
+    } finally {
+      await scratch.close().catch(() => undefined)
+    }
+    logger.info(
+      { from: localPath, to: pdfPath },
+      "[Questions/v2] wrapped a text letter as PDF — SureLC rejects text/plain",
+    )
+    return pdfPath
+  } catch (err: any) {
+    logger.warn(
+      { err: err?.message },
+      "[Questions/v2] could not wrap text as PDF — uploading as-is",
+    )
+    return localPath
+  }
+}
+
+/**
+ * Wait for SureLC to actually accept the file. The upload is answered
+ * asynchronously: a refusal leaves a "Could not upload file" toast and
+ * CREATE disabled, while an acceptance clears "Required documents are
+ * missing" and enables CREATE. Returning true off setFiles alone — the
+ * old behaviour — reported a refused upload as a success.
+ */
+async function confirmUploadAccepted(
+  page: Page,
+  logger: import("pino").Logger,
+  slug: string,
+  timeoutMs = 20_000,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  let lastToast = ""
+  while (Date.now() < deadline) {
+    const st = await page
+      .evaluate(() => {
+        const text = (document.body.textContent || "").replace(/\s+/g, " ")
+        const create = Array.from(document.querySelectorAll("button")).find(
+          (b) => b.textContent?.trim() === "CREATE",
+        ) as HTMLButtonElement | undefined
+        const toast = (
+          document.querySelector(
+            "simple-snack-bar, mat-snack-bar-container, .mat-mdc-snack-bar-label",
+          )?.textContent || ""
+        )
+          .replace(/\s+/g, " ")
+          .trim()
+        return {
+          refused: /Could not upload file/i.test(text) || /Could not upload file/i.test(toast),
+          stillMissing: /Required documents are missing/i.test(text),
+          createEnabled: !!create && !create.disabled,
+          toast,
+        }
+      })
+      .catch(() => null)
+    if (st) {
+      if (st.toast) lastToast = st.toast
+      if (st.refused) {
+        logger.warn(
+          { slug, toast: lastToast },
+          "[Questions/v2] SureLC refused the upload",
+        )
+        return false
+      }
+      if (st.createEnabled || !st.stillMissing) return true
+    }
+    await page.waitForTimeout(600)
+  }
+  logger.warn({ slug }, "[Questions/v2] upload never confirmed by SureLC")
+  return false
+}
+
 async function fillQuestionsV2(
   ctx: TabContext,
   input: ProfileFillInput["questions"],
@@ -2080,6 +2231,21 @@ async function fillQuestionsV2(
     } catch (err: any) {
       logger.warn({ slug, err: err.message }, "[Questions/v2] SELECT path threw")
     }
+    // Some disclosures (a conviction, as opposed to a charge) ask for
+    // several NAMED categories of document instead of one file, and each
+    // category is a collapsed expansion panel. Angular does not render a
+    // collapsed panel's body, so its UPLOAD NEW DOCUMENT button does not
+    // exist until the panel is opened — which is why this route looked
+    // button-less on Carlos Murray Sr's felony card. Open them all, and
+    // report what they ask for: a category we hold no document for is a
+    // document the rep still owes, not a bug to work around.
+    const categories = await expandDocumentCategories(page)
+    if (categories.length > 0) {
+      logger.info(
+        { slug, categories },
+        "[Questions/v2] this disclosure asks for named document categories",
+      )
+    }
     // ── Path B: UPLOAD NEW DOCUMENT (fallback) ────────────────────
     if (!uploadOk && doc) {
       try {
@@ -2094,18 +2260,39 @@ async function fillQuestionsV2(
             `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`,
           )
           await fs.writeFile(localPath, buf)
-          const uploadBtn = await page.$(
-            'button:has-text("UPLOAD NEW DOCUMENT")',
+          const uploadPath = await asUploadableFile(
+            page,
+            localPath,
+            doc.contentType,
+            logger,
           )
-          if (uploadBtn) {
-            const [fc] = await Promise.all([
-              page.waitForEvent("filechooser", { timeout: 8_000 }),
-              (uploadBtn as any).click(),
-            ])
-            await fc.setFiles(localPath)
-            await page.waitForTimeout(2000)
-            uploadOk = true
-            logger.info({ slug }, "[Questions/v2] uploaded fresh doc")
+          // Setting the file on the input directly is more reliable than
+          // racing a filechooser off a button click, and it works on both
+          // shapes of this route. Keep the button path as the fallback.
+          const fileInput = await page.$('input[type="file"]')
+          if (fileInput) {
+            await (fileInput as any).setInputFiles(uploadPath)
+          } else {
+            const uploadBtn = await page.$(
+              'button:has-text("UPLOAD NEW DOCUMENT")',
+            )
+            if (uploadBtn) {
+              const [fc] = await Promise.all([
+                page.waitForEvent("filechooser", { timeout: 8_000 }),
+                (uploadBtn as any).click(),
+              ])
+              await fc.setFiles(uploadPath)
+            }
+          }
+          if (fileInput || (await page.$('button:has-text("UPLOAD NEW DOCUMENT")'))) {
+            // SureLC answers the upload asynchronously and says so in the
+            // page, not in the DOM we just touched: a rejected file leaves
+            // a "Could not upload file" toast and CREATE disabled. The old
+            // code set uploadOk the instant setFiles resolved, so a
+            // refused upload was logged as a success and the run carried
+            // on to press a dead CREATE.
+            uploadOk = await confirmUploadAccepted(page, logger, slug)
+            if (uploadOk) logger.info({ slug }, "[Questions/v2] uploaded fresh doc")
           }
         }
       } catch (err: any) {
@@ -2159,6 +2346,13 @@ async function fillQuestionsV2(
     // in unsaved state and SureLC discards the upload on navigation.
     // Verified Gurira wasBankrupt 2026-05-29: only the full pointer
     // sequence persists server-side (validation drops to 0).
+    //
+    // A DISABLED MatButton swallows the whole sequence, so "we dispatched
+    // the events" says nothing about whether anything was saved. SureLC
+    // keeps CREATE disabled until the form is complete and names what is
+    // missing on the page; read that instead of assuming, or a card that
+    // still demands an explanation gets counted as saved (Carlos Murray
+    // Sr's probation card, 2026-09-11).
     const createOk = await page
       .evaluate(() => {
         const cb = Array.from(document.querySelectorAll("button")).find(
@@ -2166,8 +2360,20 @@ async function fillQuestionsV2(
             b.textContent?.trim() === "CREATE" &&
             (b as HTMLElement).offsetWidth > 0 &&
             !/EXPLANATION/i.test(b.textContent || ""),
-        )
-        if (!cb) return false
+        ) as HTMLButtonElement | undefined
+        if (!cb) return { clicked: false, reason: "CREATE button not found / not visible" }
+        if (cb.disabled) {
+          const complaints = Array.from(
+            document.querySelectorAll("mat-error, .mat-error, [class*='error']"),
+          )
+            .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
+            .filter(Boolean)
+          return {
+            clicked: false,
+            reason: "CREATE still disabled — SureLC does not consider this form complete",
+            complaints: Array.from(new Set(complaints)).slice(0, 4),
+          }
+        }
         ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
           (t) =>
             cb.dispatchEvent(
@@ -2179,15 +2385,18 @@ async function fillQuestionsV2(
               }),
             ),
         )
-        return true
+        return { clicked: true }
       })
-      .catch(() => false)
-    if (createOk) {
+      .catch(() => ({ clicked: false, reason: "CREATE probe threw" }))
+    if (createOk.clicked) {
       await page.waitForTimeout(2500)
       saved++
       logger.info({ slug }, "[Questions/v2] CREATE pointer-sequence dispatched")
     } else {
-      logger.warn({ slug }, "[Questions/v2] CREATE button not found / not visible")
+      logger.warn(
+        { slug, reason: (createOk as any).reason, complaints: (createOk as any).complaints },
+        "[Questions/v2] explanation NOT saved",
+      )
     }
   }
   logger.info(
