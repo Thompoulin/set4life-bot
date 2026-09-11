@@ -1878,10 +1878,17 @@ async function fillQuestionsV2(
     logger.info("[Questions/v2] no surelcAnswers — nothing to fill")
     return { ok: true, alreadyDone: true }
   }
-  // Wait for the new layout to render fully
+  // Wait for the new layout to render fully. The selector resolving is
+  // not the list being built: Angular paints the top-level questions
+  // first and the umbrella's eight children a beat later, so an
+  // inventory taken at first paint contains no sub-question at all — and
+  // the No pass below then silently corrects nothing. That is how 1b and
+  // 1d stayed Yes on Carlos Murray Sr through a run that reported
+  // success, while a slower run the same night fixed both.
   await page
     .waitForSelector("sb-question", { timeout: 10_000 })
     .catch(() => undefined)
+  await waitForQuestionListToSettle(page)
   // Inventory which slugs are on-screen (text → slug map). We don't
   // keep ElementHandles because each ADD EXPLANATION click navigates
   // to a new route, invalidating prior handles → "Target page, context
