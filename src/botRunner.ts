@@ -109,6 +109,11 @@ export interface RunActivationResult {
       contracting?: {
         submitted: string[]
         failed: Array<{ carrier: string; reason: string }>
+        // Fastlane path only — see admin/fastlaneResult.ts.
+        skipped?: boolean
+        skipReason?: string
+        added?: string[]
+        notFound?: string[]
       }
     }
     rep_review?: {
@@ -664,18 +669,22 @@ export async function runActivation(
               producerId,
               selectedCarriers,
             })
-            adminPhase.contracting = {
-              submitted: r.ok ? ["all-via-fastlane"] : [],
-              failed: r.ok
-                ? []
-                : [{ carrier: "(fastlane)", reason: r.reason || "Fastlane failed" }],
-            }
+            // Carries Fastlane's skip + added/notFound through, so an ok run
+            // that filed nothing no longer reads as "all carriers submitted".
+            const { contractingFromFastlane } = await import(
+              "./admin/fastlaneResult.js"
+            )
+            adminPhase.contracting = contractingFromFastlane(r)
             if (!r.ok) adminPhase.ok = false
             await finishContracting({
               ok: r.ok,
-              msg: r.ok
-                ? `Fastlane submitted (one-producer/many-carriers)`
-                : r.reason || `Fastlane failed`,
+              msg: !r.ok
+                ? r.reason || `Fastlane failed`
+                : r.skipped
+                  ? r.reason || `Skipped Fastlane — nothing it offers was left to submit`
+                  : adminPhase.contracting.submitted.length === 0
+                    ? `Fastlane: nothing new to submit — no carrier was added`
+                    : `Fastlane submitted (one-producer/many-carriers)`,
             })
 
             // Post-Fastlane self-clean. Fastlane creates a fresh

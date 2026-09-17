@@ -649,6 +649,10 @@ export async function runFastlaneOneProducerManyCarriers(
   // row for each selected carrier and click ITS ADD. Unselected
   // carriers stay in the available column and are never contracted.
   const selected = input.selectedCarriers ?? []
+  // Hoisted so every later return can report what was actually added — the
+  // backoffice used to be told "all-via-fastlane" for runs that added nothing.
+  const added: string[] = []
+  const notFound: string[] = []
   if (selected.length === 0) {
     // Fail-safe: never fall back to ADD ALL. Adding none is strictly
     // safer than adding every carrier — a missing/empty selection is a
@@ -665,8 +669,6 @@ export async function runFastlaneOneProducerManyCarriers(
       { wanted },
       `[Fastlane] adding ONLY ${wanted.length} selected carrier(s) (no ADD ALL)`,
     )
-    const added: string[] = []
-    const notFound: string[] = []
     for (const c of selected) {
       const name = (c.carrierName || "").trim()
       if (!name) continue
@@ -749,6 +751,7 @@ export async function runFastlaneOneProducerManyCarriers(
           skipped: true,
           skipReason: `Fastlane does not offer: ${unavailable.join(", ")} — needs manual/alternate contracting`,
           reason: `Skipped Fastlane — carrier(s) not available in BGA Fastlane grid: ${unavailable.join(", ")}`,
+          details: { added, notFound },
         }
       }
 
@@ -1033,11 +1036,12 @@ export async function runFastlaneOneProducerManyCarriers(
   const confirm = await page.$(
     'text=/sent|submitted|requested|created|success/i',
   )
-  if (confirm) return { ok: true }
+  if (confirm) return { ok: true, details: { added, notFound } }
 
   return {
     ok: true,
     reason: "Submitted but no explicit confirmation marker matched; check evidence screenshots",
+    details: { added, notFound },
   }
 }
 
