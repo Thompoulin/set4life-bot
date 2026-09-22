@@ -1496,6 +1496,50 @@ async function reviewOneCarrier(
     "[Rep step5] questionnaire answered from disclosures",
   )
 
+  // Unreadable-question guard — we cannot answer what we could not read.
+  //
+  // 2026-09-22, Carlos Murray Sr on American Amicable: nine of that
+  // carrier's step-4 questions came back with the label "Yes", because
+  // the label selector had fallen through to the first radio button's own
+  // text. pickYnForLabel matches nothing against "Yes", returns its "N"
+  // default, and the fill loop clicked No on all nine — compliance
+  // questions answered without being read. Nothing failed; nothing was
+  // logged as wrong. The only reason it surfaced at all is that this rep
+  // has a true felony disclosure, so the compliance guard below noticed
+  // it had been placed nowhere. A rep with a clean record would have had
+  // nine blind answers signed and filed, and we would never have known.
+  //
+  // Ana, from the SureLC side the same afternoon: "I wonder would it be
+  // one of those issues where a Yes is on our end but on SureLC the same
+  // question has not transferred correctly and it is a No on SureLC."
+  // That is exactly what it was.
+  //
+  // The selector is fixed above. This guard exists because the selector
+  // being right is not something we can keep verifying from the outside —
+  // this is the backstop that turns a silent wrong answer into a refusal.
+  {
+    const unreadable = [
+      ...step4Filled.unreadableQuestions,
+      ...step5Filled.unreadableQuestions,
+    ]
+    if (unreadable.length > 0) {
+      await snapshot(ctx, `rep-carrier${idx}-unreadable-questions`)
+      logger.warn(
+        { idx, unreadable },
+        "[Rep] question text unreadable — routing to human, not signing",
+      )
+      return {
+        ok: false,
+        reason:
+          `Could not read the text of ${unreadable.length} question(s) on this ` +
+          `carrier's wizard (radio groups: ${unreadable.slice(0, 8).join(", ")}). ` +
+          `The bot will not answer a compliance question it cannot read — the ` +
+          `default is "No", which would be a statement we never checked. A human ` +
+          `must complete this carrier's questionnaire. Do NOT auto-sign.`,
+      }
+    }
+  }
+
   // Carrier-question guard — a carrier-specific question we hold no answer
   // for must NEVER be auto-filled. pickYnForLabel's default is "N", so
   // without this the bot would tell NLG the rep is not a legal resident of
@@ -2299,6 +2343,11 @@ async function fillRadiosByLabelLookup(
   /** Required carrier-specific questions we hold NO answer for. Non-empty
    *  means the caller must refuse to sign — see the guard in repReview. */
   unansweredCarrierQuestions: string[]
+  /**
+   * Questions whose TEXT we could not read off the page. Answering one is
+   * answering blind, so the caller refuses to sign instead.
+   */
+  unreadableQuestions: string[]
 }> {
   const yesValue = scheme === "yn" ? "Y" : "true"
   const noValue = scheme === "yn" ? "N" : "false"
@@ -2334,11 +2383,36 @@ async function fillRadiosByLabelLookup(
       // pull its label text.
       const container =
         g.closest("sb-question, .wrap, mat-form-field, mat-card") || g.parentElement
-      const labelEl =
-        container?.querySelector(
+      // A bare `label` as the last fallback is a TRAP: every
+      // mat-radio-button carries its own <label> reading "Yes" / "No",
+      // so when a step's markup has no .question__text and no mat-label,
+      // querySelector("label") returns the FIRST RADIO'S OWN LABEL and
+      // the question text is silently replaced by the word "Yes".
+      //
+      // That is not hypothetical. American Amicable's step 4 — which the
+      // comment further down correctly notes "put[s] the felony /
+      // securities / sanction questions on step 4 with true/false
+      // radios" — returned NINE labels reading exactly "Yes" for Carlos
+      // Murray Sr on 2026-09-22. pickYnForLabel matches nothing against
+      // the word "Yes", returns its "N" default, and the loop below then
+      // CLICKS No. Nine compliance questions answered without ever being
+      // read. Ana saw the result from the other side and called it: "a
+      // Yes is on our end but on SureLC the same question ... is a No".
+      //
+      // So: never accept a radio's own label as the question. Skip any
+      // candidate inside a mat-radio-button, and fall back to the
+      // container's own text with the radio-group's text removed.
+      const labelEl = Array.from(
+        container?.querySelectorAll(
           ".question__text, label.question__text, mat-label, label",
-        )
-      const label = (labelEl?.textContent || "").trim().slice(0, 300)
+        ) ?? [],
+      ).find((el) => !el.closest("mat-radio-button"))
+      let label = (labelEl?.textContent || "").trim().slice(0, 300)
+      if (!label && container) {
+        const full = (container.textContent || "").trim()
+        const radios = (g.textContent || "").trim()
+        label = full.replace(radios, "").replace(/\s+/g, " ").trim().slice(0, 300)
+      }
       const values = Array.from(
         g.querySelectorAll('input[type="radio"]'),
       ).map((i) => (i as HTMLInputElement).value)
@@ -2354,11 +2428,30 @@ async function fillRadiosByLabelLookup(
   // catch a disclosure that matched no on-screen question.
   const placed = new Set<string>()
   const unansweredCarrierQuestions: string[] = []
+  const unreadableQuestions: string[] = []
   for (const { name, label, values } of groups) {
     // Record a required carrier-specific question we cannot answer BEFORE
     // filling anything — pickYnForLabel would otherwise write "N", which on
     // e.g. "Are you a legal resident of the United States?" is a false
     // statement about the rep.
+    // A question we could not READ must never be answered. The label
+    // selector above is now careful, but markup changes and the failure
+    // is invisible from the outside: pickYnForLabel's default is "N", so
+    // an unread question becomes a confident "No" on a compliance form
+    // and nothing anywhere reports a problem. This is the same doctrine
+    // as the carrier-question guard below ("the bot will not guess on a
+    // carrier form"), applied one step earlier — to whether we even know
+    // what is being asked.
+    //
+    // "Yes"/"No"/"True"/"False" are named explicitly because that is the
+    // exact shape of the 2026-09-22 failure: the label had silently
+    // become the first radio's own text.
+    const looksUnread =
+      !label || /^(yes|no|true|false)$/i.test(label.replace(/[\s*]+/g, ""))
+    if (looksUnread) {
+      unreadableQuestions.push(name)
+      continue
+    }
     const cqMatch = carrierQuestionForLabel(label, carrierAnswers)
     if (cqMatch && cqMatch.required && !cqMatch.answer) {
       unansweredCarrierQuestions.push(`${cqMatch.slug}: ${label.slice(0, 90)}`)
@@ -2450,6 +2543,7 @@ async function fillRadiosByLabelLookup(
     no,
     placedKeys: [...placed],
     unansweredCarrierQuestions,
+    unreadableQuestions,
     // Raw question labels seen on this step — surfaced so the caller can
     // log exactly how a carrier worded a question that matched no
     // disclosure pattern (e.g. an IRS/tax question phrased outside the
