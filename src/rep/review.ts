@@ -2846,15 +2846,36 @@ async function waitForPdfViewer(page: Page, maxRetries = 2): Promise<boolean> {
         if (!m) continue
         const r = +m[1], g = +m[2], b = +m[3]
         if (r < 140 || g > 110 || b > 110) continue // not red
-        if (seenText.has(text)) continue
-        seenText.add(text)
-        // Get parent label for context
-        const parent = node.parentElement
-        const parentText = parent
-          ? (parent.innerText || "").replace(/\s+/g, " ").trim().slice(0, 120)
-          : ""
+        // SureLC marks each missing requirement with the SAME red Material
+        // icon (the ligature "report"), and the requirement's text beside it
+        // is not red. Deduping by text kept only the first icon — the legend
+        // line "Red notices indicate what is required…" — so the welcome-step
+        // block on Carlos Murray Sr's American Amicable request (2026-09-22,
+        // two runs) never said WHICH requirement. For an icon, climb to the
+        // nearest ancestor that carries real text and dedupe on that row.
+        const isIcon = /^[a-z_]{2,24}$/.test(text)
+        let parentText = ""
+        if (isIcon) {
+          let up = node.parentElement
+          while (up && up !== document.body) {
+            const t = (up.innerText || "").replace(/\s+/g, " ").trim()
+            if (t.length > text.length + 8) {
+              parentText = t.slice(0, 200)
+              break
+            }
+            up = up.parentElement
+          }
+        } else {
+          const parent = node.parentElement
+          parentText = parent
+            ? (parent.innerText || "").replace(/\s+/g, " ").trim().slice(0, 120)
+            : ""
+        }
+        const key = isIcon ? `icon:${parentText}` : text
+        if (seenText.has(key)) continue
+        seenText.add(key)
         redByColor.push({ text: text.slice(0, 80), parentText, color })
-        if (redByColor.length >= 12) break
+        if (redByColor.length >= 20) break
       }
       return {
         redByColor,
