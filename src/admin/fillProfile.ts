@@ -35,6 +35,7 @@ import {
   type TabContext,
   type TabResult,
 } from "../tabs/helpers.js"
+import { decideSignatureAction, SIGNATURE_NOT_OURS } from "./signatureDecision.js"
 
 export interface ProfileFillInput {
   producerId: string
@@ -152,12 +153,18 @@ export interface ProfileFillInput {
      */
     signatureAuthPdfUrl?: string
     /**
-     * When true, click REMOVE on an existing signature before
-     * uploading fresh. Used by force-run paths to recover producers
-     * whose stale signature blocks Fastlane ("N issues"). Without
-     * this, the REMOVE+EDIT detector below returns alreadyDone=true.
+     * Force-run paths: push our signature even when the backoffice says
+     * the one on file is ours. Never REMOVEs (see signatureDecision.ts).
      */
     forceReupload?: boolean
+    /**
+     * The backoffice recorded this signature as one it pushed (formId +
+     * the same source file). Only then does a signature on file count as
+     * done; anything else is overwritten before contracts are signed.
+     */
+    existingIsOurs?: boolean
+    /** formId of our last push, for the log line. */
+    knownFormId?: string
   }
   /** Per-question explanation texts, keyed by SureLC question slug. */
   explanations?: Record<string, string>
@@ -4274,32 +4281,27 @@ async function fillSignature(
   if (!fileUrl) {
     return { ok: false, reason: "no signatureAuthPdf or signatureImage on file" }
   }
-  const isPdf = fileUrl === input?.signatureAuthPdfUrl
 
   await goToTab(page, producerId, "signature", ctx.logger)
   await snapshot(ctx, "tab-signature-01-before")
 
-  if (await isTabGreen(page, "Signature")) {
-    return { ok: true, alreadyDone: true }
-  }
+  // A green tab used to return alreadyDone right here. It only proves
+  // SOME signature is on file — see signatureDecision.ts for the rep whose
+  // contracts went out under another agency's signature that way.
+  const tabGreen = await isTabGreen(page, "Signature")
 
-  // Content-presence "already done" detector: when a signature is on
-  // file AND cropper-confirmed, SureLC renders a "Signature
-  // Authorization" header card with the confirmation date. Only treat
-  // the DATED line as definitive evidence of a complete signature.
+  // Content-presence detector: when a signature is on file AND
+  // cropper-confirmed, SureLC renders a "Signature Authorization" header
+  // card with the confirmation date. Only the DATED line is definitive.
   //
   // 2026-05-27: the looser `REMOVE + EDIT + Signature Image` clause
-  // matched signatures that had been uploaded via /uploadForm but
-  // never reached cropper-confirmed state (confirmImage failed or was
-  // skipped on a prior run). Bot reported alreadyDone, Fastlane saw
-  // the producer as unsignatured, refused to expose the SELECT button,
-  // and the activationPipeline fastlane_fallback_direct_post fired,
-  // creating orphan BGA-stage requests with producerEmailUsed=null
-  // (Javier Castro, Shingai Gurira, Doriz Lopez, Demetrius Early Jr).
-  // Forcing the API push (uploadForm + confirmImage) when only the
-  // loose pattern is present is safe — pushSignatureViaApi overwrites
-  // idempotently and the REMOVE-then-reupload fallback handles the
-  // rare case where overwrite fails.
+  // matched signatures that had been uploaded via /uploadForm but never
+  // reached cropper-confirmed state. Bot reported alreadyDone, Fastlane
+  // saw the producer as unsignatured, refused to expose SELECT, and the
+  // activationPipeline fastlane_fallback_direct_post created orphan
+  // BGA-stage requests (Javier Castro, Shingai Gurira, Doriz Lopez,
+  // Demetrius Early Jr). That state is treated as nothing on file: the
+  // API push below overwrites it idempotently.
   const sigText = await page
     .$$eval("body", (els) => (els[0]?.innerText || ""))
     .catch(() => "")
@@ -4308,200 +4310,89 @@ async function fillSignature(
   )
   const hasLooseRemoveEdit =
     /REMOVE/.test(sigText) && /EDIT/.test(sigText) && /Signature Image/i.test(sigText)
-  const hasUploaded = hasDatedAuthorization
-  if (!hasUploaded && hasLooseRemoveEdit) {
-    // Partial-upload state: signature exists in DOM (REMOVE+EDIT
-    // buttons visible) but never reached cropper-confirmed (no dated
-    // header). Don't skip — fall through to the API push at the end
-    // of this function which overwrites idempotently via uploadForm +
-    // confirmImage. This is the codepath the 2026-05-27 Javier/Shingai/
-    // Doriz/Demetrius cohort needed.
+  const hasSignatureOnFile = tabGreen || hasDatedAuthorization
+  if (!hasSignatureOnFile && hasLooseRemoveEdit) {
     logger.warn(
       { excerpt: sigText.slice(0, 200) },
       "[Signature] partial upload detected (REMOVE/EDIT visible, no dated Signature Authorization) — forcing API push to confirm",
     )
   }
-  if (hasUploaded) {
-    if (!input?.forceReupload) {
-      logger.info({ excerpt: sigText.slice(0, 200) }, "[Signature] already uploaded (dated Signature Authorization visible) — skipping")
-      return { ok: true, alreadyDone: true, details: { detected: "datedAuthorization" } }
-    }
-    // forceReupload=true: try the API push FIRST — it overwrites the
-    // existing signature without any UI manipulation, so we never end
-    // up with an erased-but-not-replaced signature. 2026-05-27
-    // incident: nightly retry sweep ran with force=true → REMOVE
-    // succeeded → API push threw on missing `sharp` package → 14
-    // producers lost their signature flags they previously had.
-    // Order: API push first, REMOVE only if it fails.
-    if (input?.signatureImageUrl) {
-      try {
-        const overwriteResult = await pushSignatureViaApi(
-          page,
-          producerId,
-          fileUrl,
-          input.signatureImageUrl,
-          logger,
-        )
-        if (overwriteResult.ok) {
-          await snapshot(ctx, "tab-signature-02-api-overwrite")
-          logger.info(
-            { formId: overwriteResult.formId },
-            "[Signature] API push overwrote existing signature without REMOVE",
-          )
-          return {
-            ok: true,
-            details: {
-              autoSaved: true,
-              warningCleared: true,
-              viaApi: true,
-              viaOverwrite: true,
-              formId: overwriteResult.formId,
-            },
-          }
-        }
-        logger.warn(
-          { reason: overwriteResult.reason },
-          "[Signature] API overwrite failed; preserving existing signature (skipping REMOVE)",
-        )
-        // Maria Lugo 2026-05-28 regression: REMOVE succeeded then UI
-        // re-upload failed, leaving the producer with NO signature on
-        // SureLC ("Missing Signature Authorization" validation). The
-        // REMOVE-then-fail-to-reupload window is non-recoverable
-        // automatically and forces an admin to re-sign via the
-        // dashboard. Safer: keep the existing signature (which was
-        // valid enough that REMOVE+re-upload would have re-attached
-        // the same file) and return with a clear reason so the
-        // orchestrator can flag for retry / admin attention without
-        // having corrupted the producer's state.
-        return {
-          ok: false,
-          reason: `API push failed (${overwriteResult.reason}); kept existing signature to avoid REMOVE-without-reupload regression`,
-        }
-      } catch (err: any) {
-        logger.warn(
-          { err: err?.message },
-          "[Signature] API overwrite threw; preserving existing signature (skipping REMOVE)",
-        )
-        return {
-          ok: false,
-          reason: `API push threw (${err?.message}); kept existing signature to avoid REMOVE-without-reupload regression`,
-        }
-      }
-    }
-    logger.info("[Signature] forceReupload=true; clicking REMOVE to clear existing signature")
-    const removeBtn =
-      (await page.$('button:has-text("REMOVE")')) ||
-      (await page.$('button:has-text("Remove")'))
-    if (!removeBtn) {
-      return {
-        ok: false,
-        reason: "forceReupload=true but REMOVE button not found",
-      }
-    }
-    await removeBtn.click().catch(() => undefined)
+  const detected = hasDatedAuthorization ? "datedAuthorization" : tabGreen ? "greenTab" : undefined
 
-    // SureLC pops a Material confirm dialog (<mat-dialog-container>
-    // with YES / NO or CONFIRM / CANCEL buttons), NOT a browser-
-    // native window.confirm — so page.on("dialog", ...) does NOT
-    // fire. Wait for the dialog, then click the affirm button.
-    try {
-      await page.waitForSelector(
-        'mat-dialog-container, [role="dialog"]',
-        { timeout: 8_000 },
-      )
-      const affirm =
-        (await page.$('mat-dialog-container button:has-text("YES")')) ||
-        (await page.$('mat-dialog-container button:has-text("Yes")')) ||
-        (await page.$('mat-dialog-container button:has-text("CONFIRM")')) ||
-        (await page.$('mat-dialog-container button:has-text("Confirm")')) ||
-        (await page.$('mat-dialog-container button:has-text("OK")')) ||
-        (await page.$('mat-dialog-container button:has-text("Ok")')) ||
-        (await page.$('mat-dialog-container button:has-text("REMOVE")')) ||
-        (await page.$('mat-dialog-container button:has-text("Remove")')) ||
-        (await page.$('mat-dialog-container button:has-text("DELETE")')) ||
-        (await page.$('[role="dialog"] button.mat-primary')) ||
-        (await page.$('[role="dialog"] button.mat-mdc-button-base'))
-      if (!affirm) {
-        // No recognizable affirm button — log what the dialog says so
-        // we can tune the selector list. Snapshot for forensic
-        // evidence.
-        const dialogText = await page
-          .$$eval("mat-dialog-container, [role='dialog']", (els) =>
-            els.map((e) => (e.textContent || "").trim()).join(" | "),
-          )
-          .catch(() => "")
-        await snapshot(ctx, "tab-signature-01b-confirm-modal-text")
-        return {
-          ok: false,
-          reason: `REMOVE confirm modal opened but affirm button not found. Modal text: ${dialogText.slice(0, 200)}`,
-        }
-      }
-      await affirm.click().catch(() => undefined)
-      logger.info("[Signature] REMOVE confirm modal — affirm clicked")
-    } catch {
-      // Modal didn't appear within 8s — maybe SureLC removed the
-      // signature without a confirm prompt (older SPA version). Just
-      // continue and let the next waitForSelector validate.
-      logger.info("[Signature] no confirm modal detected — assuming REMOVE took effect without prompt")
-    }
+  const action = decideSignatureAction({
+    hasSignatureOnFile,
+    forceReupload: !!input?.forceReupload,
+    existingIsOurs: input?.existingIsOurs,
+    hasImageUrl: !!input?.signatureImageUrl,
+  })
 
-    // Wait for the SPA to swap back to the choose-method screen.
-    // Accept any of UPLOAD / DRAW / TYPE — post-cutover the page may
-    // default to a different method than UPLOAD IT NOW.
-    try {
-      await page.waitForSelector(
-        [
-          'button:has-text("UPLOAD IT NOW")',
-          'button:has-text("Upload it now")',
-          'button:has-text("Upload")',
-          'button:has-text("DRAW IT NOW")',
-          'button:has-text("TYPE IT NOW")',
-          'input[type="file"]',
-        ].join(", "),
-        { timeout: 20_000 },
-      )
-    } catch {
-      await snapshot(ctx, "tab-signature-01b-remove-stuck")
-      const after = await page
-        .$$eval("body", (els) => (els[0]?.innerText || ""))
-        .catch(() => "")
-      return {
-        ok: false,
-        reason: `REMOVE clicked but choose-method screen never rendered. Page snippet: ${after.slice(0, 200).replace(/\s+/g, " ")}`,
-      }
+  if (action === "skip_ours") {
+    logger.info(
+      { knownFormId: input?.knownFormId, detected },
+      "[Signature] our signature is already on file — skipping",
+    )
+    return {
+      ok: true,
+      alreadyDone: true,
+      details: { detected, signatureOwnership: "ours", formId: input?.knownFormId },
     }
-    await snapshot(ctx, "tab-signature-01c-after-remove")
-    logger.info("[Signature] REMOVE confirmed; proceeding with fresh upload")
   }
 
-  // Full API-only signature flow. Two calls, no UI:
+  if (action === "fail_keep_existing") {
+    // Nothing was touched. With a signature on file that is not known to
+    // be ours, say so in the reason the backoffice keys on — contracts
+    // must not be signed under it.
+    return hasSignatureOnFile
+      ? {
+          ok: false,
+          reason: `${SIGNATURE_NOT_OURS}: a signature is on file but we cannot confirm it is ours, and there is no signatureImageUrl to overwrite it with`,
+          details: { detected, signatureOwnership: "unverified" },
+        }
+      : { ok: false, reason: "no signatureImageUrl on input — cannot push signature" }
+  }
+
+  // api_overwrite / api_push_fresh. Full API-only signature flow, no UI:
   //   1. POST /surecrm/signature/{producerId}/uploadForm (FormData "file"
   //      = the signature-authorization PDF) → returns { uid: formId }
   //   2. PUT /surecrm/signature/{producerId}/{formId}/confirmImage with
   //      { payload: data:image/png;base64,..., width, height } where
   //      payload is the rep's pristine drawn-signature PNG.
-  //
-  // Endpoints discovered 2026-05-26 by grepping chunk-XJF6ZQJI.js (the
-  // signature service module). Verified by clearing all 10 stuck
-  // producers (Perrion 3351482, Emily 8068174, Tonette 11751656, etc.)
-  // via standalone sweep script — validation/list went from
-  // [SIGNATURE:MISSING_SIGNATURE_AUTHORIZATION] to [] after the call.
-  //
-  // Why this works when setInputFiles + cropper doesn't: SureLC's
-  // Angular SPA's file-input change handler has been flaky for 8+ days
-  // (no upload fires from synthetic Playwright file events). Calling the
-  // backing HTTP endpoints directly skips that broken layer entirely.
-  if (!input?.signatureImageUrl) {
-    return { ok: false, reason: "no signatureImageUrl on input — cannot push signature" }
-  }
+  // It replaces an existing signature in place, so an overwrite never
+  // passes through a no-signature state. Endpoints discovered 2026-05-26
+  // from chunk-XJF6ZQJI.js; the SPA's own file-input handler is flaky
+  // under synthetic Playwright events, which is why we skip the UI.
+  const overwriting = action === "api_overwrite"
+  const failed = (why: string): TabResult =>
+    overwriting
+      ? {
+          ok: false,
+          reason: `${SIGNATURE_NOT_OURS}: API overwrite failed (${why}); kept the existing signature and did not REMOVE it`,
+          details: { detected, signatureOwnership: "unverified" },
+        }
+      : { ok: false, reason: `API push failed: ${why}` }
   try {
-    const result = await pushSignatureViaApi(page, producerId, fileUrl, input.signatureImageUrl, logger)
-    await snapshot(ctx, "tab-signature-03-api-pushed")
-    if (!result.ok) return { ok: false, reason: result.reason || "API push failed" }
-    return { ok: true, details: { autoSaved: true, warningCleared: true, viaApi: true, formId: result.formId } }
+    const result = await pushSignatureViaApi(page, producerId, fileUrl, input!.signatureImageUrl!, logger)
+    await snapshot(ctx, overwriting ? "tab-signature-02-api-overwrite" : "tab-signature-03-api-pushed")
+    if (!result.ok) {
+      logger.warn({ reason: result.reason, overwriting }, "[Signature] API push failed; existing signature kept")
+      return failed(result.reason || "unknown")
+    }
+    logger.info({ formId: result.formId, overwriting, detected }, "[Signature] our signature pushed via API")
+    return {
+      ok: true,
+      details: {
+        autoSaved: true,
+        warningCleared: true,
+        viaApi: true,
+        ...(overwriting ? { viaOverwrite: true } : {}),
+        formId: result.formId,
+        detected,
+        signatureOwnership: overwriting ? "overwritten" : "ours",
+      },
+    }
   } catch (err: any) {
-    logger.error({ err: err?.message }, "[Signature] API push threw")
-    return { ok: false, reason: `API push threw: ${err?.message || err}` }
+    logger.error({ err: err?.message, overwriting }, "[Signature] API push threw")
+    return failed(`threw: ${err?.message || err}`)
   }
 }
 
@@ -4526,7 +4417,7 @@ async function fillSignature(
  * page load (same pattern as bgaTokenCapture). We poll for it after the
  * navigation in case it lands a few hundred ms after the page settles.
  */
-async function pushSignatureViaApi(
+export async function pushSignatureViaApi(
   page: import("playwright").Page,
   producerId: string,
   pdfUrl: string,

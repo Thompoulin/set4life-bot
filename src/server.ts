@@ -162,12 +162,16 @@ const profileSchema = z.object({
       // agents.signatureAuthPdfUrl. fillSignature.ts prefers this
       // over the bare image and crops the signature out of it.
       signatureAuthPdfUrl: z.string().url().optional(),
-      // When true, click REMOVE on an existing signature before
-      // uploading fresh. Without this, the bot's "REMOVE+EDIT
-      // visible → already-done" heuristic strands producers with
-      // a stale/broken signature that Fastlane refuses ("N issues").
-      // Set by the main app's activationPipeline when input.force===true.
+      // Push our signature even when the main app says the one on file
+      // is ours. Never REMOVEs. Set by the main app's activationPipeline
+      // when input.force===true.
       forceReupload: z.boolean().optional(),
+      // The main app recorded the signature on file as one it pushed.
+      // Without it a signature on file is overwritten with ours before
+      // anything is signed (src/admin/signatureDecision.ts). zod strips
+      // unknown keys, so these must be declared here to reach the bot.
+      existingIsOurs: z.boolean().optional(),
+      knownFormId: z.string().optional(),
     })
     .optional(),
 })
@@ -1351,6 +1355,80 @@ app.post("/set-producer-fields", async (req, res) => {
   } catch (err: any) {
     logger.error({ err: err?.message }, "/set-producer-fields threw")
     return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  }
+})
+
+/**
+ * POST /ensure-signature
+ *
+ * Put OUR signature on the SureLC producer profile, overwriting whatever
+ * is there, through the same no-REMOVE API push the Signature tab uses.
+ * The main app calls this before Phase B signs any carrier contract for a
+ * rep whose signature on file it has not recorded as its own — SureLC's
+ * profile is shared across agencies, and a rep who was on SureLC before us
+ * arrives with their own signature on it (2026-09-23, Vicente Maestre: his
+ * contracts went out under a signature that did not match our Signature
+ * Authorization, and the carrier bounced them).
+ *
+ * Body: { producerId, adminCreds, signatureAuthPdfUrl?, signatureImageUrl }
+ * Returns: { ok, formId } or { ok:false, reason }. On failure nothing was
+ * removed — the existing signature is still on file.
+ */
+const ensureSignatureSchema = z.object({
+  producerId: z.string().min(1),
+  adminCreds: adminCredsSchema,
+  signatureAuthPdfUrl: z.string().url().optional(),
+  signatureImageUrl: z.string().url(),
+})
+app.post("/ensure-signature", async (req, res) => {
+  const auth = req.headers.authorization || ""
+  if (!BEARER || auth !== `Bearer ${BEARER}`) {
+    return res.status(401).json({ error: "unauthorized" })
+  }
+  const parsed = ensureSignatureSchema.safeParse(req.body)
+  if (!parsed.success) {
+    return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
+  }
+  const { producerId, adminCreds, signatureAuthPdfUrl, signatureImageUrl } = parsed.data
+  try {
+    const { pushSignatureViaApi } = await import("./admin/fillProfile.js")
+    const browser = await launchChromium(logger)
+    try {
+      const { page, loginResult: lr } = await getAuthenticatedPage(
+        browser,
+        adminCreds,
+        logger,
+        { contextOptions: { viewport: { width: 1280, height: 900 } } },
+      )
+      if (lr && !lr.ok) {
+        return res.status(502).json({ ok: false, reason: lr.reason || "admin login failed" })
+      }
+      // Land on the producer's signature tab so the SPA has minted its
+      // Bearer before pushSignatureViaApi goes looking for it.
+      await page.evaluate((id) => {
+        history.pushState({}, "", `/bga/producers/${id}/signature`)
+        window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+      }, producerId).catch(() => undefined)
+      await page.waitForTimeout(1_500)
+      const r = await pushSignatureViaApi(
+        page,
+        producerId,
+        signatureAuthPdfUrl || signatureImageUrl,
+        signatureImageUrl,
+        logger,
+      )
+      if (!r.ok) {
+        logger.warn({ producerId, reason: r.reason }, "[ensure-signature] push failed; existing signature kept")
+        return res.status(502).json({ ok: false, reason: r.reason || "push failed" })
+      }
+      logger.info({ producerId, formId: r.formId }, "[ensure-signature] our signature is on file")
+      return res.json({ ok: true, formId: r.formId != null ? String(r.formId) : undefined })
+    } finally {
+      await browser.close().catch(() => undefined)
+    }
+  } catch (err: any) {
+    logger.error({ err: err?.message }, "/ensure-signature threw")
+    return res.status(500).json({ ok: false, reason: err?.message || "bot crashed" })
   }
 })
 

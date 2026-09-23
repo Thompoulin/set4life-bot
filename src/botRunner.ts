@@ -44,6 +44,7 @@ import {
 } from "./admin/createRequest.js"
 import type { AdminReviewInput } from "./admin/processReview.js"
 import { repReview, type RepReviewInput } from "./rep/review.js"
+import { signatureBlocksSigning } from "./admin/signatureDecision.js"
 import { CHROMIUM_ARGS, launchChromium } from "./browserArgs.js"
 import { makeTabContext, type TabResult } from "./tabs/helpers.js"
 import { makeProgressReporter } from "./progressReporter.js"
@@ -881,7 +882,27 @@ export async function runActivation(
     }
 
     // ── PHASE B — Rep review ──────────────────────────────────────
-    if (phases.has("rep_review") && input.repReview) {
+    // Never sign carrier contracts under a signature that is not ours
+    // (src/admin/signatureDecision.ts — Vicente Maestre, 2026-09-23).
+    const signingBlocked = signatureBlocksSigning(result.phases.admin_setup?.profile)
+    if (phases.has("rep_review") && input.repReview && signingBlocked) {
+      result.phases.rep_review = {
+        ok: false,
+        signed: 0,
+        failed: [{ reason: signingBlocked }],
+        skipped: [],
+      }
+      result.success = false
+      result.stage = "rep_review_failed"
+      result.needsHumanReason = [result.needsHumanReason, `signing held: ${signingBlocked}`]
+        .filter(Boolean)
+        .join(" | ")
+      await progress.report({
+        step: "phaseB_blocked_signature",
+        status: "failed",
+        message: `Did not sign any carrier — our signature is not confirmed on SureLC: ${signingBlocked}`,
+      })
+    } else if (phases.has("rep_review") && input.repReview) {
       const finishRep = await progress.startStep(
         "phaseB_rep_review",
         "Rep auth (last 6 SSN + DOB) + signing each carrier",
