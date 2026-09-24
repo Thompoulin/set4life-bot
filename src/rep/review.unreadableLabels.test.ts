@@ -52,7 +52,8 @@ console.log("unreadable-label guard:")
 // ── 1. The label is never a radio's own text ────────────────────────────
 check(
   "label candidates exclude anything inside a mat-radio-button",
-  /\.find\(\(el\) => !el\.closest\("mat-radio-button"\)\)/.test(SRC),
+  /\.find\(\(el\) => !el\.closest\("mat-radio-button"\)\)/.test(SRC) ||
+    /if \(el\.closest\("mat-radio-button"\)\) return false/.test(SRC),
   'the bare `label` fallback is what produced nine questions named "Yes"',
 )
 

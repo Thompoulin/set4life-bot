@@ -2451,11 +2451,31 @@ async function fillRadiosByLabelLookup(
       // So: never accept a radio's own label as the question. Skip any
       // candidate inside a mat-radio-button, and fall back to the
       // container's own text with the radio-group's text removed.
-      const labelEl = Array.from(
-        container?.querySelectorAll(
-          ".question__text, label.question__text, mat-label, label",
-        ) ?? [],
-      ).find((el) => !el.closest("mat-radio-button"))
+      //
+      // Same trap, second shape (Carlos Murray Sr, AmAm, 2026-09-24): once
+      // the felony answer's explanation is added, the card grows its own
+      // form fields — a "Description" mat-label, "Conviction Date/County/
+      // State" — inside the SAME container, and in document order they can
+      // come before the question. On the retry pass the felony question was
+      // read as "Description", matched no disclosure, and the placed-guard
+      // (correctly) refused to sign. So: prefer the question's own text
+      // class first, skip anything inside the explanation card or an input
+      // field, and never accept a bare field caption as the question.
+      const FIELD_CAPTION =
+        /^(description|attachments?|explanations?|conviction (date|county|state)|occurrence date)\*?$/i
+      const usable = (el: Element) => {
+        if (el.closest("mat-radio-button")) return false
+        if (el.closest("sb-info-message, sb-date-input, mat-dialog-container")) return false
+        const ff = el.closest("mat-form-field")
+        if (ff && !ff.querySelector("mat-radio-group")) return false
+        const t = (el.textContent || "").replace(/\s+/g, " ").trim()
+        return !!t && !FIELD_CAPTION.test(t)
+      }
+      let labelEl: Element | undefined
+      for (const sel of [".question__text", "label.question__text", "mat-label", "label"]) {
+        labelEl = Array.from(container?.querySelectorAll(sel) ?? []).find(usable)
+        if (labelEl) break
+      }
       let label = (labelEl?.textContent || "").trim().slice(0, 300)
       if (!label && container) {
         const full = (container.textContent || "").trim()

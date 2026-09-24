@@ -80,3 +80,19 @@ console.log("\nall passed")
   }
   console.log("ok   questionnaire asks to confirm → NEXT pressed again (max 2)")
 }
+
+// ── Question label is never a field caption (Carlos Sr retry, 2026-09-24) ──
+{
+  const { readFileSync } = await import("node:fs")
+  const src = readFileSync(new URL("./review.ts", import.meta.url), "utf8")
+  const m = src.match(/const FIELD_CAPTION =\s*\n?\s*(\/.*\/i)/)
+  if (!m) { console.error("FAIL label guard: FIELD_CAPTION missing"); process.exit(1) }
+  const re = eval(m[1]) as RegExp
+  const bad = ["Description", "Attachments", "Conviction Date", "Conviction County*", "Conviction State"]
+  const good = ["Have you ever been convicted of a misdemeanor (other than a minor traffic offense), a felony or violation of 18 USC 1033?"]
+  const ok = bad.every((t) => re.test(t)) && good.every((t) => !re.test(t))
+    && src.includes('for (const sel of [".question__text", "label.question__text", "mat-label", "label"])')
+    && src.includes('el.closest("sb-info-message, sb-date-input, mat-dialog-container")')
+  if (!ok) { console.error("FAIL label guard: captions/priority not enforced"); process.exit(1) }
+  console.log("ok   a field caption (Description, Conviction …) is never read as the question")
+}
