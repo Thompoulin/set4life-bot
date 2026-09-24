@@ -66,3 +66,17 @@ if (failures) {
   process.exit(1)
 }
 console.log("\nall passed")
+
+// ── Questionnaire confirm (AmAm, Carlos Murray Sr, 2026-09-24) ─────────
+{
+  const { readFileSync } = await import("node:fs")
+  const src = readFileSync(new URL("./review.ts", import.meta.url), "utf8")
+  const ok =
+    src.includes("export async function needsQuestionnaireConfirm(") &&
+    /for \(let attempt = 0; attempt < 2 && \(await needsQuestionnaireConfirm\(page\)\); attempt\+\+\)/.test(src)
+  if (!ok) {
+    console.error("FAIL questionnaire confirm: second NEXT press is not wired")
+    process.exit(1)
+  }
+  console.log("ok   questionnaire asks to confirm → NEXT pressed again (max 2)")
+}

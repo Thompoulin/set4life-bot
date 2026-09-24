@@ -1686,6 +1686,16 @@ async function reviewOneCarrier(
     )
   }
   await clickNextWhenEnabled(ctx)
+  // Some carriers' Questionnaire takes TWO presses: the first only raises a
+  // yellow "Please review the information on the Questionnaire screen.
+  // Select NEXT to confirm and continue." banner and stays put. American
+  // Amicable, Carlos Murray Sr, 2026-09-24: every field was filled, NEXT was
+  // enabled, the bot pressed once and then waited for a contract PDF that
+  // was never going to render.
+  for (let attempt = 0; attempt < 2 && (await needsQuestionnaireConfirm(page)); attempt++) {
+    ctx.logger.info({ idx, attempt }, "[Rep step5] questionnaire asks to confirm — pressing NEXT again")
+    await clickNextWhenEnabled(ctx)
+  }
 
   // Pre-fill mode bails here. Steps 1-5 are auto-saved by SureLC on
   // each Next click, so when the rep returns via their email link
@@ -2710,6 +2720,19 @@ async function tickTelemarketingOnlyIfPresent(ctx: TabContext): Promise<void> {
       "[Rep] tickTelemarketingOnlyIfPresent: Playwright click failed",
     )
   }
+}
+
+/**
+ * True while the wizard is still on the Questionnaire asking the rep to
+ * press NEXT again to confirm. Exported for the source-level test.
+ */
+export async function needsQuestionnaireConfirm(page: import("playwright").Page): Promise<boolean> {
+  return page
+    .evaluate(() => {
+      const t = (document.body?.innerText || "").replace(/\s+/g, " ")
+      return /Select NEXT to confirm and continue/i.test(t) && /Questionnaire/i.test(t)
+    })
+    .catch(() => false)
 }
 
 async function clickNextWhenEnabled(ctx: TabContext): Promise<void> {
