@@ -22,6 +22,7 @@
  */
 
 import type { Page, Browser } from "playwright"
+import { fillConvictionFields, pickDocumentIndex, type ConvictionDetails } from "./convictionFields.js"
 import type pino from "pino"
 import {
   firstVisible,
@@ -178,6 +179,12 @@ export interface RepReviewInput {
    * best-match a card; entries also serve as a fallback pool since the
    * criminal-history explanations are usually one shared letter.
    */
+  /**
+   * The felony conviction's Date / County / State, from the rep's record
+   * (surelc_answers.felony.conviction). AmAm requires them under a felony
+   * Yes; they are never inferred — see rep/convictionFields.ts.
+   */
+  convictionDetails?: ConvictionDetails
   carrierQuestionExplanations?: Array<{
     questionText?: string
     /** ISO YYYY-MM-DD; rendered MM/DD/YYYY into the modal's date field. */
@@ -793,25 +800,43 @@ async function fillCarrierQuestionExplanations(
       }
 
       // 3) Attach an existing uploaded doc via its inline SELECT button.
-      //    The modal lists the rep's already-uploaded explanation/DISCHARGE
-      //    docs under "Other documents available"; reusing one needs no
-      //    filechooser (the prior UPLOAD-new path timed out). The card is
-      //    "or/and" so the description alone can satisfy it — this is
-      //    belt-and-braces and harmless when the list is empty.
+      //    The modal lists EVERY letter the rep uploaded under "Other
+      //    documents available". Clicking the first SELECT attached Carlos
+      //    Murray Sr's PROBATION letter to AmAm's FELONY card (2026-09-23).
+      //    Pick the entry whose text matches this card's question; with one
+      //    entry it is that one; with several and no clear match, attach
+      //    none — the card is "or/and", the description satisfies it.
       let attached = false
       try {
-        // Real label is "library_books SELECT FROM ..." — scope to the FIRST
-        // visible dialog (see the CREATE EXPLANATION note above; `.last()`
-        // resolved to an empty container and silently found nothing).
-        const sel = page
-          .locator("mat-dialog-container:visible")
-          .first()
-          .locator('button:has-text("SELECT FROM"), button:has-text("SELECT")')
-          .first()
-        if (await sel.count()) {
-          await sel.click({ timeout: 4000 }).catch(() => undefined)
-          await page.waitForTimeout(700)
-          attached = true
+        const dlg = page.locator("mat-dialog-container:visible").first()
+        const selects = dlg.locator('button:has-text("SELECT FROM"), button:has-text("SELECT")')
+        const n = await selects.count()
+        if (n > 0) {
+          const docTexts: string[] = []
+          for (let i = 0; i < n; i++) {
+            docTexts.push(
+              await selects
+                .nth(i)
+                .evaluate((b) => {
+                  const entry =
+                    b.closest("mat-card, .document, .document-item, li, .item") ||
+                    b.parentElement?.parentElement ||
+                    b.parentElement
+                  return (entry?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 600)
+                })
+                .catch(() => ""),
+            )
+          }
+          const choice = pickDocumentIndex(questionText, docTexts, pick.explanation)
+          logger.info(
+            { idx, n, choice, previews: docTexts.map((t) => t.slice(0, 70)) },
+            "[Rep step4] explanation document pick",
+          )
+          if (choice !== null) {
+            await selects.nth(choice).click({ timeout: 4000 }).catch(() => undefined)
+            await page.waitForTimeout(700)
+            attached = true
+          }
         }
       } catch (err: any) {
         logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT existing-doc threw")
@@ -1474,6 +1499,13 @@ async function reviewOneCarrier(
       "[Rep step4] fillCarrierQuestionExplanations threw (non-fatal)",
     )
   }
+  // Conviction Date / County / State under a felony Yes (AmAm). Filled only
+  // from the rep's record; anything left empty is named in the failure.
+  ;(page as any)._missingConvictionFields = await fillConvictionFields(
+    page,
+    input.convictionDetails,
+    ctx.logger,
+  ).catch(() => [] as string[])
   await clickNextWhenEnabled(ctx)
   // Same wait pattern for step 5 — Questionnaire is another heavy
   // page transition; without networkidle the radios race the fill.
@@ -1847,7 +1879,11 @@ async function reviewOneCarrier(
       const redByStep = (Array.isArray(diag?.stepContents) ? diag.stepContents : [])
         .filter((s: any) => Array.isArray(s?.redFields) && s.redFields.length)
         .map((s: any) => `${s.stepLabel}: ${s.redFields.join("; ")}`)
+      const missingConviction = ((page as any)._missingConvictionFields || []) as string[]
       const blockedOn = [
+        missingConviction.length
+          ? `needs ${missingConviction.join(" / ")} for the felony disclosure — not on file (surelc_answers.felony.conviction)`
+          : "",
         unsatisfiedCards.length
           ? `unsatisfiable carrier-question card(s): ${unsatisfiedCards.join(" || ")}`
           : "",

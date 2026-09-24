@@ -276,6 +276,11 @@ const repReviewSchema = z.object({
    * a "Yes" answer demands a description/attachment. See
    * rep/review.ts fillCarrierQuestionExplanations.
    */
+  // Felony conviction Date / County / State (rep/convictionFields.ts). zod
+  // strips unknown keys, so it must be declared to reach the bot.
+  convictionDetails: z
+    .object({ date: z.string(), county: z.string(), state: z.string() })
+    .optional(),
   carrierQuestionExplanations: z
     .array(
       z.object({
