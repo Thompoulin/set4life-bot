@@ -146,18 +146,25 @@ export async function fillConvictionFields(
     return wanted.map((k) => label[k])
   }
 
-  // Scope each control to the form field that carries its label.
-  const fieldFor = (lab: string) =>
-    page.locator("mat-form-field, sb-date-input, .form-field, .question").filter({ hasText: lab }).first()
+  // Anchor each control on its OWN label and take the next input of the right
+  // kind after it. Filtering containers by hasText matched the outer felony
+  // question wrapper first (it contains every label), whose first input is a
+  // hidden radio — the State click waited 30s and failed on Carlos Murray Sr's
+  // American Amicable run, 2026-09-24.
+  const inputAfterLabel = (lab: string, predicate = "") =>
+    page
+      .locator(
+        `xpath=//*[normalize-space(text())="${lab}"]/following::input${predicate}[1]`,
+      )
+      .first()
   const missing: string[] = []
 
   if (present.date) {
     const v = isoToMmDdYyyy(details.date)
     try {
       if (!v) throw new Error(`unusable date ${details.date}`)
-      let inp = page.locator('sb-date-input input[data-cy="date-input"]').first()
-      const scoped = fieldFor("Conviction Date").locator("input").first()
-      if (await scoped.count()) inp = scoped
+      let inp = inputAfterLabel("Conviction Date", '[@data-cy="date-input"]')
+      if (!(await inp.count())) inp = page.locator('sb-date-input input[data-cy="date-input"]').first()
       await inp.fill(v)
       await inp.blur()
     } catch (err: any) {
@@ -168,7 +175,7 @@ export async function fillConvictionFields(
   if (present.county) {
     try {
       let inp = page.locator('input[name="felony_county"]').first()
-      if (!(await inp.count())) inp = fieldFor("Conviction County").locator("input").first()
+      if (!(await inp.count())) inp = inputAfterLabel("Conviction County", '[@type="text"]')
       await inp.fill(details.county.trim())
       await inp.blur()
     } catch (err: any) {
@@ -180,8 +187,9 @@ export async function fillConvictionFields(
     const st = normalizeState(details.state)
     try {
       if (!st) throw new Error(`unknown state ${details.state}`)
-      const inp = fieldFor("Conviction State").locator('input[role="combobox"], input').first()
-      await inp.click()
+      const inp = inputAfterLabel("Conviction State", '[@role="combobox"]')
+      if (!(await inp.count())) throw new Error("no combobox after the Conviction State label")
+      await inp.click({ timeout: 8000 })
       await inp.fill(st.name)
       await page.waitForTimeout(600)
       const opt = page

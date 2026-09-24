@@ -1501,6 +1501,7 @@ async function reviewOneCarrier(
   }
   // Conviction Date / County / State under a felony Yes (AmAm). Filled only
   // from the rep's record; anything left empty is named in the failure.
+  ;(page as any)._convictionDetailsGiven = !!input.convictionDetails
   ;(page as any)._missingConvictionFields = await fillConvictionFields(
     page,
     input.convictionDetails,
@@ -1882,7 +1883,9 @@ async function reviewOneCarrier(
       const missingConviction = ((page as any)._missingConvictionFields || []) as string[]
       const blockedOn = [
         missingConviction.length
-          ? `needs ${missingConviction.join(" / ")} for the felony disclosure — not on file (surelc_answers.felony.conviction)`
+          ? (page as any)._convictionDetailsGiven
+            ? `could not fill ${missingConviction.join(" / ")} for the felony disclosure (details ARE on file — the field did not take the value; see the step-4 screenshot)`
+            : `needs ${missingConviction.join(" / ")} for the felony disclosure — not on file (surelc_answers.felony.conviction)`
           : "",
         unsatisfiedCards.length
           ? `unsatisfiable carrier-question card(s): ${unsatisfiedCards.join(" || ")}`
