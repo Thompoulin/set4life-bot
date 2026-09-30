@@ -22,7 +22,21 @@
  */
 
 import type { Page, Browser } from "playwright"
-import { fillConvictionFields, pickDocumentIndex, type ConvictionDetails } from "./convictionFields.js"
+import {
+  fillConvictionFields,
+  isoToMmDdYyyy,
+  pickDocumentIndex,
+  type ConvictionDetails,
+} from "./convictionFields.js"
+import {
+  OCCURRENCE_DATE_SELECTOR_LOOSE,
+  confirmUnsavedDiscard,
+  documentChoiceIndices,
+  downloadForUpload,
+  setOccurrenceDate,
+  waitForAnyEnabledButton,
+  waitForEnabledButton,
+} from "../admin/explanationDocs.js"
 import type pino from "pino"
 import {
   firstVisible,
@@ -191,6 +205,9 @@ export interface RepReviewInput {
     occurrenceDate?: string
     /** The letter-of-explanation body text. */
     explanation?: string
+    /** The rep's typed "reason" / "action taken" (Create Explanation Document editor). */
+    reason?: string
+    action?: string
     /** Fetchable URL of a supporting doc to attach (e.g. DISCHARGE.pdf). */
     docUrl?: string
     fileName?: string
@@ -711,110 +728,135 @@ async function fillCarrierQuestionExplanations(
       // mat-dialog-container so we never touch the underlying card's "ADD"
       // button (clicking ADD just re-opens the modal — the prior
       // filled:N/remaining:1 churn) or a textarea behind the overlay.
-      const dialog = page.locator("mat-dialog-container:visible").last()
+      //
+      // Shape as captured 2026-09-30 (Yolonda Burgess, F&G / Corebridge /
+      // Banner / Americo — test/fixtures/explanations-2026-09-30):
+      //   outer dialog  <sb-step-questionnaire-edit-explanation-dialog>
+      //     "Required documents are missing." + Occurrence* (sb-date-input)
+      //     [UPLOAD NEW DOCUMENT] [CREATE EXPLANATION DOCUMENT]
+      //     [SELECT FROM UPLOADED DOCUMENTS]  [CANCEL] [CREATE]
+      //   CREATE EXPLANATION DOCUMENT opens a SECOND dialog on top:
+      //     Reason* / Explanation* / Action* textareas + Occurrence* [SAVE]
+      // The old code looked for the editor's textarea in the FIRST dialog
+      // (never there), "picked" the SELECT FROM UPLOADED button as if it
+      // were a document (its only text is the drop zone), and pressed a
+      // CREATE that could not enable. Every carrier failed on the card.
+      const outer = page.locator("mat-dialog-container:visible").first()
+      const topDialog = () => page.locator("mat-dialog-container:visible").last()
+      const dialogCount = () => page.locator("mat-dialog-container:visible").count().catch(() => 0)
+      const mmddyyyy = pick.occurrenceDate
+        ? isoToMmDdYyyy(pick.occurrenceDate) ?? pick.occurrenceDate
+        : null
 
-      // 1) Occurrence date, if the modal exposes one.
-      if (pick.occurrenceDate) {
-        const m = pick.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
-        const mmddyyyy = m ? `${m[2]}/${m[3]}/${m[1]}` : pick.occurrenceDate
-        try {
-          const dateInp = dialog
-            .locator('input[placeholder*="Occurrence" i], input[placeholder*="date" i]')
-            .first()
-          if (await dateInp.count()) await dateInp.fill(mmddyyyy)
-        } catch {
-          /* no date field on this modal — fine */
-        }
+      // 1) Occurrence date (required on this modal). sb-date-input first.
+      if (mmddyyyy) {
+        await setOccurrenceDate(outer, page, mmddyyyy, logger, `card${idx}`, OCCURRENCE_DATE_SELECTOR_LOOSE)
       }
 
-      // 1b) DATE-FIRST modal shape. Captured live from Sean Way's Foresters
-      //     card 2026-08-06: the modal opens with ONLY an "Occurrence Date"
-      //     input, its datepicker toggle, CANCEL and CREATE — no textarea and
-      //     no SELECT button at all. The description/attachment step only
-      //     appears after the date is committed with CREATE. The old code
-      //     looked for a textarea immediately, found none, and gave up with
-      //     descFilled=false/attached=false while holding the rep's letter —
-      //     which is what stranded every disclosure-Yes rep at Producer.
-      //
-      //     So: if there's no textarea yet but there IS a CREATE, commit the
-      //     date and re-look. Cheap, and a no-op on the older single-step
-      //     modal shape (which has a textarea from the start).
-      // The modal is a DOCUMENT CHOOSER, not a form. Captured live from
-      // Jhovanny Jimenez's card 2026-08-06, its controls are:
-      //   [UPLOAD NEW DOCUMENT] [CREATE EXPLANATION] [SELECT FROM ...]
-      //   [CANCEL] [CREATE]
-      // There is no textarea until "CREATE EXPLANATION" is clicked — that is
-      // what opens the text editor. The old code looked for a textarea
-      // immediately, found none, and gave up while holding the rep's letter.
-      //
-      // Scope by FIRST visible dialog, not `.last()`. The previous `.last()`
-      // resolved to a different (empty) container, which is why `attached`
-      // came back false even though a "SELECT FROM ..." button is plainly
-      // present in the DOM — the locator was searching the wrong dialog.
-      const liveDlg = () => page.locator("mat-dialog-container:visible").first()
-      if ((await liveDlg().locator("textarea").count().catch(() => 0)) === 0) {
-        const createExpl = liveDlg()
-          .locator('button:has-text("CREATE EXPLANATION")')
-          .first()
-        if ((await createExpl.count().catch(() => 0)) > 0) {
-          await createExpl.click({ timeout: 4000 }).catch(() => undefined)
-          await page.waitForTimeout(2500)
-          const dom = await page
-            .evaluate(() => {
-              const d = document.querySelector("mat-dialog-container")
-              if (!d) return "(dialog closed)"
-              return Array.from(
-                d.querySelectorAll("input, textarea, button, mat-select, [contenteditable]"),
-              )
-                .slice(0, 20)
-                .map((e) => ({
-                  tag: e.tagName,
-                  txt: (e.textContent || "").trim().slice(0, 22),
-                  ph: e.getAttribute("placeholder"),
-                }))
-            })
-            .catch(() => null)
-          logger.info(
-            { idx, afterCreateExplanation: dom },
-            "[Rep step4] opened CREATE EXPLANATION editor",
-          )
-        }
-      }
-
-      // 2) Explanation text → the Description textarea. Playwright .fill()
-      //    drives Angular's form control properly; a raw value-set is
-      //    dropped by ngModel, so DONE would save an empty description and
-      //    the red card would persist (verified Jimenez 2026-06-02).
-      //    Re-resolve the dialog: on the date-first shape CREATE may have
-      //    swapped the dialog contents (or opened a second one).
+      // 2) Description.
+      //    a) Older single-step shape: a textarea right in the modal.
+      //       Playwright .fill() drives Angular's form control; a raw
+      //       value-set is dropped by ngModel (verified Jimenez 2026-06-02).
+      //    b) Editor shape: only when we hold the rep's Reason, Explanation
+      //       AND Action — the editor requires all three, and writing the
+      //       same paragraph into three fields is not what the rep said.
       let descFilled = false
       try {
-        const liveDialog = page.locator("mat-dialog-container:visible").first()
-        const ta = liveDialog.locator("textarea").first()
-        if (await ta.count()) {
-          await ta.fill(pick.explanation)
+        const inlineTa = outer.locator("textarea").first()
+        if (await inlineTa.count()) {
+          await inlineTa.fill(pick.explanation)
           descFilled = true
+        } else if (pick.reason && pick.action) {
+          const before = await dialogCount()
+          const createExpl = outer.locator('button:has-text("CREATE EXPLANATION")').first()
+          if ((await createExpl.count().catch(() => 0)) > 0) {
+            await createExpl.click({ timeout: 4000 }).catch(() => undefined)
+            const editor = topDialog()
+            await editor
+              .locator('textarea[placeholder="Reason"]')
+              .first()
+              .waitFor({ timeout: 8_000 })
+              .catch(() => undefined)
+            if ((await dialogCount()) > before) {
+              await editor.locator('textarea[placeholder="Reason"]').first().fill(pick.reason)
+              await editor.locator('textarea[placeholder="Explanation"]').first().fill(pick.explanation)
+              await editor.locator('textarea[placeholder="Action"]').first().fill(pick.action)
+              if (mmddyyyy) {
+                await setOccurrenceDate(editor, page, mmddyyyy, logger, `card${idx}-editor`, OCCURRENCE_DATE_SELECTOR_LOOSE)
+              }
+              if (await waitForEnabledButton(editor, page, "SAVE", 8_000)) {
+                await editor
+                  .locator("button")
+                  .filter({ hasText: /^\s*SAVE\s*$/ })
+                  .first()
+                  .click({ timeout: 4000 })
+                // SAVE closes the editor and lists the new document in the
+                // outer dialog.
+                const deadline = Date.now() + 8_000
+                while (Date.now() < deadline && (await dialogCount()) > before) {
+                  await page.waitForTimeout(400)
+                }
+                descFilled = (await dialogCount()) <= before
+              }
+              if (!descFilled) {
+                logger.warn({ idx }, "[Rep step4] explanation editor did not save — closing it")
+                await editor
+                  .locator("button")
+                  .filter({ hasText: /^\s*CANCEL\s*$/ })
+                  .first()
+                  .click({ timeout: 3000 })
+                  .catch(() => undefined)
+                await page.waitForTimeout(600)
+                await confirmUnsavedDiscard(page)
+              }
+            }
+          }
         }
       } catch (err: any) {
         logger.warn({ idx, err: err?.message }, "[Rep step4] description fill threw")
       }
 
-      // 3) Attach an existing uploaded doc via its inline SELECT button.
-      //    The modal lists EVERY letter the rep uploaded under "Other
-      //    documents available". Clicking the first SELECT attached Carlos
-      //    Murray Sr's PROBATION letter to AmAm's FELONY card (2026-09-23).
-      //    Pick the entry whose text matches this card's question; with one
-      //    entry it is that one; with several and no clear match, attach
-      //    none — the card is "or/and", the description satisfies it.
+      // 3) Attach. Our own document for THIS disclosure first (the rep's
+      //    upload — e.g. the discharge — or their letter, wrapped as PDF),
+      //    straight onto the modal's file input.
       let attached = false
-      try {
-        const dlg = page.locator("mat-dialog-container:visible").first()
-        const selects = dlg.locator('button:has-text("SELECT FROM"), button:has-text("SELECT")')
-        const n = await selects.count()
-        if (n > 0) {
-          const docTexts: string[] = []
+      if (!descFilled && pick.docUrl) {
+        try {
+          const uploadPath = await downloadForUpload(
+            page,
+            { url: pick.docUrl, fileName: pick.fileName },
+            `card${idx}`,
+            logger,
+          )
+          const fileInput = outer.locator('input[type="file"]').first()
+          if (uploadPath && (await fileInput.count())) {
+            await fileInput.setInputFiles(uploadPath)
+            await page.waitForTimeout(1500)
+            const refused = await page
+              .evaluate(() => /Could not upload file/i.test(document.body.textContent || ""))
+              .catch(() => false)
+            attached = !refused
+            logger.info({ idx, fileName: pick.fileName, refused }, "[Rep step4] uploaded our document")
+          }
+        } catch (err: any) {
+          logger.warn({ idx, err: err?.message }, "[Rep step4] document upload threw")
+        }
+      }
+      //    Otherwise an existing document via its OWN inline SELECT. The
+      //    modal can list every letter the rep uploaded; clicking the first
+      //    attached Carlos Murray Sr's PROBATION letter to AmAm's FELONY
+      //    card (2026-09-23), so the entry must match this card's question.
+      //    "SELECT FROM UPLOADED DOCUMENTS" opens a picker — it is not a
+      //    document and never counts (documentChoiceIndices).
+      if (!descFilled && !attached) {
+        try {
+          const selects = outer.locator("button").filter({ hasText: /SELECT/ })
+          const n = await selects.count()
+          const buttonTexts: string[] = []
+          const entryTexts: string[] = []
           for (let i = 0; i < n; i++) {
-            docTexts.push(
+            buttonTexts.push(((await selects.nth(i).textContent().catch(() => "")) || "").trim())
+            entryTexts.push(
               await selects
                 .nth(i)
                 .evaluate((b) => {
@@ -827,38 +869,44 @@ async function fillCarrierQuestionExplanations(
                 .catch(() => ""),
             )
           }
+          const real = documentChoiceIndices(buttonTexts, entryTexts)
+          const docTexts = real.map((i) => entryTexts[i])
           const choice = pickDocumentIndex(questionText, docTexts, pick.explanation)
           logger.info(
-            { idx, n, choice, previews: docTexts.map((t) => t.slice(0, 70)) },
+            { idx, n, real: real.length, choice, previews: docTexts.map((t) => t.slice(0, 70)) },
             "[Rep step4] explanation document pick",
           )
           if (choice !== null) {
-            await selects.nth(choice).click({ timeout: 4000 }).catch(() => undefined)
+            await selects.nth(real[choice]).click({ timeout: 4000 }).catch(() => undefined)
             await page.waitForTimeout(700)
             attached = true
           }
+        } catch (err: any) {
+          logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT existing-doc threw")
         }
-      } catch (err: any) {
-        logger.warn({ idx, err: err?.message }, "[Rep step4] SELECT existing-doc threw")
       }
 
-      // 4) Commit via the modal's DONE button, scoped to the dialog so we
-      //    never hit the underlying card's ADD button (which re-opens the
-      //    modal). Playwright's click runs the full pointer sequence
+      // 4) Commit via the modal's own primary button — DONE on the
+      //    Carrier-Questions step, CREATE on the Questionnaire step. SureLC
+      //    enables it only once the date and a document are registered, and
+      //    it registers an upload asynchronously, so WAIT for it rather
+      //    than try once. Playwright's click runs the full pointer sequence
       //    Material's handler expects.
       let saved = false
       try {
-        // Step-4 carrier-questions modal commits via DONE; the
-        // Questionnaire (step-5) modal commits via CREATE. Click
-        // whichever ENABLED primary button this modal exposes (a
-        // disabled one means required fields are still missing).
-        const commit = dialog
-          .locator(
-            'button:has-text("DONE"):not([disabled]), button:has-text("CREATE"):not([disabled])',
-          )
-          .first()
-        await commit.click({ timeout: 5000 })
-        saved = true
+        const commitText = await waitForAnyEnabledButton(outer, page, ["DONE", "CREATE"], 15_000)
+        if (commitText) {
+          await outer
+            .locator("button")
+            .filter({ hasText: new RegExp(`^\\s*${commitText}\\s*$`) })
+            .first()
+            .click({ timeout: 5000 })
+          saved = true
+          // A document CREATED in the editor is itself the explanation.
+          if (!attached && descFilled) attached = true
+        } else {
+          logger.warn({ idx }, "[Rep step4] commit (DONE/CREATE) never enabled")
+        }
       } catch (err: any) {
         logger.warn({ idx, err: err?.message }, "[Rep step4] commit (DONE/CREATE) click threw")
       }

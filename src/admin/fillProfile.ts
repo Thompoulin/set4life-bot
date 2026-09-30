@@ -36,6 +36,17 @@ import {
   type TabResult,
 } from "../tabs/helpers.js"
 import { decideSignatureAction, SIGNATURE_NOT_OURS } from "./signatureDecision.js"
+import {
+  OCCURRENCE_DATE_SELECTOR,
+  confirmUnsavedDiscard,
+  dedupeExplanationDocuments,
+  discardExplanationForm,
+  downloadForUpload,
+  setOccurrenceDate,
+  unsavedExplanationsReason,
+  waitForEnabledButton,
+} from "./explanationDocs.js"
+import { isoToMmDdYyyy } from "../rep/convictionFields.js"
 
 export interface ProfileFillInput {
   producerId: string
@@ -77,6 +88,8 @@ export interface ProfileFillInput {
           url: string
           fileName?: string
           slot?: string // "statement" | "notice" | "resolution" for Q1a
+          /** "explanation_letter" (generated from typed answers) | "upload". */
+          kind?: string
           // Sent by the backoffice. Load-bearing: SureLC's attachment
           // service 500s on text/plain, so a letter arriving as text has
           // to be wrapped before it is offered. See asUploadableFile.
@@ -1765,61 +1778,7 @@ async function expandDocumentCategories(page: Page): Promise<string[]> {
   return titles
 }
 
-/**
- * SureLC's attachment service refuses a plain-text upload: POST
- * /surecrm/attachments/{producer}/upload answers 500 and the page shows
- * "Could not upload file: <name>". Our questionnaire writes the rep's
- * letter of explanation as text/plain, so EVERY letter we have ever held
- * was rejected at the door — which is the real reason no disclosure card
- * has ever had a document on it. Verified on Carlos Murray Sr's
- * probation letter 2026-09-11: the same words as .txt → 500, as .pdf →
- * 200 and CREATE goes live.
- *
- * Chromium is already here, so wrap the text in a one-page PDF rather
- * than taking a dependency. Anything that is not text passes straight
- * through untouched.
- */
-async function asUploadableFile(
-  page: Page,
-  localPath: string,
-  contentType: string | undefined,
-  logger: import("pino").Logger,
-): Promise<string> {
-  const isText =
-    /^text\//i.test(contentType || "") || /\.(txt|text)$/i.test(localPath)
-  if (!isText) return localPath
-  try {
-    const fs = await import("node:fs/promises")
-    const body = await fs.readFile(localPath, "utf8")
-    const escaped = body
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-    const pdfPath = localPath.replace(/\.(txt|text)$/i, "") + ".pdf"
-    const scratch = await page.context().newPage()
-    try {
-      await scratch.setContent(
-        `<html><body style="font:12pt/1.5 Helvetica,Arial,sans-serif;margin:48px">` +
-          `<pre style="white-space:pre-wrap;font:inherit">${escaped}</pre></body></html>`,
-        { waitUntil: "load" },
-      )
-      await scratch.pdf({ path: pdfPath, format: "Letter", printBackground: true })
-    } finally {
-      await scratch.close().catch(() => undefined)
-    }
-    logger.info(
-      { from: localPath, to: pdfPath },
-      "[Questions/v2] wrapped a text letter as PDF — SureLC rejects text/plain",
-    )
-    return pdfPath
-  } catch (err: any) {
-    logger.warn(
-      { err: err?.message },
-      "[Questions/v2] could not wrap text as PDF — uploading as-is",
-    )
-    return localPath
-  }
-}
+// asUploadableFile lives in ./explanationDocs.ts (shared with rep/review.ts).
 
 /**
  * Wait for SureLC to actually accept the file. The upload is answered
@@ -1957,8 +1916,17 @@ async function fillQuestionsV2(
   let yesSet = 0
   let saved = 0
   let skipped = 0
+  // Yes questions we HOLD documents for whose card still demands an
+  // explanation when we are done. Any entry makes the tab fail, which the
+  // contracting gate in botRunner turns into "Contracting BLOCKED …
+  // questions (…)" and the backoffice files as needs-human. Reporting
+  // "Filled" over these is how Yolonda Burgess (2026-09-30) went to
+  // Fastlane with an unexplained bankruptcy and failed on every carrier.
+  const unsaved: Array<{ slug: string; why: string }> = []
   for (const [slug, ans] of Object.entries(input.surelcAnswers)) {
     if (!ans || ans.answer !== "yes") continue
+    const docs = dedupeExplanationDocuments(ans.documents)
+    const hasDbDoc = docs.length > 0
     // Don't require presentSlugs membership alone — matchQuestionSlug may
     // have missed a newly-added keyword even though getSlugQuestionPattern
     // can still target the text. Prefer pattern match.
@@ -1972,6 +1940,12 @@ async function fillQuestionsV2(
     if (!page.url().match(/\/questions(?:[?#]|$)/)) {
       await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined)
       await page.waitForTimeout(800)
+      // A form left dirty answers goBack with "Unsaved information";
+      // until that is dismissed the list never comes back and every
+      // remaining question reads as "disappeared from DOM".
+      if (await confirmUnsavedDiscard(page)) {
+        logger.warn({ slug }, "[Questions/v2] dismissed a leftover 'Unsaved information' confirm")
+      }
     }
     await page
       .waitForSelector("sb-question", { timeout: 8_000 })
@@ -2056,7 +2030,8 @@ async function fillQuestionsV2(
       }
     }
     if (!probeResult.matched) {
-      logger.warn({ slug }, "[Questions/v2] question disappeared from DOM")
+      logger.warn({ slug, hasDbDoc }, "[Questions/v2] question disappeared from DOM")
+      if (hasDbDoc) unsaved.push({ slug, why: "question not found on the Questions tab" })
       continue
     }
     if (!probeResult.yesChecked) {
@@ -2122,7 +2097,6 @@ async function fillQuestionsV2(
     // attachment gets reused instead of duplicated. The fallback to
     // UPLOAD NEW DOCUMENT below covers the case where SureLC's picker
     // is genuinely empty.
-    const hasDbDoc = !!(ans.documents && ans.documents.length > 0)
     logger.info(
       { slug, hasDbDoc },
       "[Questions/v2] linking explanation (uses existing producer-level attachments if our DB has none)",
@@ -2158,34 +2132,28 @@ async function fillQuestionsV2(
     }
     if (!navOk) {
       logger.warn({ slug }, "[Questions/v2] ADD EXPLANATION button not found")
+      if (hasDbDoc) unsaved.push({ slug, why: "ADD EXPLANATION button not found" })
       continue
     }
     // The explanation route is a separate SPA view that paints after
     // navigation; wait for its own date field rather than a fixed number
     // of milliseconds before touching anything on it.
+    //
+    // SureLC's date field is now <sb-date-input> and on this route its
+    // input's placeholder is "Current Date", not "Occurrence Date" — the
+    // old placeholder-only wait timed out (12s) on every question and the
+    // date was never written (Yolonda Burgess, 2026-09-30). The selector
+    // takes the new shape first and keeps the old one as a fallback.
     await page
-      .waitForSelector('input[placeholder="Occurrence Date"]', { timeout: 12_000 })
+      .waitForSelector(OCCURRENCE_DATE_SELECTOR, { timeout: 12_000 })
       .catch(() => undefined)
-    // Set Occurrence Date via direct value + events
+    // Set the occurrence date the rep gave us. fill()+Tab drives the
+    // Angular control; the old `.value =` + synthetic events was dropped.
+    // The BGA route does not require the date (CREATE enables without it),
+    // so a date that does not stick is logged, not fatal — CREATE decides.
     if (ans.occurrenceDate) {
-      const isoMatch = ans.occurrenceDate.match(/^(\d{4})-(\d{2})-(\d{2})$/)
-      const mmddyyyy = isoMatch
-        ? `${isoMatch[2]}/${isoMatch[3]}/${isoMatch[1]}`
-        : ans.occurrenceDate
-      await page
-        .evaluate((v) => {
-          const inp = document.querySelector(
-            'input[placeholder="Occurrence Date"]',
-          ) as HTMLInputElement | null
-          if (!inp) return false
-          inp.value = v
-          inp.dispatchEvent(new Event("input", { bubbles: true }))
-          inp.dispatchEvent(new Event("change", { bubbles: true }))
-          inp.dispatchEvent(new Event("blur", { bubbles: true }))
-          return true
-        }, mmddyyyy)
-        .catch(() => undefined)
-      await page.waitForTimeout(500)
+      const mmddyyyy = isoToMmDdYyyy(ans.occurrenceDate) ?? ans.occurrenceDate
+      await setOccurrenceDate(page, page, mmddyyyy, logger, slug)
     }
     // The rep's OWN letter for THIS disclosure wins when we hold one.
     //
@@ -2199,7 +2167,7 @@ async function fillQuestionsV2(
     // untidy; a letter that visibly answers a different question, sitting
     // on a criminal disclosure a carrier will read, is not. Reuse is now
     // the fallback for when we hold nothing of our own.
-    const doc = ans.documents && ans.documents.length > 0 ? ans.documents[0] : null
+    const doc = docs.length > 0 ? docs[0] : null
     let uploadOk = false
     // ── Path A: SELECT FROM UPLOADED DOCUMENTS (only when we have none) ──
     try {
@@ -2293,182 +2261,169 @@ async function fillQuestionsV2(
     // copy in the producer's bucket for someone to clean up. Say whose
     // turn it is instead.
     const owedDocuments =
-      categories.length > 1 && (ans.documents?.length ?? 0) < categories.length
+      categories.length > 1 && docs.length < categories.length
     if (owedDocuments) {
       logger.warn(
-        { slug, categories, weHold: ans.documents?.length ?? 0 },
+        { slug, categories, weHold: docs.length },
         "[Questions/v2] the rep still owes documents for this disclosure — nobody can complete it until they arrive",
       )
     }
-    // ── Path B: UPLOAD NEW DOCUMENT (our own letter, preferred) ───
-    if (!uploadOk && doc && !owedDocuments) {
-      try {
-        const path = await import("node:path")
-        const fs = await import("node:fs/promises")
-        const os = await import("node:os")
-        const res = await fetch(doc.url)
-        if (res.ok) {
-          const buf = Buffer.from(await res.arrayBuffer())
-          const localPath = path.join(
-            os.tmpdir(),
-            `surelc-v2-${slug}-${Date.now()}-${doc.fileName || "doc"}`,
-          )
-          await fs.writeFile(localPath, buf)
-          const uploadPath = await asUploadableFile(
-            page,
-            localPath,
-            doc.contentType,
-            logger,
-          )
+    // ── Path B: UPLOAD NEW DOCUMENT — every document we hold ───
+    // All of them, not just the first: a bankruptcy disclosure is the
+    // letter AND the discharge AND the post-filing certificate, and
+    // uploading only documents[0] left the court papers behind even on a
+    // good run. dedupeExplanationDocuments() dropped repeats (a letter
+    // regenerated after an edit arrives twice).
+    let uploadedCount = 0
+    if (!uploadOk && docs.length > 0 && !owedDocuments) {
+      // On the category shape (a conviction) there is one file input per
+      // category, in panel order. Our letter is the written statement; a
+      // document that names its slot goes to that category. An unslotted
+      // extra document has no category we can honestly file it under, so
+      // it is skipped there rather than guessed — putting a letter under
+      // "Notice of Hearing" would misdescribe it to a carrier.
+      const slotWord: Record<string, RegExp> = {
+        statement: /written statement/i,
+        notice: /notice of hearing/i,
+        resolution: /resolution of the charges|final judgment/i,
+      }
+      let statementUsed = false
+      for (const d of docs) {
+        try {
+          let targetIdx = 0
+          if (categories.length > 1) {
+            const slot = d.slot || (statementUsed ? "" : "statement")
+            if (!slot) {
+              logger.info(
+                { slug, fileName: d.fileName },
+                "[Questions/v2] extra document has no category slot on this route — not uploaded",
+              )
+              continue
+            }
+            const want = slotWord[slot] ?? slotWord.statement
+            const idx = categories.findIndex((c) => want.test(c))
+            if (idx < 0) continue
+            targetIdx = idx
+            if (slot === "statement") statementUsed = true
+          }
+          const uploadPath = await downloadForUpload(page, d, slug, logger)
+          if (!uploadPath) continue
           // Setting the file on the input directly is more reliable than
           // racing a filechooser off a button click, and it works on both
           // shapes of this route. Keep the button path as the fallback.
-          //
-          // On the category shape there is one file input per category,
-          // in panel order. Our letter of explanation is the written
-          // statement, which is the first category SureLC asks for; a
-          // document that names its slot goes to the category that
-          // matches it. Never guess past that — putting a letter under
-          // "Notice of Hearing" would misdescribe it to a carrier.
+          // Re-query each time: the list re-renders after every upload.
           const fileInputs = await page.$$('input[type="file"]')
-          const slotWord: Record<string, RegExp> = {
-            statement: /written statement/i,
-            notice: /notice of hearing/i,
-            resolution: /resolution of the charges|final judgment/i,
-          }
-          let fileInput = fileInputs[0] ?? null
-          if (categories.length > 1) {
-            const want = slotWord[doc.slot || "statement"] ?? slotWord.statement
-            const idx = categories.findIndex((c) => want.test(c))
-            if (idx >= 0 && fileInputs[idx]) fileInput = fileInputs[idx]
-          }
+          const fileInput = fileInputs[targetIdx] ?? fileInputs[0] ?? null
           if (fileInput) {
             await (fileInput as any).setInputFiles(uploadPath)
           } else {
-            const uploadBtn = await page.$(
-              'button:has-text("UPLOAD NEW DOCUMENT")',
-            )
-            if (uploadBtn) {
-              const [fc] = await Promise.all([
-                page.waitForEvent("filechooser", { timeout: 8_000 }),
-                (uploadBtn as any).click(),
-              ])
-              await fc.setFiles(uploadPath)
-            }
+            const uploadBtn = await page.$('button:has-text("UPLOAD NEW DOCUMENT")')
+            if (!uploadBtn) continue
+            const [fc] = await Promise.all([
+              page.waitForEvent("filechooser", { timeout: 8_000 }),
+              (uploadBtn as any).click(),
+            ])
+            await fc.setFiles(uploadPath)
           }
-          if (fileInput || (await page.$('button:has-text("UPLOAD NEW DOCUMENT")'))) {
-            // SureLC answers the upload asynchronously and says so in the
-            // page, not in the DOM we just touched: a rejected file leaves
-            // a "Could not upload file" toast and CREATE disabled. The old
-            // code set uploadOk the instant setFiles resolved, so a
-            // refused upload was logged as a success and the run carried
-            // on to press a dead CREATE.
-            uploadOk = await confirmUploadAccepted(page, logger, slug)
-            if (uploadOk) logger.info({ slug }, "[Questions/v2] uploaded fresh doc")
+          // SureLC answers the upload asynchronously and says so in the
+          // page: a rejected file leaves a "Could not upload file" toast.
+          if (await confirmUploadAccepted(page, logger, slug)) {
+            uploadedCount++
+            logger.info({ slug, fileName: d.fileName }, "[Questions/v2] uploaded fresh doc")
           }
+        } catch (err: any) {
+          logger.warn({ slug, fileName: d.fileName, err: err.message }, "[Questions/v2] upload threw")
         }
-      } catch (err: any) {
-        logger.warn({ slug, err: err.message }, "[Questions/v2] upload threw")
+      }
+      uploadOk = uploadedCount > 0
+      if (uploadOk && uploadedCount < docs.length) {
+        logger.warn(
+          { slug, uploaded: uploadedCount, held: docs.length },
+          "[Questions/v2] not every document we hold was uploaded",
+        )
       }
     }
     if (!uploadOk) {
       logger.warn({ slug }, "[Questions/v2] no doc attached; cancelling modal")
-      const cancelBtn = await page.$('button:has-text("CANCEL")')
-      if (cancelBtn) {
-        // Pointer-sequence on CANCEL too (Angular button)
-        await page
-          .evaluate(() => {
-            const cb = Array.from(document.querySelectorAll("button")).find(
-              (b) =>
-                b.textContent?.trim() === "CANCEL" &&
-                (b as HTMLElement).offsetWidth > 0,
-            )
-            if (!cb) return
-            ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
-              (t) =>
-                cb.dispatchEvent(
-                  new MouseEvent(t, {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    button: 0,
-                  }),
-                ),
-            )
-          })
-          .catch(() => undefined)
-        await page.waitForTimeout(800)
-        // Handle "Unsaved information" dialog — confirm discard
-        await page
-          .evaluate(() => {
-            const yes = Array.from(document.querySelectorAll("button")).find(
-              (b) =>
-                b.textContent?.trim() === "YES" &&
-                (b as HTMLElement).offsetWidth > 0,
-            )
-            if (yes) (yes as HTMLElement).click()
-          })
-          .catch(() => undefined)
-        await page.waitForTimeout(800)
+      await discardExplanationForm(page)
+      if (hasDbDoc) {
+        unsaved.push({
+          slug,
+          why: owedDocuments
+            ? `SureLC asks for ${categories.length} documents, we hold ${docs.length}`
+            : "upload not accepted by SureLC",
+        })
       }
       continue
     }
-    // Click CREATE via pointer event sequence. A plain .click() does
-    // NOT trigger Angular's MatButton click handler — the form stays
-    // in unsaved state and SureLC discards the upload on navigation.
-    // Verified Gurira wasBankrupt 2026-05-29: only the full pointer
-    // sequence persists server-side (validation drops to 0).
+    // CREATE. SureLC links an upload asynchronously and keeps CREATE
+    // disabled until it has — so WAIT for it to enable instead of reading
+    // it once. Read once, 6ms after the upload, it was disabled on
+    // Yolonda Burgess's alias card (2026-09-30); the evidence snapshot a
+    // few seconds later shows it enabled. That false "NOT saved" is what
+    // started the cascade that lost her bankruptcy explanation.
     //
-    // A DISABLED MatButton swallows the whole sequence, so "we dispatched
-    // the events" says nothing about whether anything was saved. SureLC
-    // keeps CREATE disabled until the form is complete and names what is
-    // missing on the page; read that instead of assuming, or a card that
-    // still demands an explanation gets counted as saved (Carlos Murray
-    // Sr's probation card, 2026-09-11).
-    const createOk = await page
-      .evaluate(() => {
-        const cb = Array.from(document.querySelectorAll("button")).find(
-          (b) =>
-            b.textContent?.trim() === "CREATE" &&
-            (b as HTMLElement).offsetWidth > 0 &&
-            !/EXPLANATION/i.test(b.textContent || ""),
-        ) as HTMLButtonElement | undefined
-        if (!cb) return { clicked: false, reason: "CREATE button not found / not visible" }
-        if (cb.disabled) {
-          const complaints = Array.from(
-            document.querySelectorAll("mat-error, .mat-error, [class*='error']"),
-          )
-            .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim())
-            .filter(Boolean)
-          return {
-            clicked: false,
-            reason: "CREATE still disabled — SureLC does not consider this form complete",
-            complaints: Array.from(new Set(complaints)).slice(0, 4),
-          }
-        }
-        ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach(
-          (t) =>
-            cb.dispatchEvent(
-              new MouseEvent(t, {
-                bubbles: true,
-                cancelable: true,
-                view: window,
-                button: 0,
-              }),
-            ),
-        )
-        return { clicked: true }
-      })
-      .catch(() => ({ clicked: false, reason: "CREATE probe threw" }))
+    // Fire it with the full pointer sequence: a plain .click() does NOT
+    // trigger Angular's MatButton handler and SureLC discards the upload on
+    // navigation (Gurira wasBankrupt 2026-05-29).
+    const createEnabled = await waitForEnabledButton(page, page, "CREATE", 20_000)
+    const createOk = createEnabled
+      ? await page
+          .evaluate(() => {
+            const cb = Array.from(document.querySelectorAll("button")).find(
+              (b) =>
+                b.textContent?.trim() === "CREATE" &&
+                (b as HTMLElement).offsetWidth > 0 &&
+                !(b as HTMLButtonElement).disabled,
+            ) as HTMLButtonElement | undefined
+            if (!cb) return { clicked: false, reason: "CREATE button not found / not visible" }
+            ;["pointerdown", "mousedown", "pointerup", "mouseup", "click"].forEach((t) =>
+              cb.dispatchEvent(
+                new MouseEvent(t, { bubbles: true, cancelable: true, view: window, button: 0 }),
+              ),
+            )
+            return { clicked: true }
+          })
+          .catch(() => ({ clicked: false, reason: "CREATE probe threw" }))
+      : { clicked: false, reason: "CREATE still disabled after 20s — SureLC does not consider this form complete" }
+    // Did it save? The question's own card is the authority: after a real
+    // save it no longer says "An explanation is required". A save normally
+    // returns to the list; if it did not, go back (dismissing any confirm —
+    // harmless after a real save) and read the card either way.
+    let stillRequired = true
     if (createOk.clicked) {
-      await page.waitForTimeout(2500)
+      let leftRoute = false
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        if (!/\/questions\/question\//.test(page.url())) {
+          leftRoute = true
+          break
+        }
+        await page.waitForTimeout(500)
+      }
+      if (!leftRoute) {
+        await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => undefined)
+        await page.waitForTimeout(800)
+        await confirmUnsavedDiscard(page)
+      }
+      await page.waitForSelector("sb-question", { timeout: 8_000 }).catch(() => undefined)
+      await waitForQuestionListToSettle(page)
+      const after = await probe().catch(() => ({ matched: false }) as { matched: boolean; hasAddBtn?: boolean })
+      stillRequired = after.matched ? !!after.hasAddBtn : !leftRoute
+    }
+    if (createOk.clicked && !stillRequired) {
       saved++
-      logger.info({ slug }, "[Questions/v2] CREATE pointer-sequence dispatched")
+      logger.info({ slug, uploaded: uploadedCount }, "[Questions/v2] explanation saved (CREATE)")
     } else {
-      logger.warn(
-        { slug, reason: (createOk as any).reason, complaints: (createOk as any).complaints },
-        "[Questions/v2] explanation NOT saved",
-      )
+      const why = createOk.clicked
+        ? "CREATE clicked but the card still asks for an explanation"
+        : (createOk as any).reason
+      logger.warn({ slug, reason: why }, "[Questions/v2] explanation NOT saved")
+      // Never leave a dirty form behind — the next question's goBack
+      // would land on "Unsaved information" and every later Yes would be
+      // skipped as "disappeared from DOM" (the rest of Yolonda's run).
+      if (/\/questions\/question\//.test(page.url())) await discardExplanationForm(page)
+      if (hasDbDoc) unsaved.push({ slug, why: createOk.clicked ? "CREATE did not save" : "CREATE never enabled" })
     }
   }
   logger.info(
@@ -2476,6 +2431,14 @@ async function fillQuestionsV2(
     "[Questions/v2] driver finished",
   )
   await snapshot(ctx, "tab-questions-after-v2")
+  if (unsaved.length > 0) {
+    logger.warn({ unsaved }, "[Questions/v2] Yes question(s) with our documents are still unexplained in SureLC")
+    return {
+      ok: false,
+      reason: unsavedExplanationsReason(unsaved),
+      details: { yesSet, saved, skipped, unsaved } as any,
+    }
+  }
   return { ok: true, details: { yesSet, saved, skipped } as any }
 }
 

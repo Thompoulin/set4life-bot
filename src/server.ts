@@ -87,6 +87,12 @@ const profileSchema = z.object({
                   url: z.string().url(),
                   fileName: z.string().optional(),
                   slot: z.string().optional(),
+                  // Both were sent all along and silently stripped by zod:
+                  // contentType drives the text→PDF wrap, kind tells a
+                  // generated letter from an uploaded court paper
+                  // (admin/explanationDocs.ts dedupeExplanationDocuments).
+                  contentType: z.string().optional(),
+                  kind: z.string().optional(),
                 }),
               )
               .optional(),
@@ -287,6 +293,11 @@ const repReviewSchema = z.object({
         questionText: z.string().optional(),
         occurrenceDate: z.string().optional(),
         explanation: z.string().optional(),
+        // The rep's typed Reason / Action, for SureLC's "Create Explanation
+        // Document" editor (three required fields). Optional: without them
+        // the modal attaches docUrl instead. See rep/review.ts.
+        reason: z.string().optional(),
+        action: z.string().optional(),
         docUrl: z.string().optional(),
         fileName: z.string().optional(),
         // The agency's standing description for a card the carrier demands
