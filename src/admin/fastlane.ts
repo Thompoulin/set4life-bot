@@ -194,6 +194,23 @@ function aliasNaic(carrierName: string): string | undefined {
 
 const FASTLANE_URL = "https://surelc.surancebay.com/bga/fastlane"
 
+/**
+ * What Fastlane returns when the backoffice sent no carriers. Nothing is
+ * submitted (never ADD ALL — only the rep's own choice is contracted), and
+ * the reason says whose move it is instead of blaming a missing button.
+ */
+export const NO_CARRIER_SELECTION_REASON =
+  "No carriers selected for this rep — nothing to submit. The rep has not completed " +
+  "Request Carrier Contracts yet; Fastlane was not walked past the Carriers step."
+
+export function noCarrierSelectionResult(): TabResult {
+  return {
+    ok: false,
+    reason: NO_CARRIER_SELECTION_REASON,
+    details: { added: [], notFound: [], noCarrierSelection: true },
+  }
+}
+
 export async function runFastlaneOneProducerManyCarriers(
   ctx: TabContext,
   input: FastlaneInput,
@@ -661,6 +678,15 @@ export async function runFastlaneOneProducerManyCarriers(
       "[Fastlane] no carriers in agent selection — adding NOTHING (refusing ADD ALL). Check that the pipeline sent contracting.carriers.",
     )
     await snapshot(ctx, "fastlane-04-carriers-no-selection")
+    // And stop here. NEXT cannot leave the Carriers step with an empty cart,
+    // so walking on to States / Products / Preview only ever ended in
+    // "Fastlane SUBMIT button not found on preview (visible CTAs: search |
+    // ADD ALL | ADD | … | REMOVE ALL | CANCEL | PREVIOUS | NEXT)" — which
+    // reads as a SureLC page change and sent people looking for one.
+    // Jermaine Watkins (3024058), Jairo Cabrera Rojas, Alfred Nickson Jr,
+    // 2026-09-30: every one of them simply had not picked carriers yet.
+    // docs/2026-09-30-fastlane-no-carrier-selection.md
+    return noCarrierSelectionResult()
   } else {
     const wanted = selected
       .map((c) => (c.carrierName || "").trim())
