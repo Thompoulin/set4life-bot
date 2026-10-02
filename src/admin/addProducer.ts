@@ -32,6 +32,12 @@ export interface AddProducerInput {
    * DOM. Passing the known ID through bypasses that whole brittle path.
    */
   existingProducerId?: string
+  /**
+   * The agent's NPN as the backoffice holds it. Fastlane refuses to file
+   * unless SureLC's record for existingProducerId carries this same NPN
+   * (admin/producerIdentity.ts identityFromRecord).
+   */
+  npn?: string
 }
 
 export interface AddProducerResult {

@@ -27,6 +27,14 @@ export interface FastlaneContracting {
   added?: string[]
   /** Carrier names it looked for and could not add. */
   notFound?: string[]
+  /**
+   * Machine code when Fastlane refused or the submit could not be confirmed
+   * on the intended producer (`producer_identity_unverified`,
+   * `filed_on_wrong_producer_suspected`, …). Absent on success.
+   */
+  errorCode?: string
+  /** Appointment-request ids that appeared on the intended producer after SUBMIT. */
+  newRequestIds?: number[]
 }
 
 function names(v: unknown): string[] | undefined {
@@ -42,11 +50,19 @@ export function contractingFromFastlane(r: TabResult): FastlaneContracting {
     ...(added ? { added } : {}),
     ...(notFound ? { notFound } : {}),
   }
+  const newRequestIds = Array.isArray(r.details?.newRequestIds)
+    ? (r.details!.newRequestIds as unknown[]).filter((n): n is number => typeof n === "number")
+    : undefined
   if (!r.ok) {
+    // A refusal or a suspected wrong-producer filing is never "submitted",
+    // whatever was clicked: `submitted` stays empty and the code travels with
+    // the failure so the backoffice can alert instead of advancing statuses.
     return {
       submitted: [],
       failed: [{ carrier: "(fastlane)", reason: r.reason || "Fastlane failed" }],
       ...lists,
+      ...(r.code ? { errorCode: r.code } : {}),
+      ...(newRequestIds ? { newRequestIds } : {}),
     }
   }
   if (r.skipped) {
@@ -62,5 +78,6 @@ export function contractingFromFastlane(r: TabResult): FastlaneContracting {
     submitted: added && added.length === 0 ? [] : ["all-via-fastlane"],
     failed: [],
     ...lists,
+    ...(newRequestIds ? { newRequestIds } : {}),
   }
 }

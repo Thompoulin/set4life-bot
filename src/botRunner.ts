@@ -115,6 +115,8 @@ export interface RunActivationResult {
         skipReason?: string
         added?: string[]
         notFound?: string[]
+        errorCode?: string
+        newRequestIds?: number[]
       }
     }
     rep_review?: {
@@ -665,11 +667,113 @@ export async function runActivation(
               .filter((c) =>
                 missingSet ? missingSet.has(c.carrierName.toLowerCase()) : true,
               )
-            const r = await runFastlaneOneProducerManyCarriers(tabCtx, {
-              producerDisplayName,
-              producerId,
-              selectedCarriers,
-            })
+            // ── Who exactly are we about to file for? ──
+            // Read producerId's own SureLC record BEFORE opening Fastlane and
+            // hand Fastlane the email + name its card must show. A card has
+            // no producer id and no NPN on it, so the email is the only
+            // positive identifier; without this read the wizard refuses to
+            // select anyone. Also snapshot the producer's request ids so the
+            // submit can be checked against them afterwards. All reads.
+            // Carlos Tovar, 2026-10-02 — admin/producerIdentity.ts.
+            const {
+              captureSurecrmBearer,
+              fetchProducerRecord,
+              identityFromRecord,
+              listAppointmentRequestIds,
+              verifyNewRequests,
+            } = await import("./admin/producerIdentity.js")
+            const GA_ID = "1322"
+            const bearerBefore = await captureSurecrmBearer(tabCtx.page, producerId)
+            const record = bearerBefore
+              ? await fetchProducerRecord(bearerBefore, producerId)
+              : null
+            const idCheck = identityFromRecord(producerId, record, input.producer.npn)
+            const beforeIds = bearerBefore
+              ? await listAppointmentRequestIds(bearerBefore, producerId, GA_ID)
+              : null
+            logger.info(
+              {
+                producerId,
+                npnSent: input.producer.npn ?? null,
+                identity: idCheck.ok ? idCheck.identity : null,
+                refusal: idCheck.ok ? null : idCheck.reason,
+                baselineRequests: beforeIds?.length ?? null,
+              },
+              "[Fastlane] producer identity read from SureLC",
+            )
+
+            let r: TabResult
+            if (!idCheck.ok) {
+              r = { ok: false, code: idCheck.code, reason: idCheck.reason }
+            } else if (beforeIds == null) {
+              // Without a baseline the submit cannot be verified afterwards,
+              // so do not submit. Same fail-safe as the pre-dedup above.
+              r = {
+                ok: false,
+                code: "fastlane_submit_unverified",
+                reason:
+                  `[fastlane_submit_unverified] Could not read producer ${producerId}'s existing ` +
+                  `appointment requests, so a submit could not be checked afterwards. Fastlane was ` +
+                  `not opened. Nothing was filed.`,
+              }
+            } else {
+              r = await runFastlaneOneProducerManyCarriers(tabCtx, {
+                producerDisplayName,
+                producerId,
+                selectedCarriers,
+                expectedIdentity: idCheck.identity,
+              })
+              const addedNames = Array.isArray(r.details?.added)
+                ? (r.details!.added as unknown[])
+                : []
+              if (r.ok && !r.skipped && addedNames.length > 0) {
+                // Did the requests land on THIS producer? Poll briefly —
+                // SureLC creates them on SUBMIT but the list can lag.
+                let afterIds: number[] | null = null
+                let verdict = verifyNewRequests({
+                  producerId,
+                  addedCount: addedNames.length,
+                  beforeIds,
+                  afterIds: null,
+                })
+                for (let attempt = 0; attempt < 4; attempt++) {
+                  if (attempt > 0) await tabCtx.page.waitForTimeout(5_000)
+                  const bearerAfter =
+                    (await captureSurecrmBearer(tabCtx.page, producerId)) || bearerBefore || ""
+                  afterIds = await listAppointmentRequestIds(bearerAfter, producerId, GA_ID)
+                  verdict = verifyNewRequests({
+                    producerId,
+                    addedCount: addedNames.length,
+                    beforeIds,
+                    afterIds,
+                  })
+                  if (verdict.ok) break
+                }
+                logger[verdict.ok ? "info" : "error"](
+                  {
+                    producerId,
+                    added: addedNames.length,
+                    newRequestIds: verdict.newRequestIds,
+                    verdict: verdict.ok ? "landed" : verdict.code,
+                  },
+                  "[Fastlane] post-submit check on the intended producer",
+                )
+                r = verdict.ok
+                  ? { ...r, details: { ...r.details, newRequestIds: verdict.newRequestIds } }
+                  : {
+                      ok: false,
+                      code: verdict.code,
+                      reason: verdict.reason,
+                      details: {
+                        ...r.details,
+                        newRequestIds: verdict.newRequestIds,
+                        baselineRequestCount: beforeIds.length,
+                        afterRequestCount: afterIds?.length ?? null,
+                        intendedProducerId: producerId,
+                      },
+                    }
+              }
+            }
             // Carries Fastlane's skip + added/notFound through, so an ok run
             // that filed nothing no longer reads as "all carriers submitted".
             const { contractingFromFastlane } = await import(
@@ -679,6 +783,13 @@ export async function runActivation(
             if (!r.ok) adminPhase.ok = false
             await finishContracting({
               ok: r.ok,
+              meta: {
+                producerId,
+                ...(r.code ? { code: r.code } : {}),
+                ...(Array.isArray(r.details?.newRequestIds)
+                  ? { newRequestIds: r.details!.newRequestIds }
+                  : {}),
+              },
               msg: !r.ok
                 ? r.reason || `Fastlane failed`
                 : r.skipped

@@ -31,6 +31,17 @@ import {
   settle,
   snapshot,
 } from "../tabs/helpers.js"
+import {
+  type ExpectedProducerIdentity,
+  type FastlaneCardInfo,
+  PRODUCER_AMBIGUOUS,
+  PRODUCER_IDENTITY_UNVERIFIED,
+  PRODUCER_NOT_FOUND,
+  decideProducerCard,
+  emailsInText,
+  identitySearchTerms,
+  nameTokensMatch,
+} from "./producerIdentity.js"
 
 export interface FastlaneInput {
   /** Producer's full name as displayed in the SureLC list (e.g. "LOVE, ZACHARY EDMOND"). */
@@ -54,6 +65,13 @@ export interface FastlaneInput {
    * carriers the agent never picked).
    */
   selectedCarriers?: Array<{ carrierName: string; carrierNaic?: string }>
+  /**
+   * What SureLC's own record for `producerId` says the producer's card must
+   * show (email, name), read by the orchestrator before Fastlane opens —
+   * see producerIdentity.ts. REQUIRED in practice: without it the wizard
+   * refuses to select anyone (`producer_identity_unverified`).
+   */
+  expectedIdentity?: ExpectedProducerIdentity
 }
 
 /**
@@ -258,20 +276,33 @@ export async function runFastlaneOneProducerManyCarriers(
 
   await snapshot(ctx, "fastlane-02-step1-producer")
 
-  // ── Step 1 — Producer search + SELECT.
+  // ── Step 1 — Producer search + SELECT, by POSITIVE identification only.
   //
-  // Fastlane's producer list is virtualized — Angular CDK only
-  // renders cards in the visible viewport. With 11+ producers,
-  // anyone past the visible 5–8 is NOT in the DOM, so a direct
-  // `bga-producer-card:has-text("LASTNAME")` query fails for
-  // off-screen producers. The fix is to filter via the Search
-  // input, which causes the server (or client) to narrow the list
-  // until only matching cards render.
+  // Fastlane's list is virtualised (Angular CDK renders only the cards in the
+  // viewport), so the Search box narrows it first. The Material input has no
+  // placeholder/aria-label — just a <mat-label>Search</mat-label> sibling
+  // (Josue 2026-05-08) — hence the Material-aware lookup.
   //
-  // Josue 2026-05-08: the previous `input[placeholder*="search"]`
-  // selector missed because Material's input has no placeholder/
-  // type/aria-label — just a `<mat-label>Search</mat-label>`
-  // sibling. Use the same Material-aware path our other fills use.
+  // Which card is OUR producer is decided by decideProducerCard
+  // (producerIdentity.ts), never by the name alone: the card must print the
+  // email SureLC holds for producerId, be the only card that does, and carry
+  // SureLC's own name for producerId (whole-token surname). A
+  // <bga-producer-card> carries no producer id and no NPN — the email is the
+  // only identifier on it — which is why the id check added after the Murray
+  // incident never fired: it found no id on 20 of 20 clicks and clicked
+  // anyway, and on 2026-10-01/02 filed Carlos Tovar's 22 requests on
+  // "NUNEZ-TOVAR, CARLOS EDUARDO, SR." (5861981).
+  // docs/2026-10-02-fastlane-wrong-producer-carlos-tovar.md
+  const expected = input.expectedIdentity ?? null
+  if (!expected) {
+    const d = decideProducerCard([], null)
+    logger.error(
+      { producerId: input.producerId, name: input.producerDisplayName },
+      "[Fastlane] REFUSING — no verified SureLC identity was supplied for this producer",
+    )
+    return { ok: false, code: PRODUCER_IDENTITY_UNVERIFIED, reason: (d as any).reason }
+  }
+
   const search =
     (await page.$('mat-label:has-text("Search") >> xpath=ancestor::*[self::mat-form-field][1] >> input').catch(() => null)) ||
     (await firstVisible(page, [
@@ -279,184 +310,79 @@ export async function runFastlaneOneProducerManyCarriers(
       'input[type="search"]',
       'input[aria-label*="search" i]',
     ]))
-  if (search) {
-    try {
-      await (search as any).click()
-      await (search as any).fill("")
-      // Last-name-only search is the safest — Fastlane shows names
-      // as "LASTNAME, FIRSTNAME [MIDDLE/SUFFIX]", and the agent's
-      // displayName from our side might not include middle initials
-      // even when the cert/SureLC record does.
-      // Try progressively broader terms and stop at the first that
-      // actually renders a card — see searchTermsForProducer.
-      const terms = searchTermsForProducer(input.producerDisplayName)
-      let usedTerm = terms[0]
-      let cardCount = 0
-      for (const term of terms) {
+  if (!search) logger.warn("[Fastlane] producer search input not found — judging the cards already rendered")
+
+  const terms = search ? identitySearchTerms(expected, input.producerDisplayName) : [""]
+  const severity: Record<string, number> = {
+    [PRODUCER_NOT_FOUND]: 1,
+    [PRODUCER_IDENTITY_UNVERIFIED]: 2,
+    [PRODUCER_AMBIGUOUS]: 3,
+  }
+  let chosen: { el: any; info: FastlaneCardInfo } | null = null
+  let refusal: { code: string; reason: string } | null = null
+  for (const term of terms) {
+    if (search && term) {
+      try {
+        await (search as any).click()
         await (search as any).fill("")
         await (search as any).fill(term)
-        // Some Material search inputs need an explicit Enter to commit
-        // the filter, others debounce on input. Press Enter just in
-        // case + give a generous wait (3s) for the server-side filter.
+        // Some Material search inputs commit on Enter, others debounce.
         await (search as any).press("Enter").catch(() => undefined)
         await page.waitForTimeout(3_000)
-        cardCount = (await page.$$("bga-producer-card")).length
-        usedTerm = term
-        logger.info(
-          { filtered: term, cardCount },
-          "[Fastlane] producer search filled",
-        )
-        if (cardCount > 0) break
+      } catch (err: any) {
+        logger.warn({ err: err?.message, term }, "[Fastlane] search fill failed")
+        continue
       }
-      if (cardCount === 0) {
-        logger.warn(
-          { tried: terms },
-          "[Fastlane] no producer card rendered for any search term",
-        )
-      }
-      void usedTerm
-      await snapshot(ctx, "fastlane-02b-after-search")
-    } catch (err: any) {
-      logger.warn({ err: err?.message }, "[Fastlane] search fill failed")
     }
-  } else {
-    logger.warn("[Fastlane] producer search input not found")
+    const cardEls = await page.$$("bga-producer-card")
+    const raw = await Promise.all(
+      cardEls.map((c) =>
+        c
+          .evaluate((el) => ({
+            name: ((el.querySelector(".producer__name") as HTMLElement | null)?.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim(),
+            text: (el.textContent || "").replace(/\s+/g, " ").trim(),
+          }))
+          .catch(() => ({ name: "", text: "" })),
+      ),
+    )
+    const infos: FastlaneCardInfo[] = raw.map((r) => ({
+      name: r.name || r.text.split(",").slice(0, 2).join(","),
+      emails: emailsInText(r.text),
+    }))
+    const d = decideProducerCard(infos, expected)
+    logger.info(
+      { term, producerId: expected.producerId, cards: infos, decision: d.ok ? "match" : d.code },
+      "[Fastlane] producer search judged",
+    )
+    if (d.ok) {
+      chosen = { el: cardEls[d.index], info: infos[d.index] }
+      break
+    }
+    if (!refusal || (severity[d.code] ?? 0) > (severity[refusal.code] ?? 0)) {
+      refusal = { code: d.code, reason: d.reason }
+    }
+    // Two cards with this producer's email is a finding, not a search miss.
+    if (d.code === PRODUCER_AMBIGUOUS) break
   }
-  // Click SELECT on the matching producer row. SureLC renders each
-  // producer as a `<bga-producer-card>` with class `viewport__item`
-  // — NOT a <tr> and not anything `[class*="row"]` (verified Sydney
-  // 2026-05-07 04:16 from fastlane-02-step1-producer.html). The card
-  // contains a `.producer__name` div and a SELECT button.
-  //
-  // Producers with profile issues (red "N issues" badge) have NO
-  // SELECT button — those cards are read-only and must be repaired
-  // before they can be picked.
-  //
-  // 2026-05-28 Javier Castro: our DB has firstName="Javier"
-  // lastName="Castro" → producerDisplayName="CASTRO, JAVIER", but
-  // SureLC's card text is "CASTRO DIAZ, JAVIER ANTONIO" (paternal +
-  // maternal surname + middle name — common for Latin-American
-  // producers who register with their full legal name). The exact
-  // :has-text("CASTRO, JAVIER") substring is NOT in
-  // "CASTRO DIAZ, JAVIER ANTONIO" → producerCard = null → bot
-  // falsely reports "N issues" when the card actually has a SELECT
-  // button. The search step already narrows by lastName, so the
-  // post-search viewport is reliably the producer in question. We
-  // try exact match first (Sydney etc. work as before), then a
-  // fuzzy match (card text contains lastName AND firstName as
-  // separate substrings), then any single rendered card.
-  //
-  // ⚠ EVERY strategy below must yield exactly ONE card, or we file nothing.
-  //
-  // `:has-text()` is a SUBSTRING match, and page.$ returns the FIRST hit. That
-  // is the whole bug. SureLC renders these two, verbatim from the evidence
-  // HTML of the 2026-09-08 02:08 run:
-  //
-  //     MURRAY, CARLOS ALEXANDER, II     <- the son  (12026084)
-  //     MURRAY, CARLOS ALEXANDER, SR     <- the father (16679568)
-  //
-  // We search "MURRAY, CARLOS ALEXANDER" for the father. It is a substring of
-  // BOTH — so even the strictest strategy here matched both and silently took
-  // the first, which is the son. Sixteen consecutive runs, 120 appointment
-  // requests on the wrong man's record, every one reporting success.
-  //
-  // So candidates are gathered rather than short-circuited, and ambiguity is
-  // treated as the finding it is: a name that matches two producers cannot
-  // identify either of them. Refusing costs a ticket; guessing costs somebody
-  // else's compliance record and four days of a colleague deleting rows by
-  // hand.
-  const dispParts = input.producerDisplayName.split(",")
-  const lastNameMatch = (dispParts[0] || "").trim()
-  const firstNameMatch = (dispParts[1] || "").trim()
+  await snapshot(ctx, "fastlane-02b-after-search")
 
-  const cardEls = await page.$$("bga-producer-card")
-  const cardTexts = await Promise.all(
-    cardEls.map((c) =>
-      c.evaluate((el) => (el.textContent || "").replace(/\s+/g, " ").trim()).catch(() => ""),
-    ),
-  )
-  const pick = (predicate: (t: string) => boolean) =>
-    cardTexts.map((t, i) => ({ t, i })).filter((x) => x.t && predicate(x.t))
-
-  // Same three strategies, same order, same semantics — now counted.
-  let hits = pick((t) => t.includes(input.producerDisplayName))
-  if (!hits.length && lastNameMatch && firstNameMatch) {
-    // "CASTRO DIAZ, JAVIER ANTONIO" for last="CASTRO" + first="JAVIER".
-    hits = pick((t) => t.includes(lastNameMatch) && t.includes(firstNameMatch))
-  }
-  if (!hits.length) {
-    hits = pick((t) => cardMatchesProducer(t, input.producerDisplayName))
-  }
-
-  if (hits.length > 1) {
-    await snapshot(ctx, "fastlane-02a-ambiguous-producer")
-    const names = hits.map((h) => h.t.slice(0, 60))
+  if (!chosen) {
+    await snapshot(ctx, "fastlane-02a-producer-unverified")
     logger.error(
-      { want: input.producerDisplayName, matched: names },
-      "[Fastlane] REFUSING — the name matches more than one producer card",
+      { producerId: expected.producerId, want: expected.displayName, emails: expected.emails, refusal },
+      "[Fastlane] REFUSING to select — no card is positively this producer",
     )
     return {
       ok: false,
-      reason:
-        `Refused to file: "${input.producerDisplayName}" matches ${hits.length} producers ` +
-        `in SureLC — ${names.join(" | ")}. The name cannot tell them apart, because ` +
-        `SureLC carries a suffix (SR, II, JR) that we do not store. Filing would put ` +
-        `this agent's carrier paperwork on somebody else's record. Give this agent a ` +
-        `last name that matches their SureLC card exactly, then re-run.`,
+      code: refusal?.code ?? PRODUCER_NOT_FOUND,
+      reason: refusal?.reason ?? `[${PRODUCER_NOT_FOUND}] No producer card rendered. Nothing was filed.`,
     }
   }
 
-  let producerCard = hits.length === 1 ? cardEls[hits[0].i] : null
-
-  if (!producerCard && lastNameMatch) {
-    // Last resort: search narrowed by lastName already; if exactly
-    // one card is visible after the search filter, it's our producer.
-    const allCards = await page.$$("bga-producer-card")
-    if (allCards.length === 1) {
-      producerCard = allCards[0]
-    }
-  }
-  let selectBtn: any = null
-  if (producerCard) {
-    selectBtn = await producerCard.$('button:has-text("SELECT")')
-  }
-  if (!selectBtn) {
-    // Fallback for older builds — look for a card-like wrapper
-    // containing the producer's name + a SELECT button.
-    selectBtn = await page.$(
-      `.viewport__item:has-text("${input.producerDisplayName}") button:has-text("SELECT")`,
-    )
-  }
-  if (!selectBtn && lastNameMatch && firstNameMatch) {
-    selectBtn = await page.$(
-      `.viewport__item:has-text("${lastNameMatch}"):has-text("${firstNameMatch}") button:has-text("SELECT")`,
-    )
-  }
-  if (!selectBtn && !producerCard) {
-    // No card at all is NOT the same thing as a flagged producer, and
-    // saying so sent three months of these to the wrong place. Report what
-    // is actually true: the producer is not in the list we can see.
-    const rendered = await page
-      .$$eval("bga-producer-card", (els) =>
-        els
-          .slice(0, 10)
-          .map((e) => (e.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60)),
-      )
-      .catch(() => [] as string[])
-    await snapshot(ctx, "fastlane-02c-no-producer-card")
-    logger.warn(
-      { rendered, want: input.producerDisplayName },
-      "[Fastlane] producer card not found — not a flagged producer",
-    )
-    return {
-      ok: false,
-      reason:
-        `Producer "${input.producerDisplayName}" was not found in Fastlane's list. ` +
-        `This is a name mismatch on our side, not a SureLC problem — SureLC often ` +
-        `holds only the paternal surname. Cards rendered after the search: ` +
-        `${rendered.length ? rendered.join(" | ") : "(none)"}.`,
-    }
-  }
+  const producerCard = chosen.el
+  const selectBtn: any = await producerCard.$('button:has-text("SELECT")')
   if (!selectBtn) {
     // Card IS there but carries no SELECT button — Fastlane has flagged the
     // producer as having unresolved issues. Click the "N issues" popover
@@ -533,7 +459,7 @@ export async function runFastlaneOneProducerManyCarriers(
       // the card even if the popover never opens.
       if (!issueText && producerCard) {
         const cardText = await producerCard
-          .evaluate((c) => (c.textContent || "").replace(/\s+/g, " ").trim())
+          .evaluate((c: Element) => (c.textContent || "").replace(/\s+/g, " ").trim())
           .catch(() => "")
         const issueMatch = cardText.match(
           /\b\d+\s+issues?\b|\b(license|address|email|finra|signature|e&?o|background|disclosure|expired|missing|invalid|required)\s+\w[\w\s]{0,60}/i,
@@ -575,68 +501,11 @@ export async function runFastlaneOneProducerManyCarriers(
             : "(could not capture issue tooltip nor profile-scan)"),
     }
   }
-  // ⚠ VERIFY WE PICKED THE RIGHT HUMAN BEFORE WE FILE ANYTHING FOR THEM.
-  //
-  // Every match above is on the NAME — exact, then substring, then
-  // accent-folded first tokens, then "if only one card rendered, take it".
-  // The numeric producerId was passed in all along and used only for
-  // diagnostics, so nothing ever checked that the card we are about to click
-  // is the producer we were asked for.
-  //
-  // That filed 120 duplicate appointment requests onto the WRONG PERSON
-  // between 2026-09-01 and 09-07. Carlos Alexander Murray (producer 16679568)
-  // was re-run 16 times; "MURRAY, CARLOS ALEXANDER" folds equal to
-  // "MURRAY II, CARLOS ALEXANDER", so every run clicked his SON (12026084)
-  // and filed 8 carriers against him. The son's own bot never ran once. The
-  // father's contracting has still never been filed at all — which is why he
-  // stayed permanently top of the retry queue, re-firing every ~6.5 hours.
-  //
-  // The card carries the producer id in its own markup, so this is cheap and
-  // exact. Fail CLOSED: if we cannot confirm the id, do not file. A run that
-  // stops is a ticket; a run that files on the wrong person is 120 rows in
-  // someone else's record and a compliance clean-up nobody can automate.
-  if (input.producerId) {
-    const cardId = await (producerCard ?? selectBtn)
-      .evaluate((el: Element) => {
-        // Walk up to the card, then look for the producer id in any attribute
-        // or in a /producers/<id> href it renders.
-        const card = el.closest("bga-producer-card") ?? el.closest(".viewport__item") ?? el
-        const hay = [
-          card.getAttribute?.("id") ?? "",
-          card.getAttribute?.("data-producer-id") ?? "",
-          (card as HTMLElement).innerHTML || "",
-        ].join(" ")
-        const href = hay.match(/producers?\/(\d{4,})/)
-        if (href) return href[1]
-        const bare = hay.match(/\b(\d{6,})\b/)
-        return bare ? bare[1] : ""
-      })
-      .catch(() => "")
-    if (cardId && cardId !== String(input.producerId)) {
-      await snapshot(ctx, "fastlane-02a-wrong-producer")
-      logger.error(
-        { want: input.producerId, got: cardId, name: input.producerDisplayName },
-        "[Fastlane] REFUSING to select — card is a different producer",
-      )
-      return {
-        ok: false,
-        reason:
-          `Refused to file: the producer card matched by name is producer ${cardId}, ` +
-          `but this agent is producer ${input.producerId}. "${input.producerDisplayName}" ` +
-          `matches more than one producer in SureLC, so the name is not enough to ` +
-          `identify them. Filing here would have created appointment requests on ` +
-          `someone else's record. Fix the name or file this producer by hand.`,
-      }
-    }
-    if (!cardId) {
-      logger.warn(
-        { want: input.producerId, name: input.producerDisplayName },
-        "[Fastlane] could not read a producer id off the card — proceeding on the name match alone",
-      )
-    }
-  }
+  logger.info(
+    { producerId: expected.producerId, card: chosen.info },
+    "[Fastlane] card positively identified (email + name) — clicking SELECT",
+  )
 
-  logger.info({ producer: input.producerDisplayName }, "[Fastlane] clicking SELECT on producer card")
   await selectBtn.click().catch(() => undefined)
   await settle(page, 1500)
   await snapshot(ctx, "fastlane-02b-after-select")
@@ -652,6 +521,29 @@ export async function runFastlaneOneProducerManyCarriers(
   await clickNextSafe(ctx)
   await settle(page, 1500)
   await snapshot(ctx, "fastlane-03-step2-carriers")
+
+  // Second look, before any carrier is added: the Carriers step names the
+  // producer the wizard is holding (<bga-producer-name>). If it names someone
+  // else, stop here — nothing has been filed yet. An empty read is logged, not
+  // fatal: the card was already identified by email above.
+  const heldName = await page
+    .$eval("bga-producer-name", (el) => (el.textContent || "").replace(/\s+/g, " ").trim())
+    .catch(() => "")
+  if (heldName && !nameTokensMatch(heldName, chosen.info.name)) {
+    await snapshot(ctx, "fastlane-03a-wizard-holds-other-producer")
+    logger.error(
+      { producerId: expected.producerId, selected: chosen.info.name, wizardHolds: heldName },
+      "[Fastlane] REFUSING — the wizard holds a different producer than the card we selected",
+    )
+    return {
+      ok: false,
+      code: PRODUCER_IDENTITY_UNVERIFIED,
+      reason:
+        `[${PRODUCER_IDENTITY_UNVERIFIED}] Selected "${chosen.info.name}" (producer ${expected.producerId}) but ` +
+        `Fastlane's Carriers step names "${heldName}". Stopped before adding any carrier. Nothing was filed.`,
+    }
+  }
+  if (!heldName) logger.warn("[Fastlane] could not read <bga-producer-name> on the Carriers step")
 
   // ── Step 2 — Carriers: add ONLY the carriers the agent selected.
   //
@@ -1356,25 +1248,23 @@ export function foldAscii(s: string): string {
 }
 
 /**
- * Does this producer card belong to the agent we are looking for?
- * Compared on FIRST TOKENS, accent-folded, in either direction — so
- * "LANDINO, PAULA" matches "LANDINO VALBUENA, PAULA CAROLINA" and
- * "APONTE HERNANDEZ, EDGAR" matches "APONTE, EDGAR".
+ * Does this producer card's name agree with the agent we are looking for?
+ *
+ * WHOLE-TOKEN since 2026-10-02 (producerIdentity.nameTokensMatch): the first
+ * surname token of each side must be equal, and the first given-name token
+ * when both have one. "LANDINO, PAULA" still matches "LANDINO VALBUENA,
+ * PAULA CAROLINA" and "APONTE HERNANDEZ, EDGAR" matches "APONTE, EDGAR"; but
+ * "TOVAR, CARLOS" no longer matches "NUNEZ-TOVAR, CARLOS EDUARDO, SR." — the
+ * old substring test did, and filed Carlos Tovar's carriers on that card.
+ *
+ * A name match is never enough to SELECT a card on its own — see
+ * decideProducerCard, which requires the producer's email on the card.
  */
 export function cardMatchesProducer(
   cardText: string,
   displayName: string,
 ): boolean {
-  const norm = (v: string) => foldAscii(v).toUpperCase().replace(/\s+/g, " ").trim()
-  const parts = displayName.split(",")
-  const wantLast = norm(parts[0] || "").split(" ")[0]
-  const wantFirst = norm(parts[1] || "").split(" ")[0]
-  if (!wantLast) return false
-  const card = norm(cardText)
-  if (!card.includes(wantLast)) return false
-  // A first name is a strong extra signal, but only require it when we
-  // actually have one.
-  return wantFirst ? card.includes(wantFirst) : true
+  return nameTokensMatch(cardText, displayName)
 }
 
 async function diagnoseProducerProfile(

@@ -42,6 +42,12 @@ export interface TabResult {
   skipReason?: string
   /** Anything tab-specific the orchestrator should log. */
   details?: Record<string, unknown>
+  /**
+   * Stable machine code for a refusal the backoffice must act on, e.g.
+   * `producer_identity_unverified`, `filed_on_wrong_producer_suspected`
+   * (admin/producerIdentity.ts). The reason also starts with `[code]`.
+   */
+  code?: string
 }
 
 export function makeTabContext(

@@ -5,6 +5,7 @@ import { runActivation, type RunActivationInput } from "./botRunner.js"
 import { captureBgaTokens } from "./bgaTokenCapture.js"
 import { CHROMIUM_ARGS, launchChromium, browserPoolStats } from "./browserArgs.js"
 import { getAuthenticatedPage } from "./admin/sessionCache.js"
+import { AGENT_RUN_IN_PROGRESS, heldFilingLocks, tryAcquireFilingLock } from "./filingLock.js"
 
 const logger = pino({ name: "s4l-surelc-bot" })
 
@@ -34,6 +35,9 @@ const producerSchema = z.object({
   // found" dead-end seen for Zach Love (producer 11474885 already on
   // file) on 2026-05-05.
   existingProducerId: z.string().optional(),
+  // The agent's NPN. Fastlane checks it against SureLC's own record for
+  // existingProducerId before it selects anyone (producerIdentity.ts).
+  npn: z.string().optional(),
 })
 
 const profileSchema = z.object({
@@ -348,7 +352,7 @@ app.get("/health", (_req, res) => {
   // sustained queued>0 means runs are waiting on a browser, and active
   // pinned at max with a growing queue is the shape that used to end in
   // "operation aborted due to timeout" alerts.
-  res.json({ ok: true, browserPool: browserPoolStats() })
+  res.json({ ok: true, browserPool: browserPoolStats(), filingLocks: heldFilingLocks() })
 })
 
 app.post("/run-activation", async (req, res) => {
@@ -361,6 +365,37 @@ app.post("/run-activation", async (req, res) => {
     return res.status(400).json({ error: "bad_request", issues: parsed.error.issues })
   }
   const input = parsed.data as RunActivationInput
+  // Phase A files carrier requests. Two at once for the same agent (or the
+  // same producer) both pass the pre-dedup check and both file — Carlos Tovar,
+  // 2026-10-01 17:47 + 17:53. Refuse the second; see filingLock.ts.
+  const files = !input.phases || input.phases.includes("admin_setup")
+  const lock = files
+    ? tryAcquireFilingLock(
+        [
+          `agent:${input.agentOpenId}`,
+          input.producer.existingProducerId
+            ? `producer:${input.producer.existingProducerId}`
+            : null,
+        ],
+        input.jobId,
+      )
+    : null
+  if (lock && !lock.ok) {
+    logger.warn(
+      { jobId: input.jobId, agentOpenId: input.agentOpenId, holder: lock.holder },
+      "refusing activation — a filing run for this agent/producer is already in progress",
+    )
+    return res.status(409).json({
+      success: false,
+      stage: "launched",
+      code: AGENT_RUN_IN_PROGRESS,
+      error:
+        `[${AGENT_RUN_IN_PROGRESS}] Another admin_setup run (job ${lock.holder.jobId}, started ` +
+        `${new Date(lock.holder.since).toISOString()}) holds ${lock.holder.key}. Nothing was done.`,
+      phases: {},
+      evidenceFiles: [],
+    })
+  }
   logger.info(
     { jobId: input.jobId, agentOpenId: input.agentOpenId, phases: input.phases },
     "starting activation",
@@ -374,6 +409,8 @@ app.post("/run-activation", async (req, res) => {
       success: false,
       error: err?.message || "bot crashed",
     })
+  } finally {
+    if (lock && lock.ok) lock.release()
   }
 })
 
@@ -687,6 +724,18 @@ app.post("/create-appointment-requests", async (req, res) => {
     .map((c) => c.trim().toLowerCase())
     .filter(Boolean)
   const gaId = parsed.data.gaId ?? 1322
+  // Same per-producer lock as /run-activation's Phase A: this endpoint files
+  // carrier requests too, and must never overlap a Fastlane run on the same
+  // producer (filingLock.ts).
+  const lock = tryAcquireFilingLock([`producer:${producerId}`], `create-appointment-requests-${Date.now()}`)
+  if (!lock.ok) {
+    logger.warn({ producerId, holder: lock.holder }, "/create-appointment-requests refused — producer is locked")
+    return res.status(409).json({
+      ok: false,
+      code: AGENT_RUN_IN_PROGRESS,
+      error: `[${AGENT_RUN_IN_PROGRESS}] A filing run (job ${lock.holder.jobId}) holds ${lock.holder.key}. Nothing was created.`,
+    })
+  }
   try {
     const { chromium } = await import("playwright")
     const { loginAdmin } = await import("./admin/login.js")
@@ -897,6 +946,8 @@ app.post("/create-appointment-requests", async (req, res) => {
   } catch (err: any) {
     logger.error({ err: err?.message }, "/create-appointment-requests threw")
     return res.status(500).json({ ok: false, error: err?.message || "bot crashed" })
+  } finally {
+    lock.release()
   }
 })
 
