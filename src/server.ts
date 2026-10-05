@@ -802,9 +802,10 @@ app.post("/create-appointment-requests", async (req, res) => {
       // on every created request — Thomas then saw editable/unsigned
       // agreements at BGA stage with no producer email to send back to
       // (Javier Castro 2026-05-27). The SureLC SPA exposes the producer
-      // resource under /surecrm/producer/{id}.
+      // resource under /surecrm/producers/{id}/model (moved there in the
+      // 2026-10-05 redesign; /surecrm/producer/{id} now 404s).
       const producerRecord = await fetch(
-        `https://surelc.surancebay.com/surecrm/producer/${producerId}`,
+        `https://surelc.surancebay.com/surecrm/producers/${producerId}/model`,
         { headers: { Authorization: `Bearer ${bearer}` } },
       )
         .then((r) => (r.ok ? r.json() : null))
@@ -1503,7 +1504,7 @@ app.post("/ensure-signature", async (req, res) => {
  * POST /set-producer-email
  *
  * Update the SureLC producer record's `email` field via the BGA SPA's
- * own Bearer-JWT endpoint (PUT /surecrm/producer/{id}). The public
+ * own Bearer-JWT endpoint (PUT /surecrm/producers/{id}/update). The public
  * x-api-key API path (PUT /api/v2/producers/) silently NO-OPs the
  * email field on UPDATE — likely because SureLC pins NIPR-sourced
  * values there. The BGA admin SPA is the source-of-truth path admins

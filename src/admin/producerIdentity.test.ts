@@ -195,6 +195,16 @@ check("we have an NPN but the record has none → unverified", identityFromRecor
 check("no NPN from the backoffice → email still anchors the id", identityFromRecord("11383068", rec, undefined).ok, true)
 check("record without email → unverified", identityFromRecord("11383068", { ...rec, email: null, effectiveEmail: null }, "22175721").ok, false)
 check("record for a different id → unverified", identityFromRecord("11383068", { ...rec, id: 5861981 }, "22175721").ok, false)
+// New (post 2026-10-05) /surecrm/producers/{id}/model shape: producerId, email, no id/effectiveEmail/fullName.
+const model = { producerId: 11383068, npn: "22175721", email: "JuanAlvarez@agent.example.com", firstName: "Juan", lastName: "Alvarez" }
+check("/model shape → identity", (() => { const r = identityFromRecord("11383068", model, "22175721"); return r.ok && r.identity })(), {
+  producerId: "11383068",
+  emails: ["juanalvarez@agent.example.com"],
+  displayName: "Alvarez, Juan",
+  npn: "22175721",
+})
+check("/model shape for a different producerId → unverified", identityFromRecord("11383068", { ...model, producerId: 5861981 }, "22175721").ok, false)
+check("record with no id of any kind → unverified", identityFromRecord("11383068", { ...model, producerId: undefined }, "22175721").ok, false)
 check("record unreadable → unverified", identityFromRecord("11383068", null, "22175721").ok, false)
 
 check(

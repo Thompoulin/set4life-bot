@@ -26,7 +26,7 @@
  * ─── What identifies a card now ──────────────────────────────────────
  *
  * Before Fastlane opens, the bot reads producer <producerId> from SureLC's own
- * API (GET /surecrm/producer/{id}, read-only, the same call
+ * API (GET /surecrm/producers/{id}/model, read-only, the same call
  * /create-appointment-requests has used since 2026-05-27). That record is the
  * id-linked truth: its name, its email, its NPN.
  *
@@ -123,8 +123,14 @@ export function emailsInText(text: string): string[] {
 
 // ─── the producer record ───────────────────────────────────────────
 
-/** The fields of GET /surecrm/producer/{id} this module reads. */
+/**
+ * The fields of GET /surecrm/producers/{id}/model this module reads. Since the
+ * 2026-10-05 SureLC redesign the record is keyed `producerId` and carries
+ * `email` only (no `id` / `effectiveEmail` / `fullName`); the old names stay
+ * optional so a legacy-shaped record still parses.
+ */
 export interface SureLcProducerRecord {
+  producerId?: number | string
   id?: number | string
   npn?: string | number | null
   email?: string | null
@@ -170,8 +176,13 @@ export function identityFromRecord(
   if (!record || typeof record !== "object") {
     return unverified(`Could not read producer ${producerId} from SureLC, so no Fastlane card can be checked against it.`)
   }
-  if (record.id != null && String(record.id) !== String(producerId)) {
-    return unverified(`SureLC returned producer ${record.id} when asked for ${producerId}.`)
+  for (const returned of [record.producerId, record.id]) {
+    if (returned != null && String(returned) !== String(producerId)) {
+      return unverified(`SureLC returned producer ${returned} when asked for ${producerId}.`)
+    }
+  }
+  if (record.producerId == null && record.id == null) {
+    return unverified(`SureLC's record for ${producerId} carries no producer id, so it cannot be confirmed as that producer.`)
   }
   const recNpn = digits(record.npn)
   const wantNpn = digits(expectedNpn)
@@ -403,13 +414,13 @@ export async function captureSurecrmBearer(
   return bearer
 }
 
-/** GET /surecrm/producer/{id}. Read-only. null on any failure. */
+/** GET /surecrm/producers/{id}/model. Read-only. null on any failure. */
 export async function fetchProducerRecord(
   bearer: string,
   producerId: string,
 ): Promise<SureLcProducerRecord | null> {
   try {
-    const r = await fetch(`https://surelc.surancebay.com/surecrm/producer/${producerId}`, {
+    const r = await fetch(`https://surelc.surancebay.com/surecrm/producers/${producerId}/model`, {
       headers: { Authorization: `Bearer ${bearer}` },
     })
     if (!r.ok) return null
