@@ -3666,6 +3666,14 @@ async function fillEno(
     return { ok: false, reason: "no E&O certificate URL provided" }
   }
   await goToTab(page, producerId, "eno", ctx.logger)
+  // 2026-10-05 redesign: let the tab render before judging it. It shows one of
+  // the policy cards, the "Add Existing E&O Policy" uploader, or an ADD button.
+  await page
+    .waitForSelector(
+      'sb-eno-policy-uploader, .selector__dropzone, sb-eno-list-card, bga-eno-list-card, button:has-text("ADD")',
+      { timeout: 10_000 },
+    )
+    .catch(() => undefined)
 
   // Recover from leftover dirty form state from a previous failed
   // run (Demetrius 2026-05-09: SureLC pre-filled Case Limit with a
@@ -3743,7 +3751,25 @@ async function fillEno(
   // "ADD EXISTING POLICY". Owner reported 2026-05-05 the bot found
   // the button but landed on the form with EVERY required field
   // empty + a "Must be specified" red error under each.
-  const addBtn = await firstVisible(page, [
+  //
+  // 2026-10-05 redesign: a producer with no policy no longer shows an ADD
+  // button at all. The tab IS the "Add Existing E&O Policy" card
+  // (<sb-eno-policy-uploader>: "Upload the declaration page of your E&O
+  // policy.") with a dropzone and one hidden file input. That was the
+  // "Add Existing Policy button not found … visible buttons: light_mode |
+  // chevron_left; file inputs in DOM: 1" failure. When the uploader is already
+  // on screen there is nothing to open: go straight to the upload.
+  const uploaderShowing = await page
+    .evaluate(
+      () =>
+        !!document.querySelector("sb-eno-policy-uploader, .selector__dropzone") ||
+        /Upload the declaration page of your E&O policy|Add Existing E&O Policy/i.test(document.body?.innerText || ""),
+    )
+    .catch(() => false)
+  if (uploaderShowing) logger.info("[E&O] uploader already on screen (new UI) — skipping the ADD button")
+  const addBtn = uploaderShowing
+    ? null
+    : await firstVisible(page, [
     'button:has-text("ADD EXISTING POLICY")',
     'button:has-text("Add Existing Policy")',
     'button:has-text("Add E&O")',
@@ -3751,7 +3777,9 @@ async function fillEno(
     'button:has-text("Add")',
     'button[aria-label*="add" i]',
   ])
-  if (addBtn) {
+  if (uploaderShowing) {
+    await assertOnProducerTab(page, producerId, "eno")
+  } else if (addBtn) {
     try {
       await addBtn.click()
       await settle(page, 1200)
@@ -3879,6 +3907,9 @@ async function fillEno(
   // rebuilt UI, so it's now first in the list and the direct-input path is a
   // last resort.
   const ENO_UPLOAD_BUTTON_SELECTORS = [
+    // 2026-10-05: the "Add Existing E&O Policy" card's dropzone.
+    ".selector__dropzone",
+    'sb-eno-policy-uploader [class*="dropzone"]',
     'button.message__button:has(mat-icon:text-is("publish"))',
     'button:has(mat-icon:text-is("publish"))',
     'button:has-text("publish")',

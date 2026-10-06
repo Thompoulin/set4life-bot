@@ -23,6 +23,7 @@
  *      SUBMIT on Preview
  */
 
+import type { Locator, Page } from "playwright"
 import {
   type TabContext,
   type TabResult,
@@ -42,6 +43,15 @@ import {
   identitySearchTerms,
   nameTokensMatch,
 } from "./producerIdentity.js"
+import {
+  findOneProducerManyCarriersStart,
+  readPreview,
+  readSelectedCarrierNames,
+  readSelectedCount,
+  readSubmitDialog,
+  visibleValidationText,
+  waitForWizardStep,
+} from "./fastlaneUi.js"
 
 export interface FastlaneInput {
   /** Producer's full name as displayed in the SureLC list (e.g. "LOVE, ZACHARY EDMOND"). */
@@ -246,16 +256,22 @@ export async function runFastlaneOneProducerManyCarriers(
   await snapshot(ctx, "fastlane-01-landing")
 
   // ── Step 0 — pick the "One Producer → Multiple Carriers" tile.
-  const tile = await firstVisible(page, [
-    'text=/One Producer.*Multiple Carriers/i',
-    '[class*="tile"]:has-text("ONE PRODUCER")',
-    'div:has-text("ONE PRODUCER"):has-text("MULTIPLE CARRIERS")',
-  ])
-  if (!tile) {
+  //
+  // 2026-10-05 redesign: the tile is a <bga-mass-contracting-action-link>
+  // whose START REQUEST button opens the wizard. Its words have no spaces in
+  // the DOM, so the old text=/One Producer.*Multiple Carriers/ matched
+  // nothing, and the Data Express tile ("SEND UPDATES") carries the same two
+  // phrases. findOneProducerManyCarriersStart accepts exactly one tile.
+  const startBtn = await findOneProducerManyCarriersStart(page, 20_000)
+  if (!startBtn) {
     return { ok: false, reason: "Fastlane 'One Producer Many Carriers' tile not found" }
   }
-  await tile.click().catch(() => undefined)
+  await startBtn.click({ timeout: 8_000 }).catch(async () => {
+    await startBtn.evaluate((el: HTMLElement) => el.click()).catch(() => undefined)
+  })
   await settle(page, 1500)
+  // Wait for the wizard (URL /bga/fastlane/multiCarriers/... and the step nav).
+  await waitForWizardStep(page, "producer", 15_000)
 
   // Dismiss any leftover "Are you sure you want to exit before
   // submitting?" Warning modal from a previous bot session that
@@ -304,6 +320,11 @@ export async function runFastlaneOneProducerManyCarriers(
   }
 
   const search =
+    (await firstVisible(page, [
+      // 2026-10-05: <sb-search-filter><mat-form-field><input placeholder="Search">
+      "sb-search-filter input",
+      'input[placeholder="Search"]',
+    ])) ||
     (await page.$('mat-label:has-text("Search") >> xpath=ancestor::*[self::mat-form-field][1] >> input').catch(() => null)) ||
     (await firstVisible(page, [
       'input[placeholder*="search" i]',
@@ -518,9 +539,10 @@ export async function runFastlaneOneProducerManyCarriers(
   // explicit NEXT click between Step 1 (Producer) and Step 2
   // (Carriers). Without it, the bot stays on the Producer page
   // looking for an ADD ALL button that's only on the Carriers page.
-  await clickNextSafe(ctx)
+  const toCarriers = await advanceTo(ctx, "carriers")
   await settle(page, 1500)
   await snapshot(ctx, "fastlane-03-step2-carriers")
+  if (toCarriers) return toCarriers
 
   // Second look, before any carrier is added: the Carriers step names the
   // producer the wizard is holding (<bga-producer-name>). If it names someone
@@ -587,6 +609,16 @@ export async function runFastlaneOneProducerManyCarriers(
       { wanted },
       `[Fastlane] adding ONLY ${wanted.length} selected carrier(s) (no ADD ALL)`,
     )
+    // The available list loads asynchronously ("Loading available items...").
+    await page
+      .waitForFunction(
+        () =>
+          document.querySelector('[id^="item-"]') !== null ||
+          /No available items|Nothing found/i.test(document.body?.innerText || ""),
+        undefined,
+        { timeout: 20_000 },
+      )
+      .catch(() => undefined)
     for (const c of selected) {
       const name = (c.carrierName || "").trim()
       if (!name) continue
@@ -687,7 +719,12 @@ export async function runFastlaneOneProducerManyCarriers(
       }
     }
   }
-  await clickNextSafe(ctx)
+  // Fail closed BEFORE leaving the Carriers step: the cart must hold exactly
+  // the carriers we added, nothing else (never ADD ALL, never a stray row).
+  const cartCheck = await verifyCart(ctx, added, selected)
+  if (cartCheck) return cartCheck
+  const toStates = await advanceTo(ctx, "states")
+  if (toStates) return { ...toStates, details: { added, notFound } }
 
   // ── Step 3 — States: ensure every state checkbox is on for every
   //    carrier section. Default in SureLC is "all checked", so this
@@ -770,7 +807,8 @@ export async function runFastlaneOneProducerManyCarriers(
   // virtualized rows until scroll triggers them).
   await tickAllStateBoxes("second-pass")
   await snapshot(ctx, "fastlane-06-states-after-check-all")
-  await clickNextSafe(ctx)
+  const toProducts = await advanceTo(ctx, "products")
+  if (toProducts) return { ...toProducts, details: { added, notFound } }
 
   // ── Step 4 — Products: SureLC pre-checks the standard product
   //    set per carrier (Fixed Life by default). Verify all enabled
@@ -789,37 +827,18 @@ export async function runFastlaneOneProducerManyCarriers(
   } catch {
     /* ignore */
   }
-  await clickNextSafe(ctx)
+  const toPreview = await advanceTo(ctx, "preview")
+  if (toPreview) return { ...toPreview, details: { added, notFound } }
 
   // ── Step 5 — Preview + SUBMIT.
   //
-  // Tangela Collins-Myers (producer 3579873, 2026-07-26): bot reached
-  // Preview after a UHL-only partial Fastlane run but firstVisible on the
-  // five button selectors returned null → admin_setup_partial. SureLC's
-  // Preview step is Angular-Material and often mounts the final CTA late
-  // (or as mat-flat-button / role=button / "Submit Request" / disabled
-  // until validation settles). Wait, re-NEXT if still on Products, poll
-  // for a broader selector set, force-enable if needed, then click.
+  // 2026-10-05: the last wizard step is "Preview" ("Contracting Request
+  // Preview": producer, sending email, "Carriers (N)"). SUBMIT replaces NEXT
+  // there and is disabled until the step validates (valid Sending Email).
   await page
     .waitForLoadState("networkidle", { timeout: 15_000 })
     .catch(() => undefined)
   await settle(page, 1500)
-
-  // If we never left Products (NEXT was disabled / missed), try NEXT once more.
-  const stillOnProducts = await page
-    .$('text=/Products|Select Products|Product Selection/i')
-    .catch(() => null)
-  const previewMarker = await page
-    .$('text=/Preview|Review|Summary|Confirm/i')
-    .catch(() => null)
-  if (stillOnProducts && !previewMarker) {
-    logger.info("[Fastlane] still on Products after NEXT — re-clicking NEXT")
-    await clickNextSafe(ctx)
-    await page
-      .waitForLoadState("networkidle", { timeout: 10_000 })
-      .catch(() => undefined)
-    await settle(page, 1200)
-  }
 
   // Scroll the wizard panel so a sticky/footer SUBMIT is in the DOM viewport.
   await page.evaluate(() => {
@@ -830,137 +849,217 @@ export async function runFastlaneOneProducerManyCarriers(
   await settle(page, 400)
   await snapshot(ctx, "fastlane-08-step5-preview")
 
-  const submitSelectors = [
-    'button:has-text("SUBMIT")',
-    'button:has-text("Submit")',
-    'button:has-text("Submit Request")',
-    'button:has-text("SUBMIT REQUEST")',
-    'button:has-text("Send")',
-    'button:has-text("Send Request")',
-    'button:has-text("FINISH")',
-    'button:has-text("Finish")',
-    'button[type="submit"]',
-    'button.mat-flat-button:has-text("SUBMIT")',
-    'button.mat-raised-button:has-text("SUBMIT")',
-    'button.mat-button:has-text("SUBMIT")',
-    'a:has-text("SUBMIT")',
-    'a:has-text("Submit")',
-    '[role="button"]:has-text("SUBMIT")',
-    '[role="button"]:has-text("Submit")',
-  ]
-
-  let submitBtn = null as Awaited<ReturnType<typeof firstVisible>>
-  // Poll up to ~20s — Angular often paints the CTA after networkidle.
-  for (let attempt = 0; attempt < 10 && !submitBtn; attempt++) {
-    submitBtn = await firstVisible(page, submitSelectors)
-    if (submitBtn) break
-    // Also try Playwright's getByRole for accessibility-tree hits that
-    // firstVisible (querySelector-based) can miss when the label is
-    // split across nested spans.
-    try {
-      const byRole = page.getByRole("button", {
-        name: /submit|send request|finish/i,
-      })
-      const count = await byRole.count()
-      for (let i = 0; i < count; i++) {
-        const loc = byRole.nth(i)
-        if (await loc.isVisible().catch(() => false)) {
-          await loc.scrollIntoViewIfNeeded().catch(() => undefined)
-          // Prefer a real ElementHandle for the shared click path below.
-          const handle = await loc.elementHandle().catch(() => null)
-          if (handle) {
-            submitBtn = handle as any
-            break
-          }
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-    if (submitBtn) break
-    // Mid-poll: if a NEXT is still visible and SUBMIT isn't, click NEXT
-    // (we may be one step short of Preview).
-    if (attempt === 3 || attempt === 6) {
-      const nextStillThere = await firstVisible(page, [
-        'button:has-text("NEXT")',
-        'button:has-text("Next")',
-      ])
-      if (nextStillThere) {
-        logger.info(
-          `[Fastlane] SUBMIT not found yet (attempt ${attempt + 1}) — clicking residual NEXT`,
-        )
-        await (nextStillThere as any).click().catch(() => undefined)
-        await settle(page, 1500)
-      }
-    }
-    await settle(page, 1500)
-  }
-
-  if (!submitBtn) {
-    // Last-ditch: dump visible button labels into the reason so the next
-    // operator/session can tighten selectors without a full re-debug.
-    let visibleLabels = ""
-    try {
-      visibleLabels = await page.evaluate(() => {
-        const els = Array.from(
-          document.querySelectorAll("button, a[role='button'], [role='button']"),
-        )
-        return els
-          .filter((el) => {
-            const s = window.getComputedStyle(el as Element)
-            return s.display !== "none" && s.visibility !== "hidden"
-          })
-          .map((el) => ((el as HTMLElement).innerText || "").trim().slice(0, 40))
-          .filter((t) => t.length > 0)
-          .slice(0, 20)
-          .join(" | ")
-      })
-    } catch {
-      /* ignore */
-    }
-    logger.warn(
-      { visibleLabels },
-      "[Fastlane] SUBMIT button not found on preview after retries",
+  // Second look at the producer and the cart, on the page that is about to be
+  // submitted. "Sending Email" defaults to the selected producer's email, so it
+  // must be one of the emails SureLC holds for producerId; "Carriers (N)" must
+  // be exactly what we added. Anything else: stop, nothing is filed.
+  const preview = await readPreview(page)
+  const knownEmails = new Set([...expected.emails, ...chosen.info.emails].map((e) => e.toLowerCase()))
+  if (preview.sendingEmail && !knownEmails.has(preview.sendingEmail.toLowerCase())) {
+    await snapshot(ctx, "fastlane-08a-preview-wrong-email")
+    logger.error(
+      { producerId: expected.producerId, previewEmail: "(redacted)", known: knownEmails.size },
+      "[Fastlane] REFUSING — Preview's Sending Email is not this producer's email",
     )
     return {
       ok: false,
-      reason: `Fastlane SUBMIT button not found on preview${
-        visibleLabels ? ` (visible CTAs: ${visibleLabels})` : ""
-      }`,
+      code: PRODUCER_IDENTITY_UNVERIFIED,
+      reason:
+        `[${PRODUCER_IDENTITY_UNVERIFIED}] Fastlane's Preview names a Sending Email that is not an email SureLC ` +
+        `holds for producer ${expected.producerId}. Stopped before SUBMIT. Nothing was filed.`,
+      details: { added, notFound },
+    }
+  }
+  if (!preview.sendingEmail) logger.warn("[Fastlane] could not read the Sending Email on Preview")
+  if (preview.carriersCount !== null && preview.carriersCount !== added.length) {
+    await snapshot(ctx, "fastlane-08b-preview-carrier-count")
+    logger.error(
+      { previewCount: preview.carriersCount, added: added.length },
+      "[Fastlane] REFUSING — Preview lists a different number of carriers than we added",
+    )
+    return {
+      ok: false,
+      reason:
+        `Fastlane's Preview lists ${preview.carriersCount} carrier(s) but the agent selected ${added.length} ` +
+        `(${added.join(", ")}). Stopped before SUBMIT. Nothing was filed.`,
+      details: { added, notFound },
+    }
+  }
+  if (preview.carriersCount === null) logger.warn("[Fastlane] could not read 'Carriers (N)' on Preview")
+
+  // SUBMIT: a real <button> named SUBMIT, enabled by SureLC itself. Never
+  // force-enabled — a disabled SUBMIT means the step is invalid, and clicking
+  // it anyway would file an invalid request.
+  const submitBtn = await findSubmitButton(page, 20_000)
+  if (!submitBtn) {
+    const visibleLabels = (
+      await page
+        .evaluate(() =>
+          Array.from(document.querySelectorAll("button, a[role='button'], [role='button']"))
+            .filter((el) => {
+              const st = window.getComputedStyle(el as Element)
+              return st.display !== "none" && st.visibility !== "hidden"
+            })
+            .map((el) => ((el as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().slice(0, 40))
+            .filter((t) => t.length > 0)
+            .slice(0, 20)
+            .join(" | "),
+        )
+        .catch(() => "")
+    ).trim()
+    logger.warn({ visibleLabels }, "[Fastlane] SUBMIT button not found on preview after retries")
+    return {
+      ok: false,
+      reason: `Fastlane SUBMIT button not found on preview${visibleLabels ? ` (visible CTAs: ${visibleLabels})` : ""}`,
+    }
+  }
+  if (!(await waitEnabled(submitBtn, 10_000))) {
+    const why = await visibleValidationText(page)
+    await snapshot(ctx, "fastlane-08c-submit-disabled")
+    return {
+      ok: false,
+      reason: `Fastlane SUBMIT is disabled on preview — SureLC considers the request incomplete${why ? ` (${why})` : ""}. Nothing was filed.`,
+      details: { added, notFound },
     }
   }
 
-  // Un-disable if Angular left it disabled pending a validation spin.
-  await page
-    .evaluate((el) => {
-      const btn = el as HTMLButtonElement
-      if (btn && btn.disabled) {
-        btn.disabled = false
-        btn.removeAttribute("disabled")
-        btn.classList.remove("mat-button-disabled", "mat-mdc-button-disabled")
-      }
-    }, submitBtn)
-    .catch(() => undefined)
-
-  await (submitBtn as any).scrollIntoViewIfNeeded?.({ timeout: 2000 }).catch(() => undefined)
-  await (submitBtn as any).click({ timeout: 5000 }).catch(async () => {
-    // Force click if interceptors block the native one.
-    await page.evaluate((el) => (el as HTMLElement).click(), submitBtn).catch(() => undefined)
-  })
-  await settle(page, 2500)
+  await submitBtn.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => undefined)
+  await submitBtn.click({ timeout: 5000 })
+  await settle(page, 1500)
   await snapshot(ctx, "fastlane-09-after-submit")
 
-  // Confirmation pattern.
-  const confirm = await page.$(
-    'text=/sent|submitted|requested|created|success/i',
-  )
-  if (confirm) return { ok: true, details: { added, notFound } }
-
+  // SUBMIT posts the request from a "Processing Contracting Requests" dialog
+  // that lists one row per carrier (success / error) and then shows DONE.
+  // Wait for it so a carrier-level rejection is reported, not lost. If the
+  // results never finish (they arrive over a websocket), the request has still
+  // been posted — botRunner's post-submit verification is then the judge.
+  let dlg = await readSubmitDialog(page)
+  for (let i = 0; i < 80 && !dlg.done; i++) {
+    if (!dlg.open && i >= 6) break
+    await page.waitForTimeout(1500)
+    dlg = await readSubmitDialog(page)
+  }
+  await snapshot(ctx, "fastlane-10-submit-results")
+  if (!dlg.open) {
+    return {
+      ok: false,
+      reason: "Fastlane SUBMIT was clicked but the 'Processing Contracting Requests' dialog never appeared; nothing confirms a filing",
+      details: { added, notFound },
+    }
+  }
+  if (dlg.done) {
+    const doneBtn = page.getByRole("button", { name: /^\s*done\s*$/i })
+    await doneBtn.first().click({ timeout: 3000 }).catch(() => undefined)
+  }
+  logger.info({ done: dlg.done, ok: dlg.ok, failed: dlg.failed }, "[Fastlane] submit results")
+  if (dlg.failed.length > 0) {
+    return {
+      ok: false,
+      reason:
+        "Fastlane SUBMIT reported errors: " +
+        dlg.failed.map((f) => `${f.carrier || "(carrier)"}: ${f.error || "error"}`).join(" | "),
+      details: { added, notFound, submitOk: dlg.ok, submitFailed: dlg.failed },
+    }
+  }
+  if (dlg.done) return { ok: true, details: { added, notFound, submitOk: dlg.ok } }
   return {
     ok: true,
-    reason: "Submitted but no explicit confirmation marker matched; check evidence screenshots",
+    reason: "Submitted but SureLC's results dialog did not finish; check evidence screenshots",
     details: { added, notFound },
   }
+}
+
+/** The enabled-or-not SUBMIT button of the last wizard step, by role and name. */
+async function findSubmitButton(page: Page, timeoutMs: number): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs
+  do {
+    for (const name of [/^\s*submit\s*$/i, /^\s*(submit|send request|finish)\b/i]) {
+      const loc = page.getByRole("button", { name })
+      const n = await loc.count().catch(() => 0)
+      for (let i = 0; i < n; i++) {
+        if (await loc.nth(i).isVisible().catch(() => false)) return loc.nth(i)
+      }
+    }
+    await page.waitForTimeout(1000)
+  } while (Date.now() < deadline)
+  return null
+}
+
+async function waitEnabled(loc: Locator, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  do {
+    if (await loc.isEnabled().catch(() => false)) return true
+    await new Promise((r) => setTimeout(r, 500))
+  } while (Date.now() < deadline)
+  return false
+}
+
+/**
+ * Click NEXT and confirm the wizard reached `to` ("carriers" | "states" |
+ * "products" | "preview"). Returns null on success (or when the step nav
+ * cannot be read — legacy behaviour), otherwise a failure result that says
+ * which step it stayed on and what SureLC's validation printed.
+ */
+async function advanceTo(ctx: TabContext, to: string): Promise<TabResult | null> {
+  const { page, logger } = ctx
+  await clickNextSafe(ctx)
+  let r = await waitForWizardStep(page, to, 10_000)
+  if (!r.reached && r.active !== null) {
+    logger.warn({ to, active: r.active }, "[Fastlane] wizard did not advance — clicking NEXT once more")
+    await clickNextSafe(ctx)
+    r = await waitForWizardStep(page, to, 8_000)
+  }
+  if (r.reached || r.active === null) return null
+  const why = await visibleValidationText(page)
+  await snapshot(ctx, `fastlane-stuck-before-${to}`)
+  return {
+    ok: false,
+    reason:
+      `Fastlane stayed on the "${r.active}" step after NEXT (expected "${to}")` +
+      (why ? `: ${why}` : "") +
+      ". Nothing was filed.",
+  }
+}
+
+/**
+ * The Carriers step's cart must hold exactly the carriers we clicked ADD on:
+ * its "Selected (N)" counter equals the number added, and every Selected row
+ * is one of the agent's carriers. Anything else fails closed before NEXT.
+ */
+async function verifyCart(
+  ctx: TabContext,
+  added: string[],
+  selected: Array<{ carrierName: string; carrierNaic?: string }>,
+): Promise<TabResult | null> {
+  const { page, logger } = ctx
+  const count = await readSelectedCount(page)
+  const names = await readSelectedCarrierNames(page)
+  const wanted = selected.flatMap((c) => expandCarrierNames(c.carrierName).map(normalizeCarrier)).filter(Boolean)
+  const stray = names.filter((n) => {
+    const nn = normalizeCarrier(n)
+    return !wanted.some(
+      (w) =>
+        nn.includes(w) ||
+        w.includes(nn) ||
+        w.split(" ").filter((t) => t.length > 2).every((t) => nn.includes(t)),
+    )
+  })
+  logger.info({ count, names, added }, "[Fastlane] cart check")
+  // Names are advisory (an id-based ADD may show SureLC's legal name, which
+  // our DB spelling need not resemble); the counter is the hard gate.
+  if (stray.length > 0) logger.warn({ stray }, "[Fastlane] a Selected row does not resemble any carrier the agent picked")
+  if (count !== null && count !== added.length) {
+    await snapshot(ctx, "fastlane-04a-cart-mismatch")
+    logger.error({ count, names, added, stray }, "[Fastlane] REFUSING — the cart does not match the agent's selection")
+    return {
+      ok: false,
+      reason:
+        `Fastlane's cart holds ${count ?? names.length} carrier(s) [${names.join(", ")}] but the agent selected ` +
+        `${added.length} [${added.join(", ")}]. Stopped before NEXT. Nothing was filed.`,
+      details: { added, notFound: [] },
+    }
+  }
+  return null
 }
 
 /**
@@ -981,6 +1080,44 @@ export async function runFastlaneOneProducerManyCarriers(
  * to adding anything else).
  */
 async function addSingleCarrier(
+  ctx: TabContext,
+  carrierName: string,
+  carrierNaic?: string,
+): Promise<boolean> {
+  if (await addSingleCarrierInDom(ctx, carrierName, carrierNaic)) return true
+  // The available list is a virtual scroll: only the rows near the viewport
+  // exist in the DOM. Narrow it with the step's own "Search by Carrier name"
+  // filter (client-side, changes nothing in SureLC) and look again.
+  const { page, logger } = ctx
+  const search = await firstVisible(page, [
+    'bga-step-carriers sb-search-filter input',
+    'input[placeholder*="Search by Carrier" i]',
+  ])
+  if (!search) return false
+  const terms = Array.from(
+    new Set(
+      expandCarrierNames(carrierName)
+        .map((n) => n.split(/\s+/).slice(0, 2).join(" "))
+        .filter((n) => n.length > 2),
+    ),
+  ).slice(0, 4)
+  try {
+    for (const term of terms) {
+      await (search as any).fill(term)
+      await page.waitForTimeout(1000) // the step debounces the filter by 300ms
+      if (await addSingleCarrierInDom(ctx, carrierName, carrierNaic)) {
+        logger.info({ carrierName, term }, "[Fastlane] found the carrier through the step's search filter")
+        return true
+      }
+    }
+  } finally {
+    await (search as any).fill("").catch(() => undefined)
+    await page.waitForTimeout(600)
+  }
+  return false
+}
+
+async function addSingleCarrierInDom(
   ctx: TabContext,
   carrierName: string,
   carrierNaic?: string,
@@ -1060,17 +1197,9 @@ async function addSingleCarrier(
   }
   const targetNorms = nameCandidates.map(normalizeCarrier).filter(Boolean)
 
-  const containerSelectors = [
-    ".items__item",
-    ".item",
-    '[id^="item-"]',
-    "mat-row",
-    "tr",
-    "mat-list-item",
-    "li",
-    '[class*="carrier"]',
-    '[class*="row"]',
-  ]
+  // Available rows are div.items__item.item#item-<id>. The Selected column
+  // reuses .items__item (as a <button>, no id), so only id'd rows count.
+  const containerSelectors = ['[id^="item-"]']
 
   for (const container of containerSelectors) {
     for (const nameFrag of nameCandidates) {
@@ -1115,7 +1244,7 @@ async function addSingleCarrier(
   // Last resort: scan every available item row for alias token overlap
   // (handles cases where :has-text fails on nested Angular nodes).
   try {
-    const allItems = await page.$$('.items__item, [id^="item-"]')
+    const allItems = await page.$$('[id^="item-"]')
     for (const row of allItems) {
       const rowText = await row
         .evaluate((el: Element) => (el.textContent || "").trim())
@@ -1143,47 +1272,28 @@ async function addSingleCarrier(
 
 async function clickNextSafe(ctx: TabContext): Promise<void> {
   const { page, logger } = ctx
-  const next = await firstVisible(page, [
-    'button:has-text("NEXT")',
-    'button:has-text("Next")',
-    'button:has-text("Continue")',
-    'button.mat-flat-button:has-text("NEXT")',
-    'button.mat-raised-button:has-text("NEXT")',
-    '[role="button"]:has-text("NEXT")',
-    '[role="button"]:has-text("Next")',
-  ])
-  if (next) {
-    try {
-      // Un-disable if Angular left NEXT greyed while carriers/states settle.
-      await page
-        .evaluate((el) => {
-          const btn = el as HTMLButtonElement
-          if (btn && btn.disabled) {
-            btn.disabled = false
-            btn.removeAttribute("disabled")
-            btn.classList.remove("mat-button-disabled", "mat-mdc-button-disabled")
-          }
-        }, next)
-        .catch(() => undefined)
-      await next.click({ timeout: 5000 })
-      await settle(page, 1200)
-    } catch (err: any) {
-      logger?.warn?.(`[Fastlane] NEXT click failed: ${err?.message || err}`)
-      await page.evaluate((el) => (el as HTMLElement).click(), next).catch(() => undefined)
-      await settle(page, 1200)
-    }
-  } else {
-    // getByRole fallback for nested-span NEXT labels.
-    try {
-      const byRole = page.getByRole("button", { name: /^(next|continue)$/i })
-      if ((await byRole.count()) > 0 && (await byRole.first().isVisible())) {
-        await byRole.first().click({ timeout: 5000 })
-        await settle(page, 1200)
-      }
-    } catch {
-      /* ignore */
-    }
+  // NEXT is "NEXT arrow_forward" in the wizard footer. Match by role and a
+  // leading NEXT/CONTINUE; never the producer list's "Next page" paginator.
+  const byRole = page.getByRole("button", { name: /^\s*(next|continue)\b(?!\s*page)/i })
+  const n = await byRole.count().catch(() => 0)
+  let next: Locator | null = null
+  for (let i = 0; i < n && !next; i++) {
+    if (await byRole.nth(i).isVisible().catch(() => false)) next = byRole.nth(i)
   }
+  if (!next) {
+    logger?.warn?.("[Fastlane] NEXT button not found")
+    return
+  }
+  // SureLC greys NEXT until the step validates; give it a moment, then click.
+  // Not force-enabled: the wizard's own handler refuses an invalid step anyway.
+  await waitEnabled(next, 6_000)
+  try {
+    await next.click({ timeout: 5000 })
+  } catch (err: any) {
+    logger?.warn?.(`[Fastlane] NEXT click failed: ${err?.message || err}`)
+    await next.evaluate((el: HTMLElement) => el.click()).catch(() => undefined)
+  }
+  await settle(page, 1200)
 }
 
 /**

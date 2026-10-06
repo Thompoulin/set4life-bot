@@ -11,7 +11,7 @@
  * ALL of Q15/Q15a/Q15b/Q15c "Yes" for anyone with a personal bankruptcy —
  * a false statement on the firm (Q15b) and pending (Q15c) questions.
  */
-import { pickYnForLabel, disclosureKeyForLabel } from "./review"
+import { pickYnForLabel, disclosureKeyForLabel } from "./review.js"
 
 const Q15 =
   "15 Have you personally or any insurance or securities brokerage firm with whom you have been associated filed a bankruptcy petition or declared bankruptcy?"

@@ -472,6 +472,10 @@ export async function gotoBga(
         page.getByRole("link", { name: new RegExp(`^${label}s?$`, "i") }).first(),
         page.getByRole("button", { name: new RegExp(`^${label}s?$`, "i") }).first(),
       ]
+      // The sidebar renders a beat after the SPA lands (2026-10-05: the click
+      // was skipped because the link wasn't in the DOM yet, then pushState
+      // carried the navigation). Give it a few seconds before giving up.
+      await page.locator(`a[href$="/${seg}"]`).first().waitFor({ state: "attached", timeout: 5_000 }).catch(() => {})
       for (const loc of candidates) {
         const found = await loc.count().catch(() => 0)
         if (!found) continue
