@@ -401,14 +401,23 @@ export async function captureSurecrmBearer(
     }
   }
   page.on("request", handler)
-  try {
-    await page.evaluate((id) => {
-      history.pushState({}, "", `/bga/producers/${id}/appointments`)
-      window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
-    }, String(producerId))
-    for (let i = 0; i < 10 && !bearer; i++) await page.waitForTimeout(500)
-  } catch {
-    /* fall through */
+  // Since the 2026-10-05 redesign the appointments route can render without
+  // any /surecrm/ call, so fall back to the profile route, whose
+  // /surecrm/producers/{id}/model call is what /diagnose-producer harvests.
+  for (const view of ["appointments", "profile"]) {
+    if (bearer) break
+    try {
+      await page.evaluate(
+        ([id, v]) => {
+          history.pushState({}, "", `/bga/producers/${id}/${v}`)
+          window.dispatchEvent(new PopStateEvent("popstate", { state: {} }))
+        },
+        [String(producerId), view] as const,
+      )
+      for (let i = 0; i < 20 && !bearer; i++) await page.waitForTimeout(500)
+    } catch {
+      /* try the next view */
+    }
   }
   page.off("request", handler)
   return bearer
