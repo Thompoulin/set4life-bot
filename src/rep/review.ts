@@ -38,6 +38,7 @@ import {
   waitForEnabledButton,
 } from "../admin/explanationDocs.js"
 import type pino from "pino"
+import { AUTH_FORM_MOUNTED, SSN_HOST, fillRepAuthGate, hasSsnGate } from "./authGate.js"
 import {
   firstVisible,
   settle,
@@ -1086,25 +1087,10 @@ export async function repReview(
       logger.warn({ err: err?.message }, "[Rep auth] failed to enumerate inputs")
     }
 
-    // SureLC's rep auth form (verified Sydney 2026-05-07 12:02 from
-    // the actual DOM dump at accounts.surancebay.com/oauth/authorize):
-    //
-    //   <auth-ssn-input id="auth-ssn-input-0" name="ssn">
-    //     <input class="hidden">          ← keystrokes go here (Material mask)
-    //     <input class="visible" readonly> ← display only
-    //   </auth-ssn-input>
-    //
-    //   <auth-date-input formcontrolname="dob">
-    //     <input matinput type="text" id="mat-input-0">  ← DOB text input
-    //     <input matnativecontrol id="mat-input-1">      ← datepicker shadow
-    //   </auth-date-input>
-    //
-    //   <button mat-flat-button>LOGIN</button>
-    //
-    // The custom auth-ssn-input component routes keystrokes from
-    // either inner input into the masked formcontrol. We click the
-    // outer component to focus, then keyboard.type() the 6 digits.
-    // For DOB, mat-input-0 is a plain text input; .fill works.
+    // SureLC's rep auth form: SSN last-6 + DOB + LOGIN. Selectors for both
+    // the pre-2026-10-05 (`auth-ssn-input` / `auth-date-input`) and the
+    // redesigned (`sb-ssn-input` / `sb-date-input`) generations live in
+    // ./authGate.ts, together with the fill + read-back logic.
 
     // RETRY for SureLC's intermittent email/password gate: the login.jsp
     // bypass (and sometimes the emailed link) lands on the standard
@@ -1113,7 +1099,7 @@ export async function repReview(
     // OAuth flow and yields the SSN/DOB gate on a later attempt (verified
     // manually 2026-06-03; the 2nd open reliably gave SSN/DOB). Without
     // this the run no-ops on the email-skew/bypass path.
-    let ssnHost = await page.$('auth-ssn-input')
+    let ssnHost = await hasSsnGate(page)
     for (let gateAttempt = 1; gateAttempt <= 6 && !ssnHost; gateAttempt++) {
       logger.warn(
         { gateAttempt, url: page.url() },
@@ -1143,95 +1129,28 @@ export async function repReview(
         .catch(() => undefined)
       await page
         .waitForSelector(
-          'auth-ssn-input, input[matinput], input.mat-mdc-input-element, input[type="password"]',
+          AUTH_FORM_MOUNTED,
           { timeout: 30_000 },
         )
         .catch(() => undefined)
       await settle(page, 2500)
-      ssnHost = await page.$('auth-ssn-input')
+      ssnHost = await hasSsnGate(page)
     }
     if (!ssnHost) {
-      return { ok: false, signed, failed: [{ reason: "SSN field not found at auth (email/password gate persisted after retries)" }], skipped }
+      // Say what was actually on screen: an "email/password gate" guess
+      // hid the 2026-10-05 tag rename for two days.
+      const hasPassword = !!(await page.$('input[type="password"]').catch(() => null))
+      return {
+        ok: false,
+        signed,
+        failed: [{ reason: `SSN field not found at auth (no SSN/DOB gate after retries; ${hasPassword ? "email/password login shown" : "no password field either"}; url ${page.url().split("?")[0]})` }],
+        skipped,
+      }
     }
-    // Focus the inner masked input directly (the .hidden one is the
-    // event-target; the .visible one is readonly and the outer host
-    // doesn't receive keystrokes). Use evaluate to focus regardless of
-    // Playwright's visibility heuristic.
-    const ssnFocused = await page
-      .evaluate(() => {
-        const el = document.querySelector(
-          "auth-ssn-input input.hidden, auth-ssn-input input:not([readonly])",
-        ) as HTMLInputElement | null
-        if (!el) return false
-        el.focus()
-        return true
-      })
-      .catch(() => false)
-    if (!ssnFocused) {
-      // Last-resort: click the host element so Material catches focus.
-      await ssnHost.click().catch(() => undefined)
+    const auth = await fillRepAuthGate(ctx, input.ssnLast6, input.dob, "auth", { snapshots: true })
+    if (!auth.ok) {
+      return { ok: false, signed, failed: [{ reason: auth.reason ?? "rep auth failed" }], skipped }
     }
-    await page.waitForTimeout(300)
-    await page.keyboard.type(input.ssnLast6, { delay: 100 })
-    await page.waitForTimeout(500)
-    await snapshot(ctx, "rep-step0a-after-ssn")
-
-    // DOB — auth-date-input has TWO inner inputs:
-    //   - id="mat-input-0"  type="text" matinput → THIS is the typeable one
-    //   - id="mat-input-1"  matnativecontrol      → datepicker shadow input
-    // Target by id specifically. fill() on mat-input-0 with force:true
-    // bypasses Material's "element not editable" check (which it
-    // sometimes reports while the parent form-field hasn't switched
-    // out of the "empty" state yet).
-    const dobSlashed = input.dob.replace(/-/g, "/")
-    const dobInput = await page.$(
-      'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
-    )
-    if (!dobInput) {
-      return { ok: false, signed, failed: [{ reason: "DOB field not found at auth" }], skipped }
-    }
-    try {
-      await (dobInput as any).fill(dobSlashed, { force: true, timeout: 10_000 })
-    } catch {
-      // Fallback — set value via JS, dispatch input/change events so
-      // Angular's reactive form picks it up.
-      await page.evaluate((val: string) => {
-        const el = document.querySelector(
-          'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
-        ) as HTMLInputElement | null
-        if (!el) return
-        const proto = Object.getPrototypeOf(el)
-        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set
-        setter?.call(el, val)
-        el.dispatchEvent(new Event("input", { bubbles: true }))
-        el.dispatchEvent(new Event("change", { bubbles: true }))
-        el.dispatchEvent(new Event("blur", { bubbles: true }))
-      }, dobSlashed)
-    }
-    // Tab to commit datepicker / trigger validation.
-    await page.keyboard.press("Tab").catch(() => undefined)
-    await page.waitForTimeout(500)
-    await snapshot(ctx, "rep-step0a-fields-filled")
-
-    const authBtn = await firstVisible(page, [
-      'button:has-text("LOGIN")',
-      'button:has-text("Login")',
-      'button:has-text("Sign In")',
-      'button:has-text("Authenticate")',
-      'button:has-text("Verify")',
-      'button:has-text("Continue")',
-      'button:has-text("Submit")',
-      'button[type="submit"]',
-      'button.mat-flat-button.mat-primary',
-    ])
-    if (!authBtn) {
-      return { ok: false, signed, failed: [{ reason: "LOGIN button not found at auth" }], skipped }
-    }
-    await Promise.all([
-      page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {}),
-      authBtn.click(),
-    ])
-    await settle(page, 3000)
     logger.info({ urlAfterAuth: page.url() }, "[Rep auth] post-LOGIN URL")
     await snapshot(ctx, "rep-step0b-after-auth")
 
@@ -1313,80 +1232,6 @@ export async function repReview(
   } finally {
     await ctxBrowser.close().catch(() => {})
   }
-}
-
-// Fill SureLC's rep SSN/DOB auth gate and click LOGIN. Assumes the
-// auth-ssn-input gate is already present on the page. Mirrors the inline
-// Step-0 auth fill; used by the Step-6 OAuth-bounce recovery to
-// re-authenticate IN PLACE when SureLC drops the ar-review session
-// mid-wizard (that bounce re-renders this same SSN/DOB gate). Returns
-// {ok:false, reason} if a required field/button is missing.
-async function fillRepAuthGate(
-  ctx: TabContext,
-  ssnLast6: string,
-  dob: string,
-): Promise<{ ok: boolean; reason?: string }> {
-  const { page } = ctx
-  const ssnFocused = await page
-    .evaluate(() => {
-      const el = document.querySelector(
-        "auth-ssn-input input.hidden, auth-ssn-input input:not([readonly])",
-      ) as HTMLInputElement | null
-      if (!el) return false
-      el.focus()
-      return true
-    })
-    .catch(() => false)
-  if (!ssnFocused) {
-    const host = await page.$("auth-ssn-input")
-    await host?.click().catch(() => undefined)
-  }
-  await page.waitForTimeout(300)
-  await page.keyboard.type(ssnLast6, { delay: 100 })
-  await page.waitForTimeout(500)
-
-  const dobSlashed = dob.replace(/-/g, "/")
-  const dobInput = await page.$(
-    'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
-  )
-  if (!dobInput) return { ok: false, reason: "DOB field not found at re-auth" }
-  try {
-    await (dobInput as any).fill(dobSlashed, { force: true, timeout: 10_000 })
-  } catch {
-    await page.evaluate((val: string) => {
-      const el = document.querySelector(
-        'auth-date-input input#mat-input-0, auth-date-input input[type="text"]:not([readonly]):not([matnativecontrol])',
-      ) as HTMLInputElement | null
-      if (!el) return
-      const proto = Object.getPrototypeOf(el)
-      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set
-      setter?.call(el, val)
-      el.dispatchEvent(new Event("input", { bubbles: true }))
-      el.dispatchEvent(new Event("change", { bubbles: true }))
-      el.dispatchEvent(new Event("blur", { bubbles: true }))
-    }, dobSlashed)
-  }
-  await page.keyboard.press("Tab").catch(() => undefined)
-  await page.waitForTimeout(500)
-
-  const authBtn = await firstVisible(page, [
-    'button:has-text("LOGIN")',
-    'button:has-text("Login")',
-    'button:has-text("Sign In")',
-    'button:has-text("Authenticate")',
-    'button:has-text("Verify")',
-    'button:has-text("Continue")',
-    'button:has-text("Submit")',
-    'button[type="submit"]',
-    'button.mat-flat-button.mat-primary',
-  ])
-  if (!authBtn) return { ok: false, reason: "LOGIN button not found at re-auth" }
-  await Promise.all([
-    page.waitForLoadState("networkidle", { timeout: 30_000 }).catch(() => {}),
-    authBtn.click(),
-  ])
-  await settle(page, 3000)
-  return { ok: true }
 }
 
 async function reviewOneCarrier(
@@ -1782,13 +1627,13 @@ async function reviewOneCarrier(
       )
       // Wait for the SSN/DOB gate to mount on the OAuth authorize page.
       await page
-        .waitForSelector('auth-ssn-input, input.mat-mdc-input-element', {
+        .waitForSelector(`${SSN_HOST}, input.mat-mdc-input-element`, {
           timeout: 30_000,
         })
         .catch(() => undefined)
       await settle(page, 2500)
-      if (await page.$("auth-ssn-input")) {
-        const reauth = await fillRepAuthGate(ctx, input.ssnLast6, input.dob)
+      if (await hasSsnGate(page)) {
+        const reauth = await fillRepAuthGate(ctx, input.ssnLast6, input.dob, "re-auth")
         if (reauth.ok) {
           // OAuth redirected back into the appointment. Re-accept the policy
           // gate if it's shown again, then retry the PDF wait — SureLC resumes
