@@ -47,6 +47,12 @@ import {
   waitForEnabledButton,
 } from "./explanationDocs.js"
 import { isoToMmDdYyyy } from "../rep/convictionFields.js"
+import {
+  dbaNeedsWork,
+  normalizeUsPhone,
+  parseDbaValidation,
+  type DbaValidationVerdict,
+} from "./dbaContact.js"
 
 export interface ProfileFillInput {
   producerId: string
@@ -71,6 +77,14 @@ export interface ProfileFillInput {
   dba?: {
     businessType?: "License Only" | "Business Only"
     solicitingFor: string // e.g. "Thomas Poulin"
+    /**
+     * DBA contact phone (any US format; normalised to 10 digits here).
+     * SureLC rejects the DBA with DBA:CONTACT_INFO_NOT_VALID / CONTACT_PHONE
+     * when it is empty, and Fastlane then refuses to offer the producer.
+     * Backoffice sends the rep's personal phone. Absent: the bot falls back
+     * to the phone on SureLC's own producer record.
+     */
+    contactPhone?: string
   }
   questions?: {
     /**
@@ -1229,6 +1243,136 @@ async function waitForTabPanelReady(
   }
 }
 
+// ─── DBA contact phone ────────────────────────────────────────────────
+
+const DBA_PHONE_LABELS = [
+  "Contact phone",
+  "Contact Phone Number",
+  "Business phone",
+  "Phone number",
+  "Phone",
+]
+
+/** SureLC's own verdict on the DBA, or null if it could not be fetched. */
+async function fetchDbaVerdict(
+  page: Page,
+  producerId: string,
+): Promise<{ verdict: DbaValidationVerdict; bearer: string } | null> {
+  const bearer = await harvestBgaBearer(page).catch(() => "")
+  if (!bearer) return null
+  try {
+    const r = await fetch("https://surelc.surancebay.com/surecrm/validation/list", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${bearer}`, "Content-Type": "application/json" },
+      body: JSON.stringify([Number(producerId)]),
+    })
+    if (!r.ok) return null
+    return { verdict: parseDbaValidation(await r.json()), bearer }
+  } catch {
+    return null
+  }
+}
+
+/** Phone on SureLC's own producer record (fallback when none was sent). */
+async function producerRecordPhone(bearer: string, producerId: string): Promise<string | null> {
+  try {
+    const r = await fetch(`https://surelc.surancebay.com/surecrm/producers/${producerId}/model`, {
+      headers: { Authorization: `Bearer ${bearer}` },
+    })
+    if (!r.ok) return null
+    const m: any = await r.json()
+    const rec = m?.producer ?? m
+    // Field names unverified: `cell` is the one /set-producer-fields documents.
+    for (const k of ["cell", "cellPhone", "phone", "mobilePhone"]) {
+      const n = normalizeUsPhone(rec?.[k])
+      if (n) return n
+    }
+  } catch {
+    /* fall through */
+  }
+  return null
+}
+
+/**
+ * Fill the DBA contact phone through the tab's own form, then ask SureLC
+ * whether it accepted it. UNVERIFIED: the label text of the phone control has
+ * not been observed live; the candidates in DBA_PHONE_LABELS are guesses, and
+ * on a miss we fail loudly with the tab's real controls listed.
+ */
+async function fillDbaContactPhone(
+  ctx: TabContext,
+  producerId: string,
+  inputPhone: string | undefined,
+  bearer: string,
+): Promise<TabResult> {
+  const { page } = ctx
+  const phone = normalizeUsPhone(inputPhone) ?? (await producerRecordPhone(bearer, producerId))
+  if (!phone) {
+    return {
+      ok: false,
+      reason:
+        "DBA contact phone is invalid (SureLC DBA:CONTACT_INFO_NOT_VALID / CONTACT_PHONE) and " +
+        "no usable 10-digit US phone was provided or found on the SureLC producer record",
+    }
+  }
+  let filled = false
+  for (const label of DBA_PHONE_LABELS) {
+    const el = await inputByLabel(page, label).catch(() => null)
+    if (!el) continue
+    try {
+      await el.fill("")
+      await el.fill(phone)
+      await el.press("Tab") // blur: SureLC auto-saves DBA fields on blur
+      filled = true
+      break
+    } catch {
+      /* try next label */
+    }
+  }
+  if (!filled) {
+    await snapshot(ctx, "tab-dba-phone-control-missing")
+    const controls = await page
+      .$$eval("mat-form-field", (els) =>
+        els
+          .slice(0, 25)
+          .map((e) => ((e.querySelector("mat-label") as HTMLElement)?.innerText || "").trim())
+          .filter(Boolean),
+      )
+      .catch(() => [] as string[])
+    return {
+      ok: false,
+      reason:
+        `DBA contact phone is invalid per SureLC but no phone control was found on the DBA tab ` +
+        `(tried labels: ${DBA_PHONE_LABELS.join(", ")}). Labelled fields: ${controls.join(" | ") || "(none)"}`,
+    }
+  }
+  await settle(page, 1500)
+  const after = await fetchDbaVerdict(page, producerId)
+  if (!after) {
+    return { ok: false, reason: "filled DBA contact phone but could not re-check SureLC validation to confirm" }
+  }
+  if (after.verdict.contactPhoneInvalid) {
+    await snapshot(ctx, "tab-dba-phone-still-invalid")
+    return {
+      ok: false,
+      reason:
+        "SureLC still reports DBA:CONTACT_INFO_NOT_VALID / CONTACT_PHONE after the bot filled the phone " +
+        "(field may not have saved, or the value was rejected)",
+      details: { phoneFilled: true },
+    }
+  }
+  return { ok: true, details: { dbaContactPhone: "set", verifiedBy: "validation/list" } }
+}
+
+/** Failure text for DBA problems the bot must not paper over. */
+function dbaOtherFieldsReason(v: DbaValidationVerdict): string | null {
+  if (!v.otherFields.length) return null
+  return (
+    `SureLC reports DBA fields the bot does not fill: ${v.otherFields.join(", ")} ` +
+    `(rep's own address data needs correcting; the bot does not invent it)`
+  )
+}
+
 async function fillDba(
   ctx: TabContext,
   producerId: string,
@@ -1251,8 +1395,24 @@ async function fillDba(
 
   // If the affiliation template applied, fields are greyed and pre-
   // filled. The "complete" indicator is the green check on the tab.
-  if (await isTabGreen(page, "DBA")) {
-    return { ok: true, alreadyDone: true }
+  // The icon alone is not trusted: 2026-10-14 two producers had a clear icon
+  // while SureLC's validation held DBA:CONTACT_INFO_NOT_VALID (CONTACT_PHONE).
+  const iconGreen = await isTabGreen(page, "DBA")
+  const initial = await fetchDbaVerdict(page, producerId)
+  if (!dbaNeedsWork(iconGreen, initial?.verdict ?? null)) {
+    return { ok: true, alreadyDone: true, details: { validation: initial ? "clean" : "unavailable" } }
+  }
+  if (iconGreen && initial) {
+    // Solicitor For is fine; only contact info is wrong. Do not retype it.
+    const other = dbaOtherFieldsReason(initial.verdict)
+    if (other) return { ok: false, reason: other }
+    if (!initial.verdict.contactPhoneInvalid) {
+      return {
+        ok: false,
+        reason: `SureLC reports a DBA issue the bot cannot fix: ${initial.verdict.issues.map((i) => i.code).join(", ")}`,
+      }
+    }
+    return fillDbaContactPhone(ctx, producerId, input?.contactPhone, initial.bearer)
   }
   if (!input) {
     return { ok: false, reason: "DBA tab needs filling but no input provided" }
@@ -1495,6 +1655,16 @@ async function fillDba(
   // threw, so carry on; but say which of the two it was, so a run that
   // "passed" on no signal at all is visible in the timeline rather than
   // indistinguishable from a verified one.
+  // Contact info: ask SureLC, not the icon.
+  const mid = await fetchDbaVerdict(page, producerId)
+  if (mid) {
+    const other = dbaOtherFieldsReason(mid.verdict)
+    if (mid.verdict.contactPhoneInvalid) {
+      const ph = await fillDbaContactPhone(ctx, producerId, input.contactPhone, mid.bearer)
+      if (!ph.ok) return ph
+    }
+    if (other) return { ok: false, reason: other }
+  }
   const clearState = await waitForTabClearDetailed(page, "dba", 5_000)
   await snapshot(ctx, "tab-dba-after")
   return {
@@ -1506,6 +1676,7 @@ async function fillDba(
       // above is the real verification.
       verified: true,
       solicitingFor: solicitValue,
+      contactValidation: mid ? "checked" : "unavailable",
     },
   }
 }

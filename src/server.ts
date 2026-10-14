@@ -75,6 +75,9 @@ const profileSchema = z.object({
       // coerces anything else back to "License Only" too.
       businessType: z.literal("License Only").optional(),
       solicitingFor: z.string(),
+      // DBA contact phone (any US format). Without it SureLC flags
+      // DBA:CONTACT_INFO_NOT_VALID and Fastlane refuses the producer.
+      contactPhone: z.string().optional(),
     })
     .optional(),
   questions: z
