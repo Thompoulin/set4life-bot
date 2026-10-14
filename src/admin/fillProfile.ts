@@ -1376,8 +1376,36 @@ async function editDbaPhoneRow(
   }
 
   // 1. Switch the source to "Producer".
+  // Live 2026-10-14 (Luis): the expanded row is two mat-radio-buttons whose
+  // text is "(Producer)(786) 725-8342" and "(Other)NOT VALID", plus an edit
+  // pencil — so match "(Producer)" anywhere in the text, not the bare word.
+  const producerRadio = body
+    .locator("mat-radio-button")
+    .filter({ hasText: /\(\s*Producer\s*\)/i })
+    .first()
+  if (await producerRadio.count().catch(() => 0)) {
+    const label = producerRadio.locator("label").first()
+    if (await label.count().catch(() => 0)) await label.click({ timeout: 3000 }).catch(() => undefined)
+    else await producerRadio.click({ timeout: 3000 }).catch(() => undefined)
+    await page.waitForTimeout(400)
+    const checked = await producerRadio
+      .locator("input[type=radio]")
+      .first()
+      .isChecked()
+      .catch(() => false)
+    if (!checked) {
+      await producerRadio
+        .locator("input[type=radio]")
+        .first()
+        .check({ force: true, timeout: 3000 })
+        .catch(() => undefined)
+    }
+    await page.waitForTimeout(600)
+    await clickSave()
+    return { ok: true, how: "source=Producer (radio)" }
+  }
   const producerChoice = body
-    .locator("mat-radio-button, mat-button-toggle, button, label, mat-chip-option")
+    .locator("mat-button-toggle, button, label, mat-chip-option")
     .filter({ hasText: /^\s*Producer\s*$/i })
     .first()
   if (await producerChoice.count().catch(() => 0)) {
