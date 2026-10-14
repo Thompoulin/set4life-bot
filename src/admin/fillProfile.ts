@@ -1298,6 +1298,22 @@ async function producerRecordPhone(bearer: string, producerId: string): Promise<
  * (inherits the producer's valid phone); else pencil -> type 10 digits -> save.
  * On any miss, fail loudly listing what the expanded row really contains.
  */
+/** Answer SureLC's unsaved-changes guard with STAY, if it is up. Same text normalisation as dismissLeaveGuard. */
+async function stayOnPageIfGuarded(page: Page, logger: import("pino").Logger): Promise<boolean> {
+  const clicked = await page
+    .evaluate(() => {
+      const norm = (e: Element) =>
+        ((e as HTMLElement).innerText || "").replace(/\s+/g, " ").trim().toUpperCase()
+      const stay = Array.from(document.querySelectorAll("button")).find((b) => norm(b).includes("STAY"))
+      if (!stay) return false
+      ;(stay as HTMLElement).click()
+      return true
+    })
+    .catch(() => false)
+  if (clicked) logger.warn("[guard] answered STAY on an unsaved-changes dialog (DBA phone edit)")
+  return clicked
+}
+
 async function editDbaPhoneRow(
   ctx: TabContext,
   phone: string,
@@ -1310,9 +1326,19 @@ async function editDbaPhoneRow(
   if (!(await row.count().catch(() => 0))) {
     return { ok: false, reason: 'DBA tab has no "Phone" row in "Contact Information for Contracting"' }
   }
+  // Live 2026-10-14 (Luis Lopez Torres): the "You have not filled all required
+  // fields — YES, LEAVE / NO, STAY ON PAGE" guard was already up over the DBA
+  // tab, so the header click landed on the modal and the row never opened.
+  // Here we are editing THIS tab, so answer STAY (dismissLeaveGuard answers
+  // LEAVE, which is right only when moving to another tab).
+  await stayOnPageIfGuarded(page, ctx.logger)
   const header = row.locator("mat-expansion-panel-header").first()
   if ((await header.getAttribute("aria-expanded").catch(() => null)) !== "true") {
     await header.click().catch(() => undefined)
+    await page.waitForTimeout(400)
+    if (await stayOnPageIfGuarded(page, ctx.logger)) {
+      await header.click().catch(() => undefined)
+    }
   }
   await page.waitForTimeout(900)
   await snapshot(ctx, "tab-dba-phone-row-expanded")
