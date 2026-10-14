@@ -1245,14 +1245,6 @@ async function waitForTabPanelReady(
 
 // ─── DBA contact phone ────────────────────────────────────────────────
 
-const DBA_PHONE_LABELS = [
-  "Contact phone",
-  "Contact Phone Number",
-  "Business phone",
-  "Phone number",
-  "Phone",
-]
-
 /** SureLC's own verdict on the DBA, or null if it could not be fetched. */
 async function fetchDbaVerdict(
   page: Page,
@@ -1294,10 +1286,127 @@ async function producerRecordPhone(bearer: string, producerId: string): Promise<
 }
 
 /**
- * Fill the DBA contact phone through the tab's own form, then ask SureLC
- * whether it accepted it. UNVERIFIED: the label text of the phone control has
- * not been observed live; the candidates in DBA_PHONE_LABELS are guesses, and
- * on a miss we fail loudly with the tab's real controls listed.
+ * Fix the "Phone" row of the "Contact Information for Contracting" card.
+ *
+ * Structure seen live 2026-10-14 (Luis Lopez Torres): each row is
+ * <sb-dba-contact-info-option> > mat-expansion-panel whose header holds
+ * .header__option-name ("Phone"), .header__role ("(Other)" / "(Producer)")
+ * and .header__value ("Not valid" + an error icon). The panel body is EMPTY
+ * until expanded, so what is inside (a source Producer/Other control, a pencil
+ * "Click pencil to start editing", an input, a save button) is UNVERIFIED and
+ * discovered at runtime. Preference order: switch the source to "Producer"
+ * (inherits the producer's valid phone); else pencil -> type 10 digits -> save.
+ * On any miss, fail loudly listing what the expanded row really contains.
+ */
+async function editDbaPhoneRow(
+  ctx: TabContext,
+  phone: string,
+): Promise<{ ok: true; how: string } | { ok: false; reason: string }> {
+  const { page } = ctx
+  const row = page
+    .locator("sb-dba-contact-info-option")
+    .filter({ has: page.locator(".header__option-name", { hasText: /^\s*Phone\s*$/ }) })
+    .first()
+  if (!(await row.count().catch(() => 0))) {
+    return { ok: false, reason: 'DBA tab has no "Phone" row in "Contact Information for Contracting"' }
+  }
+  const header = row.locator("mat-expansion-panel-header").first()
+  if ((await header.getAttribute("aria-expanded").catch(() => null)) !== "true") {
+    await header.click().catch(() => undefined)
+  }
+  await page.waitForTimeout(900)
+  await snapshot(ctx, "tab-dba-phone-row-expanded")
+  const body = row.locator(".mat-expansion-panel-body").first()
+
+  const describe = async (): Promise<string> =>
+    body
+      .evaluate((el) => {
+        const t = (e: Element) =>
+          ((e as HTMLElement).innerText || e.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40)
+        const parts: string[] = []
+        el.querySelectorAll("button, mat-icon, input, mat-select, mat-radio-button, mat-button-toggle, a").forEach(
+          (e) => {
+            const aria = e.getAttribute("aria-label")
+            parts.push(`${e.tagName.toLowerCase()}[${t(e)}${aria ? "|aria=" + aria : ""}]`)
+          },
+        )
+        return `text="${t(el)}" controls=${parts.join(" ") || "(none)"}`
+      })
+      .catch(() => "(row body unreadable)")
+
+  const clickSave = async (): Promise<boolean> => {
+    const save = body
+      .locator("button")
+      .filter({ hasText: /^\s*(save|done|ok|apply)\s*$/i })
+      .or(
+        body.locator(
+          "button:has(mat-icon:text-is('check')), button:has(mat-icon:text-is('done')), button:has(mat-icon:text-is('save'))",
+        ),
+      )
+      .first()
+    if (!(await save.count().catch(() => 0))) return false
+    await save.click({ timeout: 3000 }).catch(() => undefined)
+    return true
+  }
+
+  // 1. Switch the source to "Producer".
+  const producerChoice = body
+    .locator("mat-radio-button, mat-button-toggle, button, label, mat-chip-option")
+    .filter({ hasText: /^\s*Producer\s*$/i })
+    .first()
+  if (await producerChoice.count().catch(() => 0)) {
+    await producerChoice.click({ timeout: 3000 }).catch(() => undefined)
+    await page.waitForTimeout(600)
+    await clickSave()
+    return { ok: true, how: "source=Producer" }
+  }
+  const sourceSelect = body.locator("mat-select").first()
+  if (await sourceSelect.count().catch(() => 0)) {
+    await sourceSelect.click({ timeout: 3000 }).catch(() => undefined)
+    await page.waitForTimeout(500)
+    const opt = page.locator("mat-option").filter({ hasText: /^\s*Producer\s*$/i }).first()
+    if (await opt.count().catch(() => 0)) {
+      await opt.click({ timeout: 3000 }).catch(() => undefined)
+      await page.waitForTimeout(600)
+      await clickSave()
+      return { ok: true, how: "source=Producer (select)" }
+    }
+    await page.keyboard.press("Escape").catch(() => undefined)
+  }
+
+  // 2. Pencil -> type the number -> save.
+  let input = body.locator("input").first()
+  if (!(await input.count().catch(() => 0))) {
+    const pencilSel =
+      "mat-icon:text-is('edit'), mat-icon:text-is('create'), mat-icon:text-is('mode_edit')"
+    const pencil = body.locator(pencilSel).first().or(row.locator(pencilSel).first())
+    if (await pencil.count().catch(() => 0)) {
+      await pencil.click({ timeout: 3000 }).catch(() => undefined)
+      await page.waitForTimeout(700)
+      input = body.locator("input").first()
+    }
+  }
+  if (await input.count().catch(() => 0)) {
+    try {
+      await input.fill("")
+      await input.fill(phone)
+      if (!(await clickSave())) await input.press("Enter")
+      await page.waitForTimeout(600)
+      return { ok: true, how: "typed phone" }
+    } catch {
+      /* fall through to the loud failure */
+    }
+  }
+  await snapshot(ctx, "tab-dba-phone-row-unrecognised")
+  return {
+    ok: false,
+    reason: `DBA "Phone" row expanded but no Producer-source control, pencil or input was usable. Row contents: ${await describe()}`,
+  }
+}
+
+/**
+ * Fill the DBA contact phone (see editDbaPhoneRow), then ask SureLC whether it
+ * accepted it. Fails loudly, listing the row's controls, if the UI differs.
  */
 async function fillDbaContactPhone(
   ctx: TabContext,
@@ -1315,37 +1424,8 @@ async function fillDbaContactPhone(
         "no usable 10-digit US phone was provided or found on the SureLC producer record",
     }
   }
-  let filled = false
-  for (const label of DBA_PHONE_LABELS) {
-    const el = await inputByLabel(page, label).catch(() => null)
-    if (!el) continue
-    try {
-      await el.fill("")
-      await el.fill(phone)
-      await el.press("Tab") // blur: SureLC auto-saves DBA fields on blur
-      filled = true
-      break
-    } catch {
-      /* try next label */
-    }
-  }
-  if (!filled) {
-    await snapshot(ctx, "tab-dba-phone-control-missing")
-    const controls = await page
-      .$$eval("mat-form-field", (els) =>
-        els
-          .slice(0, 25)
-          .map((e) => ((e.querySelector("mat-label") as HTMLElement)?.innerText || "").trim())
-          .filter(Boolean),
-      )
-      .catch(() => [] as string[])
-    return {
-      ok: false,
-      reason:
-        `DBA contact phone is invalid per SureLC but no phone control was found on the DBA tab ` +
-        `(tried labels: ${DBA_PHONE_LABELS.join(", ")}). Labelled fields: ${controls.join(" | ") || "(none)"}`,
-    }
-  }
+  const row = await editDbaPhoneRow(ctx, phone)
+  if (!row.ok) return { ok: false, reason: row.reason }
   await settle(page, 1500)
   const after = await fetchDbaVerdict(page, producerId)
   if (!after) {
@@ -1361,7 +1441,7 @@ async function fillDbaContactPhone(
       details: { phoneFilled: true },
     }
   }
-  return { ok: true, details: { dbaContactPhone: "set", verifiedBy: "validation/list" } }
+  return { ok: true, details: { dbaContactPhone: "set", via: row.how, verifiedBy: "validation/list" } }
 }
 
 /** Failure text for DBA problems the bot must not paper over. */
